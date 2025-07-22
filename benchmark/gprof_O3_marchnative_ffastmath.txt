@@ -1,0 +1,234 @@
+Flat profile:
+
+Each sample counts as 0.01 seconds.
+  %   cumulative   self              self     total           
+ time   seconds   seconds    calls   s/call   s/call  name    
+ 33.02      2.78     2.78       20     0.14     0.15  sumthreshold_2d
+ 27.08      5.06     2.28   357168     0.00     0.00  findMedian
+ 13.90      6.23     1.17       20     0.06     0.06  binarySIR
+  8.19      6.92     0.69       20     0.03     0.18  identSubstNSigma
+  7.60      7.56     0.64                             transpose_byte
+  6.65      8.12     0.56       60     0.01     0.01  transpose
+  1.78      8.27     0.15       20     0.01     0.01  transpose_int
+  0.48      8.31     0.04   367408     0.00     0.00  findMeanStd
+  0.36      8.34     0.03       20     0.00     0.00  ksigma_1d
+  0.36      8.37     0.03       20     0.00     0.00  ksigma_2d
+  0.36      8.40     0.03        1     0.03     7.76  readAndDedisp
+  0.24      8.42     0.02                             _init
+  0.00      8.42     0.00    10240     0.00     0.00  findMinMax
+  0.00      8.42     0.00       20     0.00     0.00  substitute_pixels
+  0.00      8.42     0.00        1     0.00     0.00  check_and_create_dataset_path
+  0.00      8.42     0.00        1     0.00     0.00  parseCommandLineArguments
+  0.00      8.42     0.00        1     0.00     0.00  readMetadata
+
+ %         the percentage of the total running time of the
+time       program used by this function.
+
+cumulative a running sum of the number of seconds accounted
+ seconds   for by this function and those listed above it.
+
+ self      the number of seconds accounted for by this
+seconds    function alone.  This is the major sort for this
+           listing.
+
+calls      the number of times this function was invoked, if
+           this function is profiled, else blank.
+
+ self      the average number of milliseconds spent in this
+ms/call    function per call, if this function is profiled,
+	   else blank.
+
+ total     the average number of milliseconds spent in this
+ms/call    function and its descendents per call, if this
+	   function is profiled, else blank.
+
+name       the name of the function.  This is the minor sort
+           for this listing. The index shows the location of
+	   the function in the gprof listing. If the index is
+	   in parenthesis it shows where it would appear in
+	   the gprof listing if it were to be printed.
+
+Copyright (C) 2012-2024 Free Software Foundation, Inc.
+
+Copying and distribution of this file, with or without modification,
+are permitted in any medium without royalty provided the copyright
+notice and this notice are preserved.
+
+		     Call graph (explanation follows)
+
+
+granularity: each sample hit covers 4 byte(s) for 0.12% of 8.42 seconds
+
+index % time    self  children    called     name
+                0.03    7.73       1/1           main [2]
+[1]     92.2    0.03    7.73       1         readAndDedisp [1]
+                0.69    2.84      20/20          identSubstNSigma [3]
+                2.78    0.25      20/20          sumthreshold_2d [4]
+                1.17    0.00      20/20          binarySIR [6]
+                0.00    0.00   10240/10240       findMinMax [14]
+                0.00    0.00      20/20          substitute_pixels [15]
+-----------------------------------------------
+                                                 <spontaneous>
+[2]     92.2    0.00    7.76                 main [2]
+                0.03    7.73       1/1           readAndDedisp [1]
+                0.00    0.00       1/1           readMetadata [18]
+                0.00    0.00       1/1           parseCommandLineArguments [17]
+-----------------------------------------------
+                0.69    2.84      20/20          readAndDedisp [1]
+[3]     41.9    0.69    2.84      20         identSubstNSigma [3]
+                2.28    0.00  357148/357168      findMedian [5]
+                0.37    0.00      40/60          transpose [8]
+                0.15    0.00      20/20          transpose_int [9]
+                0.04    0.00  357148/367408      findMeanStd [11]
+-----------------------------------------------
+                2.78    0.25      20/20          readAndDedisp [1]
+[4]     36.0    2.78    0.25      20         sumthreshold_2d [4]
+                0.19    0.00      20/60          transpose [8]
+                0.03    0.03      20/20          ksigma_2d [10]
+                0.00    0.00   10260/367408      findMeanStd [11]
+-----------------------------------------------
+                0.00    0.00      20/357168      ksigma_1d [12]
+                2.28    0.00  357148/357168      identSubstNSigma [3]
+[5]     27.1    2.28    0.00  357168         findMedian [5]
+-----------------------------------------------
+                1.17    0.00      20/20          readAndDedisp [1]
+[6]     13.9    1.17    0.00      20         binarySIR [6]
+-----------------------------------------------
+                                                 <spontaneous>
+[7]      7.6    0.64    0.00                 transpose_byte [7]
+-----------------------------------------------
+                0.19    0.00      20/60          sumthreshold_2d [4]
+                0.37    0.00      40/60          identSubstNSigma [3]
+[8]      6.7    0.56    0.00      60         transpose [8]
+-----------------------------------------------
+                0.15    0.00      20/20          identSubstNSigma [3]
+[9]      1.8    0.15    0.00      20         transpose_int [9]
+-----------------------------------------------
+                0.03    0.03      20/20          sumthreshold_2d [4]
+[10]     0.7    0.03    0.03      20         ksigma_2d [10]
+                0.03    0.00      20/20          ksigma_1d [12]
+-----------------------------------------------
+                0.00    0.00   10260/367408      sumthreshold_2d [4]
+                0.04    0.00  357148/367408      identSubstNSigma [3]
+[11]     0.5    0.04    0.00  367408         findMeanStd [11]
+-----------------------------------------------
+                0.03    0.00      20/20          ksigma_2d [10]
+[12]     0.4    0.03    0.00      20         ksigma_1d [12]
+                0.00    0.00      20/357168      findMedian [5]
+-----------------------------------------------
+                                                 <spontaneous>
+[13]     0.2    0.02    0.00                 _init [13]
+-----------------------------------------------
+                0.00    0.00   10240/10240       readAndDedisp [1]
+[14]     0.0    0.00    0.00   10240         findMinMax [14]
+-----------------------------------------------
+                0.00    0.00      20/20          readAndDedisp [1]
+[15]     0.0    0.00    0.00      20         substitute_pixels [15]
+-----------------------------------------------
+                0.00    0.00       1/1           parseCommandLineArguments [17]
+[16]     0.0    0.00    0.00       1         check_and_create_dataset_path [16]
+-----------------------------------------------
+                0.00    0.00       1/1           main [2]
+[17]     0.0    0.00    0.00       1         parseCommandLineArguments [17]
+                0.00    0.00       1/1           check_and_create_dataset_path [16]
+-----------------------------------------------
+                0.00    0.00       1/1           main [2]
+[18]     0.0    0.00    0.00       1         readMetadata [18]
+-----------------------------------------------
+
+ This table describes the call tree of the program, and was sorted by
+ the total amount of time spent in each function and its children.
+
+ Each entry in this table consists of several lines.  The line with the
+ index number at the left hand margin lists the current function.
+ The lines above it list the functions that called this function,
+ and the lines below it list the functions this one called.
+ This line lists:
+     index	A unique number given to each element of the table.
+		Index numbers are sorted numerically.
+		The index number is printed next to every function name so
+		it is easier to look up where the function is in the table.
+
+     % time	This is the percentage of the `total' time that was spent
+		in this function and its children.  Note that due to
+		different viewpoints, functions excluded by options, etc,
+		these numbers will NOT add up to 100%.
+
+     self	This is the total amount of time spent in this function.
+
+     children	This is the total amount of time propagated into this
+		function by its children.
+
+     called	This is the number of times the function was called.
+		If the function called itself recursively, the number
+		only includes non-recursive calls, and is followed by
+		a `+' and the number of recursive calls.
+
+     name	The name of the current function.  The index number is
+		printed after it.  If the function is a member of a
+		cycle, the cycle number is printed between the
+		function's name and the index number.
+
+
+ For the function's parents, the fields have the following meanings:
+
+     self	This is the amount of time that was propagated directly
+		from the function into this parent.
+
+     children	This is the amount of time that was propagated from
+		the function's children into this parent.
+
+     called	This is the number of times this parent called the
+		function `/' the total number of times the function
+		was called.  Recursive calls to the function are not
+		included in the number after the `/'.
+
+     name	This is the name of the parent.  The parent's index
+		number is printed after it.  If the parent is a
+		member of a cycle, the cycle number is printed between
+		the name and the index number.
+
+ If the parents of the function cannot be determined, the word
+ `<spontaneous>' is printed in the `name' field, and all the other
+ fields are blank.
+
+ For the function's children, the fields have the following meanings:
+
+     self	This is the amount of time that was propagated directly
+		from the child into the function.
+
+     children	This is the amount of time that was propagated from the
+		child's children to the function.
+
+     called	This is the number of times the function called
+		this child `/' the total number of times the child
+		was called.  Recursive calls by the child are not
+		listed in the number after the `/'.
+
+     name	This is the name of the child.  The child's index
+		number is printed after it.  If the child is a
+		member of a cycle, the cycle number is printed
+		between the name and the index number.
+
+ If there are any cycles (circles) in the call graph, there is an
+ entry for the cycle-as-a-whole.  This entry shows who called the
+ cycle (as parents) and the members of the cycle (as children.)
+ The `+' recursive calls entry shows the number of function calls that
+ were internal to the cycle, and the calls entry for each member shows,
+ for that member, how many times it was called from other members of
+ the cycle.
+
+Copyright (C) 2012-2024 Free Software Foundation, Inc.
+
+Copying and distribution of this file, with or without modification,
+are permitted in any medium without royalty provided the copyright
+notice and this notice are preserved.
+
+Index by function name
+
+  [13] _init                   [3] identSubstNSigma       [15] substitute_pixels
+   [6] binarySIR              [12] ksigma_1d               [4] sumthreshold_2d
+  [16] check_and_create_dataset_path [10] ksigma_2d        [8] transpose
+  [11] findMeanStd            [17] parseCommandLineArguments [7] transpose_byte
+   [5] findMedian              [1] readAndDedisp           [9] transpose_int
+  [14] findMinMax             [18] readMetadata

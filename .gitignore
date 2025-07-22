@@ -1,0 +1,35 @@
+# Build files
+build/
+*.o
+*.so
+gmon.out
+
+# Model files (large binary files)
+*.pth
+*.ckpt
+
+# Data files
+dataset/
+test_output/
+lot/
+src/dataset*/
+
+# Training logs and checkpoints
+lightning_logs/
+checkpoints*/
+final_model.ckpt
+
+# IDE files
+.vscode/
+*.swp
+*.swo
+*~
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Temporary files
+*.tmp
+*.bak

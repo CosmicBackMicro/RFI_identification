@@ -1,0 +1,10 @@
+albumentations==2.0.8
+fitsio==1.2.5
+matplotlib==3.10.3
+numpy==2.3.1
+opencv_python==4.11.0.86
+opencv_python_headless==4.11.0.86
+pytorch_lightning==2.5.2
+scikit_learn==1.7.1
+segmentation_models_pytorch==0.5.0
+torch==2.5.1

@@ -1,0 +1,42 @@
+{
+    "files.associations": {
+        "stdio.h": "c",
+        "unistd.h": "c",
+        "psrpalett.h": "c",
+        "cpgplot.h": "c",
+        "readfastdata.h": "c",
+        "plot.h": "c",
+        "findstats.h": "c",
+        "stdlib.h": "c",
+        "cmd.h": "c",
+        "omp.h": "c",
+        "numbers": "c",
+        "getopt.h": "c",
+        "time.h": "c",
+        "fftw3.h": "c",
+        "fitsio.h": "c",
+        "identification.h": "c",
+        "errno.h": "c",
+        "stat.h": "c",
+        "string.h": "c",
+        "math.h": "c",
+        "png.h": "c",
+        "string": "c",
+        "unordered_map": "c",
+        "string_view": "c",
+        "transpose.h": "c",
+        "cmath": "c"
+    },
+    "C_Cpp.dimInactiveRegions": true,
+    "C_Cpp.default.compilerPath": "/usr/bin/clang",
+    "makefile.launchConfigurations": [
+        {
+            "cwd": "/home/cbm/deRFI/build",
+            "binaryPath": "/home/cbm/deRFI/build/ReadFASTData",
+            "binaryArgs": []
+        }
+    ],
+    "python-envs.defaultEnvManager": "ms-python.python:conda",
+    "python-envs.defaultPackageManager": "ms-python.python:conda",
+    "python-envs.pythonProjects": []
+}

@@ -621,7 +621,7 @@ if __name__ == "__main__":
     MAX_EPOCHS = 30  # 减少epoch数
     
     # 预训练权重路径
-    weights_path = '/home/cbm/deRFI/cent_resnet50.pth'
+    weights_path = '/home/cbm/deRFI/pretrained_weights/cent_resnet50.pth'
     
     # 创建数据集 - 使用稳定的增强策略
     train_dataset = FITSDataset(

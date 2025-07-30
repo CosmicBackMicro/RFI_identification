@@ -10,6 +10,8 @@ gmon.out
 
 # Data files
 dataset/
+dataset_xinglong/
+dataset_xinglong_1/
 test_output/
 lot/
 src/dataset*/
@@ -33,3 +35,5 @@ __pycache__/
 # Temporary files
 *.tmp
 *.bak
+debug_mad_plot.c
+label.py

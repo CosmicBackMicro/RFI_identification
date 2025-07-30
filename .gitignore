@@ -3,6 +3,8 @@ build/
 *.o
 *.so
 gmon.out
+*.out
+a.out
 
 # Model files (large binary files)
 *.pth
@@ -15,6 +17,9 @@ dataset_xinglong_1/
 test_output/
 lot/
 src/dataset*/
+
+# Pretrained weights
+pretrained_weights/
 
 # Training logs and checkpoints
 lightning_logs/
@@ -31,9 +36,27 @@ final_model.ckpt
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.coverage
+.tox/
 
 # Temporary files
 *.tmp
 *.bak
-debug_mad_plot.c
-label.py
+
+
+# System files
+.DS_Store
+Thumbs.db
+*.log
+core
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb
+
+# Environment variables
+.env
+.env.local

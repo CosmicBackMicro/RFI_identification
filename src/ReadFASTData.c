@@ -490,28 +490,30 @@ void applyScaleOffset(float *data, float *scale, float *offset, int lenx, int nc
 /// @param blocksPerRead Number of blocks to read per iteration
 /// @param nchan Number of channels
 /// @param blockSize Size of each data block
-/// @param scale Output scale array
-/// @param offset Output offset array
+/// @param scale Output scale array (sized for nchan)
+/// @param offset Output offset array (sized for nchan)
 /// @param outRawData Output raw data buffer
 /// @param status FITS status pointer
 void readRawBlock(fitsfile *fptr, int blockIndex, int blocksPerRead, int nchan, int blockSize,
                  float *scale, float *offset, unsigned char *outRawData, int *status) {
     int col, nulval = 0, anynul = 0;
-    size_t raw_data_size = blockSize * blocksPerRead;
 
+    // Read the first subint's scale and offset (assuming they're the same for all subints in this block)
+    fits_get_colnum(fptr, CASESEN, "DAT_OFFS", &col, status);
+    fits_read_col(fptr, TFLOAT, col, blockIndex * blocksPerRead + 1, 1, nchan, 
+                 &nulval, offset, &anynul, status);
+
+    fits_get_colnum(fptr, CASESEN, "DAT_SCL", &col, status);
+    fits_read_col(fptr, TFLOAT, col, blockIndex * blocksPerRead + 1, 1, nchan, 
+                 &nulval, scale, &anynul, status);
+
+    // Read all data blocks
     for (int k = 0; k < blocksPerRead; k++) {
-        fits_get_colnum(fptr, CASESEN, "DAT_OFFS", &col, status);
-        fits_read_col(fptr, TFLOAT, col, blockIndex * blocksPerRead + k + 1, 1, nchan, 
-                     &nulval, offset, &anynul, status);
-
-        fits_get_colnum(fptr, CASESEN, "DAT_SCL", &col, status);
-        fits_read_col(fptr, TFLOAT, col, blockIndex * blocksPerRead + k + 1, 1, nchan, 
-                     &nulval, scale, &anynul, status);
-
         fits_get_colnum(fptr, CASESEN, "DATA", &col, status);
         fits_read_col(fptr, TBYTE, col, blockIndex * blocksPerRead + k + 1, 1, blockSize, 
                      &nulval, outRawData + k * blockSize, &anynul, status);
     }
+    
     if (*status) {
         fprintf(stderr, "Error reading block %d\n", blockIndex);
         fits_report_error(stderr, *status);
@@ -650,7 +652,7 @@ int main(int argc, char *argv[])
     }
 
     int nsamp, nchan, binFactorFreq, binFactorTime, nsampBinned, nchanBinned, blockSize, binnedBlockSize;
-    int blocksPerRead, naxis2, colnumFreq, colnumData;
+    int blocksPerRead, naxis2, colnumFreq;
     int startTime;
     int nulval, anynul;
 
@@ -665,7 +667,6 @@ int main(int argc, char *argv[])
     blocksPerRead = m.blocksPerRead;
     naxis2 = m.naxis2;
     colnumFreq = m.colnumFreq;
-    colnumData = m.colnumData;
     startTime = m.startTime;
 
     // Read frequency array
@@ -694,8 +695,10 @@ int main(int argc, char *argv[])
 
     float *finalMedian = malloc(sizeof(float) * nsampBinned * nchanBinned);
     float *finalStd = malloc(sizeof(float) * nsampBinned * nchanBinned);
-    float *scale = malloc(sizeof(float) * nchanBinned * blocksPerRead);
-    float *offset = malloc(sizeof(float) * nchanBinned * blocksPerRead);
+    float *scale = malloc(sizeof(float) * nchan);  // Fix: Use original nchan size
+    float *offset = malloc(sizeof(float) * nchan); // Fix: Use original nchan size
+    float *scaleBinned = malloc(sizeof(float) * nchanBinned); // New: for downsampled data
+    float *offsetBinned = malloc(sizeof(float) * nchanBinned); // New: for downsampled data
     
     float *rawToFloatArray = NULL;
     int needDownsamp = (binFactorTime * binFactorFreq != 1);
@@ -712,14 +715,21 @@ int main(int argc, char *argv[])
         // Read a raw data block of `blocksPerRead` subints with its scale and offset
         readRawBlock(fptr, ii, blocksPerRead, nchan, blockSize, scale, offset, outRawData, &fits_status);
         
+        // Convert raw data to float and apply scale/offset BEFORE downsampling
         if (needDownsamp) {
             convertToFloat(outRawData, rawToFloatArray, nsamp * nchan);
+            applyScaleOffset(rawToFloatArray, scale, offset, nsamp, nchan);
             downsamp2D(rawToFloatArray, nsamp, nchan, outData, binFactorTime, binFactorFreq, 0);
+            // Create downsampled scale/offset arrays for later use
+            downsamp1D(scale, nchan, binFactorFreq, scaleBinned);
+            downsamp1D(offset, nchan, binFactorFreq, offsetBinned);
         } else {
             convertToFloat(outRawData, outData, nsamp * nchan);
+            applyScaleOffset(outData, scale, offset, nsamp, nchan);
+            // For no downsampling case, just copy the arrays
+            memcpy(scaleBinned, scale, sizeof(float) * nchanBinned);
+            memcpy(offsetBinned, offset, sizeof(float) * nchanBinned);
         }
-
-        applyScaleOffset(outData, scale, offset, nsampBinned, nchanBinned);
         transpose(outData, nsampBinned, nchanBinned, outDataT);
         
         if (m.generateMasks)
@@ -730,8 +740,8 @@ int main(int argc, char *argv[])
             { // Plot raw data
                 cpgpage();
                 cpgmtxt("T", 3.0, 0.35, 0.5, "Raw Data");
-                // plotDownsampSED(&m, blocksPerRead, outDataT, freqArray, startTime, numiter, NULL);
-                plotDownsampSEDStd(&m, blocksPerRead, outDataT, freqArray, startTime, numiter, NULL);
+                // Use downsampled frequency array for plotting
+                plotDownsampSEDStd(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL);
             }
 
 
@@ -755,7 +765,7 @@ int main(int argc, char *argv[])
             { // Plot result after NSigma substitution
                 cpgpage();
                 // plotDataAndMask(&m, blocksPerRead, outDataT, freqArray, startTime, numiter, globalMask);
-                plotDataAndMaskStd(&m, blocksPerRead, outDataT, freqArray, startTime, numiter, globalMask);
+                plotDataAndMaskStd(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, globalMask);
             }
 
             if (m.plot)
@@ -765,7 +775,7 @@ int main(int argc, char *argv[])
                 snprintf(text2, sizeof(text2), "Result after mean-std normalization with %.2f sigma", NSigma);
                 cpgmtxt("T", 3.5, 0.5, 0.5, text2);
                 // plotDownsampSED(&m, blocksPerRead, outDataT, freqArray, startTime, numiter, NULL);
-                plotDownsampSEDStd(&m, blocksPerRead, outDataT, freqArray, startTime, numiter, NULL);
+                plotDownsampSEDStd(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL);
             }
 
             float timesOfSigma = 8.0f;
@@ -794,7 +804,7 @@ int main(int argc, char *argv[])
                 snprintf(text3, sizeof(text3), "Result of RFI detection with chi=%.2f", timesOfSigma);
                 cpgmtxt("T", 3.5, 0.5, 0.5, text3);
                 // plotDataAndMask(&m, blocksPerRead, outDataT, freqArray, startTime, numiter, mask_ST);
-                plotDataAndMaskStd(&m, blocksPerRead, outDataT, freqArray, startTime, numiter, mask_ST);
+                plotDataAndMaskStd(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, mask_ST);
             }
 
             if (m.doSumThreshold)
@@ -807,22 +817,22 @@ int main(int argc, char *argv[])
                 cpgpage();
                 cpgmtxt("T", 3.5, 0.5, 0.5, "Result after pixel substitution");
                 // plotDownsampSED(&m, blocksPerRead, outDataT, freqArray, startTime, numiter, NULL);
-                plotDownsampSEDStd(&m, blocksPerRead, outDataT, freqArray, startTime, numiter, NULL);
+                plotDownsampSEDStd(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL);
                 cpgpage();
             }
         }
 
         if (m.write)
         {
-            calcCompress(outDataT, nchanBinned, nsampBinned, scale, offset);
+            calcCompress(outDataT, nchanBinned, nsampBinned, scaleBinned, offsetBinned);
             transpose(outDataT, nchanBinned, nsampBinned, outData);
-            applyCompress(outData, outRawData, nchanBinned, nsampBinned, scale, offset);
+            applyCompress(outData, outRawData, nchanBinned, nsampBinned, scaleBinned, offsetBinned);
             
             int writeBack = 0, writeDastset = 1;
             
             if (writeBack) {
                 writeBlock(fptr, blocksPerRead, nchanBinned, nsampBinned, binnedBlockSize,
-                        offset, scale, outRawData, m.naxis2, ii, &fits_status);
+                        offsetBinned, scaleBinned, outRawData, m.naxis2, ii, &fits_status);
                 if (fits_status)
                 {
                     fits_report_error(stderr, fits_status);
@@ -835,7 +845,7 @@ int main(int argc, char *argv[])
             }
 
             if (writeDastset) {
-                writeFITSDataset(outRawData, scale, offset, nsampBinned, nchanBinned, ii, &m, &fits_status);
+                writeFITSDataset(outRawData, scaleBinned, offsetBinned, nsampBinned, nchanBinned, ii, &m, &fits_status);
             }
         }
 
@@ -907,6 +917,8 @@ int main(int argc, char *argv[])
     free(outRawDataT);
     free(scale);
     free(offset);
+    free(scaleBinned);
+    free(offsetBinned);
     if (needDownsamp) {
         free(rawToFloatArray);
     }

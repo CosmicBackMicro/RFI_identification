@@ -40,8 +40,36 @@ int ClosestFreqIdx(const float *freqArray, int arraySize, float targetFreq)
     return closestIndex;
 }
 
+void clampPlotRange(float *data, int dataSize, float nsig, float *zmin, float *zmax)
+{
+    float mean, std;
+    findMeanStd(data, dataSize, &mean, &std);
+    *zmin = mean - nsig * std;
+    *zmax = mean + nsig * std;
+}
+
+void setupPalette(int palettType, double contrast, double brightness)
+{
+    palett(palettType, contrast, brightness);
+}
+
+void drawColorBar(float zmin, float zmax, const char *label)
+{
+    cpgwedg("RI", 2.0, 2.5, zmin, zmax, label);
+}
+
 void plotDownsampLongTimeAbs(Metadata *m, int numReads, float *dsDataT, float *dsFreqArray, float startTime, int currentBlock)
 {
+    // === Global Layout Configuration ===
+    float globalMargin = 0.1;  // Symmetric margin for left/right/top/bottom
+    float mainPanelRight = 0.7;  // Main panel right boundary
+    float mainPanelTop = 0.7;    // Main panel top boundary
+    
+    // === Panel Layout Configuration ===
+    float mainPanel_x1 = globalMargin, mainPanel_x2 = mainPanelRight, mainPanel_y1 = globalMargin, mainPanel_y2 = mainPanelTop;
+    float rightPanel_x1 = mainPanelRight, rightPanel_x2 = 1.0 - globalMargin, rightPanel_y1 = globalMargin, rightPanel_y2 = mainPanelTop;
+    float topPanel_x1 = globalMargin, topPanel_x2 = mainPanelRight, topPanel_y1 = mainPanelTop, topPanel_y2 = 1.0 - globalMargin;
+
     int nsampPlot = m->nsampBinned * numReads;
     int nchanPlot = m->nchanBinned;
     float tbinPlot = m->tbinBinned;
@@ -65,7 +93,7 @@ void plotDownsampLongTimeAbs(Metadata *m, int numReads, float *dsDataT, float *d
     int palettType = 3;
     double contrast = 1.0;
     double brightness = 0.4;
-    palett(palettType, contrast, brightness);
+    setupPalette(palettType, contrast, brightness);
 
     // === Main Panel: Time-Frequency Plot ===
 
@@ -75,9 +103,9 @@ void plotDownsampLongTimeAbs(Metadata *m, int numReads, float *dsDataT, float *d
     plotStartChan = (plotStartChan < 0) ? 0 : plotStartChan;
     plotEndChan = (plotEndChan > nchanPlot) ? nchanPlot : plotEndChan;
 
-    cpgsvp(0.1, 0.7, 0.1, 0.7);
-    float mean, std, nsig = 5.0;
-    findMeanStd(dsDataT, nsampPlot * nchanPlot, &mean, &std);
+    cpgsvp(mainPanel_x1, mainPanel_x2, mainPanel_y1, mainPanel_y2);
+    float zmin, zmax, nsig = 5.0;
+    clampPlotRange(dsDataT, nsampPlot * nchanPlot, nsig, &zmin, &zmax);
 
     float tr[6] = {
         startTime + currentBlock * nsampPlot * tbinPlot, tstep,
@@ -93,14 +121,14 @@ void plotDownsampLongTimeAbs(Metadata *m, int numReads, float *dsDataT, float *d
             plotEndChan - plotStartChan + 1,      // Number of channels
             1, nsampPlot,                         // X range
             1, plotEndChan - plotStartChan + 1,   // Y range
-            mean - nsig * std, mean + nsig * std, // Z range
+            zmin, zmax,                           // Z range
             tr);
     cpglab("", "Frequency (MHz)", "");
     cpgmtxt("B", 2.5, 0.5, 0.5, "Time (s)");
     cpgsch(1.0);
 
     // === Right Panel: Time-integrated Profile ===
-    cpgsvp(0.7, 0.85, 0.1, 0.7);
+    cpgsvp(rightPanel_x1, rightPanel_x2, rightPanel_y1, rightPanel_y2);
     float freqProfileMin, freqProfileMax;
     findMinMax(dsFreqProfile, nchanPlot, &freqProfileMin, &freqProfileMax);
     freqProfileMin -= 0.1 * (freqProfileMax - freqProfileMin);
@@ -116,10 +144,10 @@ void plotDownsampLongTimeAbs(Metadata *m, int numReads, float *dsDataT, float *d
     cpgsch(1.0);
 
     // === Right Edge: Color Bar ===
-    cpgwedg("RI", 2.0, 2.5, mean - nsig * std, mean + nsig * std, "Intensity");
+    drawColorBar(zmin, zmax, "Intensity");
 
     // === Top Panel: Frequency-integrated Profile ===
-    cpgsvp(0.1, 0.7, 0.7, 0.9);
+    cpgsvp(topPanel_x1, topPanel_x2, topPanel_y1, topPanel_y2);
     float time[nsampPlot];
     for (int i = 0; i < nsampPlot; i++)
     {
@@ -153,6 +181,16 @@ void plotDownsampLongTimeAbs(Metadata *m, int numReads, float *dsDataT, float *d
 }
 void plotDownsampSED(Metadata *m, int numReads, float *dsDataT, float *dsFreqArray, float startTime, int currentBlock, float *baseline)
 {
+    // === Global Layout Configuration ===
+    float globalMargin = 0.1;  // Symmetric margin for left/right/top/bottom
+    float mainPanelRight = 0.7;  // Main panel right boundary
+    float mainPanelTop = 0.7;    // Main panel top boundary
+    
+    // === Panel Layout Configuration ===
+    float mainPanel_x1 = globalMargin, mainPanel_x2 = mainPanelRight, mainPanel_y1 = globalMargin, mainPanel_y2 = mainPanelTop;
+    float rightPanel_x1 = mainPanelRight, rightPanel_x2 = 1.0 - globalMargin, rightPanel_y1 = globalMargin, rightPanel_y2 = mainPanelTop;
+    float topPanel_x1 = globalMargin, topPanel_x2 = mainPanelRight, topPanel_y1 = mainPanelTop, topPanel_y2 = 1.0 - globalMargin;
+
     int nsampPlot = m->nsampBinned; // Use binned samples for plotting
     int nchanPlot = m->nchanBinned;
     float tbinPlot = m->tbinBinned;
@@ -177,7 +215,7 @@ void plotDownsampSED(Metadata *m, int numReads, float *dsDataT, float *dsFreqArr
     int palettType = 3;
     double contrast = 1.0;
     double brightness = 0.4;
-    palett(palettType, contrast, brightness);
+    setupPalette(palettType, contrast, brightness);
 
     // === Main Panel: Time-Frequency Plot ===
     float plotStartFreq = 1000.0, plotEndFreq = 1500.0;
@@ -186,9 +224,9 @@ void plotDownsampSED(Metadata *m, int numReads, float *dsDataT, float *dsFreqArr
     plotStartChan = (plotStartChan < 0) ? 0 : plotStartChan;
     plotEndChan = (plotEndChan > nchanPlot) ? nchanPlot : plotEndChan;
 
-    cpgsvp(0.1, 0.7, 0.1, 0.7);
-    float mean, std, nsig = 5.0;
-    findMeanStd(dsDataT, nsampPlot * nchanPlot, &mean, &std);
+    cpgsvp(mainPanel_x1, mainPanel_x2, mainPanel_y1, mainPanel_y2);
+    float zmin, zmax, nsig = 5.0;
+    clampPlotRange(dsDataT, nsampPlot * nchanPlot, nsig, &zmin, &zmax);
 
     float tr[6] = {
         startTime + currentBlock * nsampPlot * tbinPlot, tstep,
@@ -204,14 +242,14 @@ void plotDownsampSED(Metadata *m, int numReads, float *dsDataT, float *dsFreqArr
             plotEndChan - plotStartChan + 1,      // Number of channels
             1, nsampPlot,                         // X range
             1, plotEndChan - plotStartChan + 1,   // Y range
-            mean - nsig * std, mean + nsig * std, // Z range
+            zmin, zmax,                           // Z range
             tr);
     cpglab("", "Frequency (MHz)", "");
     cpgmtxt("B", 2.5, 0.5, 0.5, "Time (s)");
     cpgsch(1.0);
 
     // === Right Panel: Time-integrated Profile ===
-    cpgsvp(0.7, 0.85, 0.1, 0.7);
+    cpgsvp(rightPanel_x1, rightPanel_x2, rightPanel_y1, rightPanel_y2);
     float freqProfileMin, freqProfileMax;
     findMinMax(dsFreqProfile, nchanPlot, &freqProfileMin, &freqProfileMax);
     freqProfileMin -= 0.1 * (freqProfileMax - freqProfileMin);
@@ -230,10 +268,10 @@ void plotDownsampSED(Metadata *m, int numReads, float *dsDataT, float *dsFreqArr
     cpgsch(1.0);
 
     // === Right Edge: Color Bar ===
-    cpgwedg("RI", 2.0, 2.5, mean - nsig * std, mean + nsig * std, "Intensity");
+    drawColorBar(zmin, zmax, "Intensity");
 
     // === Top Panel: Frequency-integrated Profile ===
-    cpgsvp(0.1, 0.7, 0.7, 0.9);
+    cpgsvp(topPanel_x1, topPanel_x2, topPanel_y1, topPanel_y2);
     // Calculate time axis
     float time[nsampPlot];
     for (int i = 0; i < nsampPlot; i++)
@@ -269,6 +307,16 @@ void plotDownsampSED(Metadata *m, int numReads, float *dsDataT, float *dsFreqArr
 
 void plotDataAndMask(Metadata *m, int numBuffs, float *dsDataT, float *dsFreqArray, float startTime, int currentBlock, int *mask)
 {
+    // === Global Layout Configuration ===
+    float globalMargin = 0.1;  // Symmetric margin for left/right/top/bottom
+    float mainPanelRight = 0.7;  // Main panel right boundary
+    float mainPanelTop = 0.7;    // Main panel top boundary
+    
+    // === Panel Layout Configuration ===
+    float mainPanel_x1 = globalMargin, mainPanel_x2 = mainPanelRight, mainPanel_y1 = globalMargin, mainPanel_y2 = mainPanelTop;
+    float rightPanel_x1 = mainPanelRight, rightPanel_x2 = 1.0 - globalMargin, rightPanel_y1 = globalMargin, rightPanel_y2 = mainPanelTop;
+    float topPanel_x1 = globalMargin, topPanel_x2 = mainPanelRight, topPanel_y1 = mainPanelTop, topPanel_y2 = 1.0 - globalMargin;
+
     // int nsampPlot = m->nsampBinned * numBuffs;
     int nsampPlot = m->nsampBinned; // Use binned samples for plotting
     int nchanPlot = m->nchanBinned;
@@ -294,7 +342,7 @@ void plotDataAndMask(Metadata *m, int numBuffs, float *dsDataT, float *dsFreqArr
     int palettType = 3;
     double contrast = 1.0;
     double brightness = 0.4;
-    palett(palettType, contrast, brightness);
+    setupPalette(palettType, contrast, brightness);
 
     // === Main Panel: Time-Frequency Plot ===
     float plotStartFreq = 1000.0, plotEndFreq = 1500.0;
@@ -303,9 +351,9 @@ void plotDataAndMask(Metadata *m, int numBuffs, float *dsDataT, float *dsFreqArr
     plotStartChan = (plotStartChan < 0) ? 0 : plotStartChan;
     plotEndChan = (plotEndChan > nchanPlot) ? nchanPlot : plotEndChan;
 
-    cpgsvp(0.1, 0.7, 0.1, 0.7);
-    float mean, std, nsig = 5.0;
-    findMeanStd(dsDataT, nsampPlot * nchanPlot, &mean, &std);
+    cpgsvp(mainPanel_x1, mainPanel_x2, mainPanel_y1, mainPanel_y2);
+    float zmin, zmax, nsig = 5.0;
+    clampPlotRange(dsDataT, nsampPlot * nchanPlot, nsig, &zmin, &zmax);
 
     float tr[6] = {
         startTime + currentBlock * nsampPlot * tbinPlot, tstep,
@@ -322,7 +370,7 @@ void plotDataAndMask(Metadata *m, int numBuffs, float *dsDataT, float *dsFreqArr
             plotEndChan - plotStartChan + 1,
             1, nsampPlot,
             1, plotEndChan - plotStartChan + 1,
-            mean - nsig * std, mean + nsig * std,
+            zmin, zmax,
             tr);
 
     plotIndexMask(fmin, nchanPlot, chan_bwPlot, tmin, nsampPlot, tbinPlot, mask, plotStartChan, plotEndChan);
@@ -332,7 +380,7 @@ void plotDataAndMask(Metadata *m, int numBuffs, float *dsDataT, float *dsFreqArr
     cpgsch(1.0);
 
     // === Right Panel: Time-integrated Profile ===
-    cpgsvp(0.7, 0.85, 0.1, 0.7);
+    cpgsvp(rightPanel_x1, rightPanel_x2, rightPanel_y1, rightPanel_y2);
     float freqProfileMin, freqProfileMax;
     findMinMax(dsFreqProfile, nchanPlot, &freqProfileMin, &freqProfileMax);
     freqProfileMin -= 0.1 * (freqProfileMax - freqProfileMin);
@@ -348,11 +396,11 @@ void plotDataAndMask(Metadata *m, int numBuffs, float *dsDataT, float *dsFreqArr
     cpgsch(1.0);
 
     // === Right Edge: Color Bar ===
-    cpgwedg("RI", 2.0, 2.5, mean - nsig * std, mean + nsig * std, "Intensity");
+    drawColorBar(zmin, zmax, "Intensity");
 
     // === Top Panel: Frequency-integrated Profile ===
-    cpgsvp(0.1, 0.7, 0.7, 0.9);
-    // 计算时间轴
+    cpgsvp(topPanel_x1, topPanel_x2, topPanel_y1, topPanel_y2);
+    // Calculate time axis
     float time[nsampPlot];
     for (int i = 0; i < nsampPlot; i++)
     {
@@ -387,6 +435,16 @@ void plotDataAndMask(Metadata *m, int numBuffs, float *dsDataT, float *dsFreqArr
 
 void plotDownsampSEDStd(Metadata *m, int numReads, float *dsDataT, float *dsFreqArray, float startTime, int currentBlock, float *baseline)
 {
+    // === Global Layout Configuration ===
+    float globalMargin = 0.1;  // Symmetric margin for left/right/top/bottom
+    float mainPanelRight = 0.7;  // Main panel right boundary
+    float mainPanelTop = 0.7;    // Main panel top boundary
+    
+    // === Panel Layout Configuration ===
+    float mainPanel_x1 = globalMargin, mainPanel_x2 = mainPanelRight, mainPanel_y1 = globalMargin, mainPanel_y2 = mainPanelTop;
+    float rightPanel_x1 = mainPanelRight, rightPanel_x2 = 1.0 - globalMargin, rightPanel_y1 = globalMargin, rightPanel_y2 = mainPanelTop;
+    float topPanel_x1 = globalMargin, topPanel_x2 = mainPanelRight, topPanel_y1 = mainPanelTop, topPanel_y2 = 1.0 - globalMargin;
+
     int nsampPlot = m->nsampBinned; // Use binned samples for plotting
     int nchanPlot = m->nchanBinned;
     float tbinPlot = m->tbinBinned;
@@ -410,7 +468,7 @@ void plotDownsampSEDStd(Metadata *m, int numReads, float *dsDataT, float *dsFreq
     int palettType = 3;
     double contrast = 1.0;
     double brightness = 0.4;
-    palett(palettType, contrast, brightness);
+    setupPalette(palettType, contrast, brightness);
 
     // === Main Panel: Time-Frequency Plot ===
     float plotStartFreq = 1000.0, plotEndFreq = 1500.0;
@@ -419,9 +477,9 @@ void plotDownsampSEDStd(Metadata *m, int numReads, float *dsDataT, float *dsFreq
     plotStartChan = (plotStartChan < 0) ? 0 : plotStartChan;
     plotEndChan = (plotEndChan > nchanPlot) ? nchanPlot : plotEndChan;
 
-    cpgsvp(0.1, 0.7, 0.1, 0.7);
-    float mean, std, nsig = 5.0;
-    findMeanStd(dsDataT, nsampPlot * nchanPlot, &mean, &std);
+    cpgsvp(mainPanel_x1, mainPanel_x2, mainPanel_y1, mainPanel_y2);
+    float zmin, zmax, nsig = 5.0;
+    clampPlotRange(dsDataT, nsampPlot * nchanPlot, nsig, &zmin, &zmax);
 
     float tr[6] = {
         startTime + currentBlock * nsampPlot * tbinPlot, tstep,
@@ -437,14 +495,14 @@ void plotDownsampSEDStd(Metadata *m, int numReads, float *dsDataT, float *dsFreq
             plotEndChan - plotStartChan + 1,      // Number of channels
             1, nsampPlot,                         // X range
             1, plotEndChan - plotStartChan + 1,   // Y range
-            mean - nsig * std, mean + nsig * std, // Z range
+            zmin, zmax, // Z range
             tr);
     cpglab("", "Frequency (MHz)", "");
     cpgmtxt("B", 2.5, 0.5, 0.5, "Time (s)");
     cpgsch(1.0);
 
     // === Right Panel: Time-integrated Profile ===
-    cpgsvp(0.7, 0.85, 0.1, 0.7);
+    cpgsvp(rightPanel_x1, rightPanel_x2, rightPanel_y1, rightPanel_y2);
     float freqProfileMin, freqProfileMax;
     findMinMax(dsFreqProfile, nchanPlot, &freqProfileMin, &freqProfileMax);
     freqProfileMin -= 0.1 * (freqProfileMax - freqProfileMin);
@@ -460,10 +518,10 @@ void plotDownsampSEDStd(Metadata *m, int numReads, float *dsDataT, float *dsFreq
     cpgsch(1.0);
 
     // === Right Edge: Color Bar ===
-    cpgwedg("RI", 2.0, 2.5, mean - nsig * std, mean + nsig * std, "Intensity");
+    drawColorBar(zmin, zmax, "Intensity");
 
     // === Top Panel: Frequency-integrated Profile ===
-    cpgsvp(0.1, 0.7, 0.7, 0.9);
+    cpgsvp(topPanel_x1, topPanel_x2, topPanel_y1, topPanel_y2);
     // Calculate time axis
     float time[nsampPlot];
     for (int i = 0; i < nsampPlot; i++)
@@ -499,6 +557,16 @@ void plotDownsampSEDStd(Metadata *m, int numReads, float *dsDataT, float *dsFreq
 
 void plotDataAndMaskStd(Metadata *m, int numBuffs, float *dsDataT, float *dsFreqArray, float startTime, int currentBlock, int *mask)
 {
+    // === Global Layout Configuration ===
+    float globalMargin = 0.1;  // Symmetric margin for left/right/top/bottom
+    float mainPanelRight = 0.7;  // Main panel right boundary
+    float mainPanelTop = 0.7;    // Main panel top boundary
+    
+    // === Panel Layout Configuration ===
+    float mainPanel_x1 = globalMargin, mainPanel_x2 = mainPanelRight, mainPanel_y1 = globalMargin, mainPanel_y2 = mainPanelTop;
+    float rightPanel_x1 = mainPanelRight, rightPanel_x2 = 1.0 - globalMargin, rightPanel_y1 = globalMargin, rightPanel_y2 = mainPanelTop;
+    float topPanel_x1 = globalMargin, topPanel_x2 = mainPanelRight, topPanel_y1 = mainPanelTop, topPanel_y2 = 1.0 - globalMargin;
+
     int nsampPlot = m->nsampBinned; // Use binned samples for plotting
     int nchanPlot = m->nchanBinned;
     float tbinPlot = m->tbinBinned;
@@ -522,7 +590,7 @@ void plotDataAndMaskStd(Metadata *m, int numBuffs, float *dsDataT, float *dsFreq
     int palettType = 3;
     double contrast = 1.0;
     double brightness = 0.4;
-    palett(palettType, contrast, brightness);
+    setupPalette(palettType, contrast, brightness);
 
     // === Main Panel: Time-Frequency Plot ===
     float plotStartFreq = 1000.0, plotEndFreq = 1500.0;
@@ -531,9 +599,9 @@ void plotDataAndMaskStd(Metadata *m, int numBuffs, float *dsDataT, float *dsFreq
     plotStartChan = (plotStartChan < 0) ? 0 : plotStartChan;
     plotEndChan = (plotEndChan > nchanPlot) ? nchanPlot : plotEndChan;
 
-    cpgsvp(0.1, 0.7, 0.1, 0.7);
-    float mean, std, nsig = 5.0;
-    findMeanStd(dsDataT, nsampPlot * nchanPlot, &mean, &std);
+    cpgsvp(mainPanel_x1, mainPanel_x2, mainPanel_y1, mainPanel_y2);
+    float zmin, zmax, nsig = 5.0;
+    clampPlotRange(dsDataT, nsampPlot * nchanPlot, nsig, &zmin, &zmax);
 
     float tr[6] = {
         startTime + currentBlock * nsampPlot * tbinPlot, tstep,
@@ -550,7 +618,7 @@ void plotDataAndMaskStd(Metadata *m, int numBuffs, float *dsDataT, float *dsFreq
             plotEndChan - plotStartChan + 1,
             1, nsampPlot,
             1, plotEndChan - plotStartChan + 1,
-            mean - nsig * std, mean + nsig * std,
+            zmin, zmax,
             tr);
 
     plotIndexMask(fmin, nchanPlot, chan_bwPlot, tmin, nsampPlot, tbinPlot, mask, plotStartChan, plotEndChan);
@@ -560,7 +628,7 @@ void plotDataAndMaskStd(Metadata *m, int numBuffs, float *dsDataT, float *dsFreq
     cpgsch(1.0);
 
     // === Right Panel: Time-integrated Profile ===
-    cpgsvp(0.7, 0.85, 0.1, 0.7);
+    cpgsvp(rightPanel_x1, rightPanel_x2, rightPanel_y1, rightPanel_y2);
     float freqProfileMin, freqProfileMax;
     findMinMax(dsFreqProfile, nchanPlot, &freqProfileMin, &freqProfileMax);
     freqProfileMin -= 0.1 * (freqProfileMax - freqProfileMin);
@@ -576,11 +644,11 @@ void plotDataAndMaskStd(Metadata *m, int numBuffs, float *dsDataT, float *dsFreq
     cpgsch(1.0);
 
     // === Right Edge: Color Bar ===
-    cpgwedg("RI", 2.0, 2.5, mean - nsig * std, mean + nsig * std, "Intensity");
+    drawColorBar(zmin, zmax, "Intensity");
 
     // === Top Panel: Frequency-integrated Profile ===
-    cpgsvp(0.1, 0.7, 0.7, 0.9);
-    // 计算时间轴
+    cpgsvp(topPanel_x1, topPanel_x2, topPanel_y1, topPanel_y2);
+    // Calculate time axis
     float time[nsampPlot];
     for (int i = 0; i < nsampPlot; i++)
     {
@@ -633,7 +701,7 @@ void plotIndexMask(
             float y1 = fmin + (i - plotStartChan + 0.0) * chan_bwPlot;
             float y2 = fmin + (i - plotStartChan + 1.0) * chan_bwPlot;
 
-            // 设置颜色
+            // Set color
             int color_index;
             switch (mask[idx])
             {

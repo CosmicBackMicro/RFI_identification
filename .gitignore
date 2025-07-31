@@ -12,8 +12,6 @@ a.out
 
 # Data files
 dataset/
-dataset_xinglong/
-dataset_xinglong_1/
 test_output/
 lot/
 src/dataset*/

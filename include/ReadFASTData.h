@@ -43,6 +43,10 @@ void downsamp2D(float *array, int nsamp, int nchan,
 
 void downsamp1D(float *array, int inputSize, int binFactor, float *binnedArray);
 
+void upsampleMask2D(int *binnedMask, int nsampBinned, int nchanBinned,
+                    int *originalMask, int nsampOriginal, int nchanOriginal,
+                    int binFactorTime, int binFactorFreq, int isTranspose);
+
 void readRawBlock(fitsfile *fptr, int blockIndex, int blocksPerRead, int nchan, int blockSize,
                   float *scale, float *offset, unsigned char *outRawData, int *fits_status);
 

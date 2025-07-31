@@ -33,7 +33,7 @@
                 // "--blocksPerRead=1",
                 "--startTime=0.0",
                 "--generateMasks=1",
-                "--datasetPath=/home/cbm/deRFI/dataset",
+                "--datasetPath=/home/cbm/deRFI/output",
             ],
             "stopAtEntry": false,
             "cwd": "${fileDirname}",

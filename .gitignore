@@ -13,6 +13,7 @@ a.out
 # Data files
 dataset/
 test_output/
+output/
 lot/
 src/dataset*/
 

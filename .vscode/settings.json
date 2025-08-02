@@ -25,7 +25,8 @@
         "unordered_map": "c",
         "string_view": "c",
         "transpose.h": "c",
-        "cmath": "c"
+        "cmath": "c",
+        "cuda_acceleration.h": "c"
     },
     "C_Cpp.dimInactiveRegions": true,
     "C_Cpp.default.compilerPath": "/usr/bin/clang",

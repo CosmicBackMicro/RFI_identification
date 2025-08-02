@@ -1,10 +1,14 @@
 # 编译器配置
 CC := clang
 CXX := clang++
+NVCC := nvcc
 
 # 检测编译器类型
 IS_CLANG := $(shell $(CC) --version 2>/dev/null | grep -q clang && echo 1 || echo 0)
 IS_GCC := $(shell $(CC) --version 2>/dev/null | grep -q gcc && echo 1 || echo 0)
+
+# 检测CUDA编译器
+HAS_NVCC := $(shell which nvcc >/dev/null 2>&1 && echo 1 || echo 0)
 
 # 构建模式：
 # 可通过 make MODE=release 或 make MODE=debug 切换，
@@ -117,8 +121,24 @@ DEP_DIR := $(BUILD_DIR)/dep
 
 # 源文件和目标文件
 SRCS := $(wildcard $(SRC_DIR)/*.c)
+CU_SRCS := $(wildcard $(SRC_DIR)/*.cu)
 OBJS := $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(SRCS))
+CU_OBJS := $(patsubst $(SRC_DIR)/%.cu,$(OBJ_DIR)/%.o,$(CU_SRCS))
 DEPS := $(patsubst $(SRC_DIR)/%.c,$(DEP_DIR)/%.d,$(SRCS))
+
+# 只有在有CUDA编译器和CUDA源文件时才包含CUDA对象文件
+ifeq ($(HAS_NVCC),1)
+ifneq ($(CU_SRCS),)
+    ALL_OBJS := $(OBJS) $(CU_OBJS)
+    CFLAGS += -DHAVE_CUDA
+    CXXFLAGS += -DHAVE_CUDA
+    NVCC_FLAGS := -O3 -arch=sm_50 -Xcompiler -fPIC
+else
+    ALL_OBJS := $(OBJS)
+endif
+else
+    ALL_OBJS := $(OBJS)
+endif
 
 # 目标可执行文件
 TARGET := $(BUILD_DIR)/ReadFASTData
@@ -128,6 +148,13 @@ LIBS := -lcfitsio -lgfortran -lcpgplot -lm -lfftw3f -lpng
 # 添加OpenMP支持
 ifeq ($(findstring -fopenmp,$(CFLAGS)),-fopenmp)
     LIBS += -lgomp
+endif
+
+# 添加CUDA库支持
+ifeq ($(HAS_NVCC),1)
+ifneq ($(CU_SRCS),)
+    LIBS += -lcudart -lcufft
+endif
 endif
 
 # 包含目录
@@ -178,12 +205,16 @@ turbo:
 	$(MAKE) MODE=turbo $(TARGET)
 
 # 链接可执行文件
-$(TARGET): $(OBJS)
+$(TARGET): $(ALL_OBJS)
 	$(CC) $(CFLAGS) $^ -o $@ $(LIBS)
 
 # 编译规则（含依赖生成）
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OBJ_DIR) $(DEP_DIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -MMD -MP -MF $(DEP_DIR)/$*.d -c $< -o $@
+
+# CUDA编译规则
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.cu | $(OBJ_DIR) $(DEP_DIR)
+	$(NVCC) $(NVCC_FLAGS) $(INCLUDES) -c $< -o $@
 
 # 包含依赖文件
 -include $(DEPS)

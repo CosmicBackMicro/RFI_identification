@@ -12,6 +12,7 @@ typedef struct {
     char *datasetPath;
     int doSubstitution;
     int doSumThreshold;
+    int enableCuda;  // 0 = disable CUDA, 1 = enable CUDA (default)
 
     /* From FITS Header */
     int nchan;

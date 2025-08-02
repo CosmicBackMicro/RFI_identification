@@ -655,6 +655,48 @@ void normalizeChannelData(float *data, int nsamp, int nchan,
     }
 }
 
+/// @brief Print threshold statistics for channel values
+/// @param channel_values Array of channel values to analyze
+/// @param nchan Number of channels
+/// @param thresh_values Array of threshold values
+/// @param threshold_names Array of threshold names
+/// @param num_thresholds Number of thresholds
+/// @param metric_name Name of the metric (e.g., "MAD", "STD")
+void printThresholdStatistics(const float *channel_values, int nchan, 
+                             const float *thresh_values, const char **threshold_names, 
+                             int num_thresholds, const char *metric_name)
+{
+    int *threshold_counts = (int *)calloc(num_thresholds, sizeof(int));
+    
+    // Count channels that would be flagged at different thresholds
+    for (int i = 0; i < nchan; i++) {
+        for (int idx = 0; idx < num_thresholds; idx++) {
+            // For negative thresholds (like -1*MAD), count values less than threshold
+            // For positive thresholds, count values greater than threshold
+            if (strstr(threshold_names[idx], "-") == threshold_names[idx]) {
+                // Negative threshold: count values less than threshold
+                if (channel_values[i] < thresh_values[idx]) threshold_counts[idx]++;
+            } else {
+                // Positive threshold: count values greater than threshold
+                if (channel_values[i] > thresh_values[idx]) threshold_counts[idx]++;
+            }
+        }
+    }
+    
+    printf("\n=== Channels flagged at different %s thresholds ===\n", metric_name);
+    for (int idx = 0; idx < num_thresholds; idx++) {
+        printf("%s: %d channels (%.2f%%)\n", 
+               threshold_names[idx], threshold_counts[idx], 
+               (float)threshold_counts[idx]/nchan*100);
+    }
+    
+    free(threshold_counts);
+}
+
+/// @brief 绘制统一的阈值线系统
+/// @param thresh_values 所有阈值的实际值数组
+/// @param threshold_labels 阈值标签数组  
+/// @param threshold_colors 阈值颜色数组
 /// @brief Calculate and visualize channel Median Absolute Difference (MAD) statistics for threshold determination
 /// MAD is calculated as the median of absolute differences between adjacent data points in each channel
 /// @param data Input data array (nsamp * nchan)
@@ -755,98 +797,94 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
     printf("MAD Min: %.6f\n", mad_min);
     printf("MAD Max: %.6f\n", mad_max);
     
-    // Suggest thresholds based on statistics
-    // 对于离散化数据，使用更合理的阈值
-    float thresh_neg1mad = mad_median - 1.0f * mad_mad;  // 新增-1MAD阈值
-    float thresh_1mad = mad_median + 1.0f * mad_mad;     // 1MAD阈值
-    float thresh_2mad = mad_median + 2.0f * mad_mad;     // 新增2MAD阈值
-    float thresh_3mad = mad_median + 3.0f * mad_mad;
-    float thresh_5mad = mad_median + 5.0f * mad_mad;
-    float thresh_2std = mad_median + 2.0f * mad_std;  // 改为基于中位数
-    float thresh_3std = mad_median + 3.0f * mad_std;  // 改为基于中位数
+    // === 统一的11条阈值线系统 ===
     
-    // 如果MAD基础阈值不合理，使用基于数据范围的阈值
-    if (mad_mad < 1e-6f || thresh_3mad <= mad_median) {
-        float data_range = mad_max - mad_min;
-        thresh_neg1mad = mad_median - 0.03f * data_range;  // -3% of range below median
-        thresh_1mad = mad_median + 0.03f * data_range;     // 3% of range above median
-        thresh_2mad = mad_median + 0.06f * data_range;     // 6% of range above median
-        thresh_3mad = mad_median + 0.1f * data_range;      // 10% of range above median
-        thresh_5mad = mad_median + 0.2f * data_range;      // 20% of range above median
-        printf("Note: Using range-based thresholds due to low MAD variability\n");
+    // === 统一的11条阈值线系统 ===
+    const int NUM_ALL_THRESHOLDS = 11;
+    float all_thresh_values[11];
+    const char* all_threshold_labels[11] = {
+        "-5*MAD", "-4*MAD", "-3*MAD", "-2*MAD", "-1*MAD", 
+        "Median", 
+        "+1*MAD", "+2*MAD", "+3*MAD", "+4*MAD", "+5*MAD"
+    };
+    const int all_threshold_colors[11] = {4, 7, 3, 8, 6, 1, 6, 8, 3, 7, 4}; // 蓝 黄 绿 橙 品红 白 品红 橙 绿 黄 蓝
+    const float all_y_positions[11] = {0.15f, 0.25f, 0.35f, 0.45f, 0.75f, 0.65f, 0.85f, 0.90f, 1.05f, 1.00f, 0.95f};
+    
+    // 成对阈值控制开关：6个开关控制±1, ±2, ±3, ±4, ±5和中位线
+    const int show_median = 1;              
+    const int threshold_pair_enabled[5] = {1, 1, 1, 0, 1}; // ±1, ±2, ±3, ±4, ±5 对的开关
+    
+    // 根据成对开关生成11个位置的启用数组
+    int threshold_enabled[11];
+    for (int i = 0; i < 5; i++) {
+        // 负阈值 (-5*MAD 到 -1*MAD，索引0-4)
+        threshold_enabled[4-i] = threshold_pair_enabled[i]; // i=0→索引4(±1), i=1→索引3(±2), 依此类推
+        // 正阈值 (+1*MAD 到 +5*MAD，索引6-10)  
+        threshold_enabled[6+i] = threshold_pair_enabled[i]; // i=0→索引6(±1), i=1→索引7(±2), 依此类推
+    }
+    threshold_enabled[5] = show_median; // 中位线 (索引5)
+    
+    // 统一计算所有11条阈值线的值
+    for (int i = 0; i < NUM_ALL_THRESHOLDS; i++) {
+        if (i < 5) {
+            // 负阈值：-5*MAD 到 -1*MAD (索引0-4)
+            float multiplier = (float)(5 - i); // i=0→5, i=1→4, i=2→3, i=3→2, i=4→1
+            all_thresh_values[i] = mad_median - multiplier * mad_mad;
+        } else if (i == 5) {
+            // 中位线 (索引5)
+            all_thresh_values[i] = mad_median;
+        } else {
+            // 正阈值：+1*MAD 到 +5*MAD (索引6-10)
+            float multiplier = (float)(i - 5); // i=6→1, i=7→2, i=8→3, i=9→4, i=10→5
+            all_thresh_values[i] = mad_median + multiplier * mad_mad;
+        }
     }
     
-    printf("\n=== Suggested Thresholds ===\n");
-    printf("-1*MAD threshold: %.6f\n", thresh_neg1mad);  // 新增输出
-    printf("1*MAD threshold: %.6f\n", thresh_1mad);
-    printf("2*MAD threshold: %.6f\n", thresh_2mad);      // 新增输出
-    printf("3*MAD threshold: %.6f\n", thresh_3mad);
-    printf("5*MAD threshold: %.6f\n", thresh_5mad);
-    printf("Median+2*STD threshold: %.6f\n", thresh_2std);
-    printf("Median+3*STD threshold: %.6f\n", thresh_3std);
-    
-    // Count channels that would be flagged at different thresholds
-    int count_neg1mad = 0, count_1mad = 0, count_2mad = 0, count_3mad = 0, count_5mad = 0;
-    int count_2std = 0, count_3std = 0;
-    for (i = 0; i < nchan; i++)
-    {
-        if (channel_mad[i] < thresh_neg1mad) count_neg1mad++;  // 新增-1MAD计数
-        if (channel_mad[i] > thresh_1mad) count_1mad++;
-        if (channel_mad[i] > thresh_2mad) count_2mad++;        // 新增2MAD计数
-        if (channel_mad[i] > thresh_3mad) count_3mad++;
-        if (channel_mad[i] > thresh_5mad) count_5mad++;
-        if (channel_mad[i] > thresh_2std) count_2std++;
-        if (channel_mad[i] > thresh_3std) count_3std++;
+    // 输出开启的阈值线统计
+    printf("\n=== Enabled Threshold Statistics ===\n");
+    for (int i = 0; i < NUM_ALL_THRESHOLDS; i++) {
+        if (threshold_enabled[i]) {
+            printf("%s threshold: %.6f\n", all_threshold_labels[i], all_thresh_values[i]);
+        }
     }
     
-    printf("\n=== Channels flagged at different thresholds ===\n");
-    printf("-1*MAD: %d channels (%.2f%%)\n", count_neg1mad, (float)count_neg1mad/nchan*100);  // 新增输出
-    printf("1*MAD: %d channels (%.2f%%)\n", count_1mad, (float)count_1mad/nchan*100);
-    printf("2*MAD: %d channels (%.2f%%)\n", count_2mad, (float)count_2mad/nchan*100);          // 新增输出
-    printf("3*MAD: %d channels (%.2f%%)\n", count_3mad, (float)count_3mad/nchan*100);
-    printf("5*MAD: %d channels (%.2f%%)\n", count_5mad, (float)count_5mad/nchan*100);
-    printf("Median+2*STD: %d channels (%.2f%%)\n", count_2std, (float)count_2std/nchan*100);
-    printf("Median+3*STD: %d channels (%.2f%%)\n", count_3std, (float)count_3std/nchan*100);
+    // 只对启用的阈值进行统计分析
+    int enabled_count = 0;
+    for (int i = 0; i < NUM_ALL_THRESHOLDS; i++) {
+        if (threshold_enabled[i]) enabled_count++;
+    }
+    
+    if (enabled_count > 0) {
+        float *enabled_values = malloc(enabled_count * sizeof(float));
+        const char **enabled_names = malloc(enabled_count * sizeof(const char*));
+        
+        int idx = 0;
+        for (int i = 0; i < NUM_ALL_THRESHOLDS; i++) {
+            if (threshold_enabled[i]) {
+                enabled_values[idx] = all_thresh_values[i];
+                enabled_names[idx] = all_threshold_labels[i];
+                idx++;
+            }
+        }
+        
+        printThresholdStatistics(channel_mad, nchan, enabled_values, enabled_names, enabled_count, "MAD");
+        
+        free(enabled_values);
+        free(enabled_names);
+    }
     
     if (plot)
     {
-        // 首先统计MAD值的分布特征
-        int unique_values = 0;
-        int zero_count = 0;
-        float min_diff = 1e6f;
+        //=============================================================================
+        // 📊 第一个图：完整MAD直方图 (Full MAD Histogram)
+        //=============================================================================
         
-        for (i = 0; i < nchan; i++) {
-            if (channel_mad[i] == 0.0f) zero_count++;
-            
-            // 检查是否是新的唯一值
-            int is_unique = 1;
-            for (j = 0; j < i; j++) {
-                float diff = fabsf(channel_mad[i] - channel_mad[j]);
-                if (diff < 1e-9f) {
-                    is_unique = 0;
-                    break;
-                } else if (diff > 1e-9f && diff < min_diff) {
-                    min_diff = diff;
-                }
-            }
-            if (is_unique) unique_values++;
-        }
+        // 使用标准的直方图bin数量（MAD离散化问题已在算法层面解决）
+        int nbins = (int)(sqrt(nchan) * 2);
+        if (nbins < 30) nbins = 30;
+        if (nbins > 100) nbins = 100;
+        printf("Using %d bins for MAD histogram\n", nbins);
         
-        // 使用适应性bin数量，对高度离散的数据减少bin数
-        int nbins;
-        if (unique_values < nchan / 10) {
-            // 如果MAD值高度离散，使用较少的bin数避免稀疏直方图
-            nbins = unique_values * 2;  // 每个唯一值分配2个bin
-            if (nbins < 20) nbins = 20;
-            if (nbins > 60) nbins = 60;
-            printf("Detected highly quantized MAD values, using %d bins (adaptive)\n", nbins);
-        } else {
-            // 标准情况，使用更多bin获得细分辨率
-            nbins = (int)(sqrt(nchan) * 2);
-            if (nbins < 30) nbins = 30;
-            if (nbins > 100) nbins = 100;
-            printf("Using %d bins for standard MAD distribution\n", nbins);
-        }
         float *hist = (float *)calloc(nbins, sizeof(float));
         float plot_min = mad_min;
         float plot_max = mad_max;
@@ -863,38 +901,15 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
         }
         float bin_width = (plot_max - plot_min) / nbins;
 
-        // 调试信息：打印实际MAD值的分布
-        printf("=== Debug: Analyzing MAD value distribution ===\n");
-        printf("First 10 MAD values: ");
-        for (i = 0; i < 10 && i < nchan; i++) {
-            printf("%.6f ", channel_mad[i]);
-        }
-        printf("\n");
-        
-        printf("Total channels: %d, Unique MAD values: %d, Zero MAD values: %d\n", 
-               nchan, unique_values, zero_count);
-        printf("Minimum non-zero difference between MAD values: %.9f\n", min_diff);
-        printf("MAD value range: [%.6f, %.6f]\n", mad_min, mad_max);
-        printf("Plot range: [%.6f, %.6f], bin_width: %.6f, nbins: %d\n", 
-               plot_min, plot_max, bin_width, nbins);
-        
-        // 分析MAD值的量化程度
-        printf("Analyzing MAD value quantization...\n");
-        if (unique_values < nchan / 10) {
-            printf("WARNING: MAD values appear highly quantized (%d unique values for %d channels)\n", 
-                   unique_values, nchan);
-            printf("This suggests the input data may be heavily digitized or have low dynamic range.\n");
-        }
+        printf("MAD value range: [%.6f, %.6f], using %d bins\n", mad_min, mad_max, nbins);
 
-        // 填充直方图并添加调试信息
+        // 填充直方图
         for (i = 0; i < nchan; i++)
         {
             int bin = (int)((channel_mad[i] - plot_min) / bin_width);
             if (bin < 0) bin = 0;
             if (bin >= nbins) bin = nbins - 1;
             hist[bin]++;
-            
-            // 调试：打印前几个值的bin分配
             if (i < 10) {
                 printf("MAD[%d]=%.6f -> bin %d\n", i, channel_mad[i], bin);
             }
@@ -920,74 +935,36 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
             if (hist[i] > max_count) max_count = hist[i];
         }
 
-        // 绘制直方图
+        // --- 第一个图：绘制完整MAD直方图 ---
         printf("Creating MAD histogram plot...\n");
-        cpgpage();
-        cpgvstd();
-        cpgsch(1.2);
-        cpgswin(plot_min, plot_max, 0, max_count * 1.1f);
-        cpgbox("BCNST", 0.0, 0, "BCNST", 0.0, 0);
-        cpglab("Channel MAD", "Number of Channels", "Channel MAD Distribution");
+        cpgpage();                          // 创建新页面
+        cpgvstd();                         // 设置标准视窗
+        cpgsch(1.2);                       // 设置字符大小
+        cpgswin(plot_min, plot_max, 0, max_count * 1.1f);  // 设置世界坐标
+        cpgbox("BCNST", 0.0, 0, "BCNST", 0.0, 0);          // 绘制坐标轴
+        cpglab("Channel MAD", "Number of Channels", "Channel MAD Distribution");  // 添加标签
         printf("MAD histogram axes set up complete\n");
 
-        // 绘制实心直方图条
+        // --- 第一个图：绘制直方图条 ---
         cpgsci(2); // 红色
         for (i = 0; i < nbins; i++)
         {
             float x1 = plot_min + i * bin_width;
             float x2 = plot_min + (i + 1) * bin_width;
-            cpgrect(x1, x2, 0, hist[i]);
+            cpgrect(x1, x2, 0, hist[i]);   // 绘制每个直方图条
         }
 
-        // 阈值线
-        cpgsci(3); // 绿色 - 正3MAD
-        cpgmove(thresh_3mad, 0);
-        cpgdraw(thresh_3mad, max_count * 1.1f);
-        cpgptxt(thresh_3mad, max_count * 1.05f, 0.0, 0.0, "3*MAD");
-
-        cpgsci(4); // 蓝色 - 正5MAD
-        cpgmove(thresh_5mad, 0);
-        cpgdraw(thresh_5mad, max_count * 1.1f);
-        cpgptxt(thresh_5mad, max_count * 1.00f, 0.0, 0.0, "5*MAD");
-
-        // 新增 +1MAD 线
-        float thresh_1mad = mad_median + 1.0f * mad_mad;
-        if (mad_mad < 1e-6f || thresh_1mad <= mad_median) {
-            float data_range = mad_max - mad_min;
-            thresh_1mad = mad_median + 0.03f * data_range;  // 3% of range above median
+        // --- 第一个图：绘制统一的11条阈值线系统 ---
+        for (int i = 0; i < NUM_ALL_THRESHOLDS; i++) {
+            if (threshold_enabled[i] && all_thresh_values[i] >= plot_min && all_thresh_values[i] <= plot_max) {
+                cpgsci(all_threshold_colors[i]);                    // 设置阈值线颜色
+                cpgmove(all_thresh_values[i], 0);                   // 移动到起点
+                cpgdraw(all_thresh_values[i], max_count * 1.1f);    // 绘制垂直线
+                cpgptxt(all_thresh_values[i], max_count * all_y_positions[i], 0.0, 0.0, all_threshold_labels[i]);  // 添加标签
+            }
         }
-        cpgsci(6); // 品红色 - 正1MAD
-        cpgmove(thresh_1mad, 0);
-        cpgdraw(thresh_1mad, max_count * 1.1f);
-        cpgptxt(thresh_1mad, max_count * 0.85f, 0.0, 0.0, "1*MAD");
 
-        // 新增 -1MAD 线
-        float thresh_neg1mad = mad_median - 1.0f * mad_mad;
-        if (mad_mad < 1e-6f || thresh_neg1mad >= mad_median) {
-            float data_range = mad_max - mad_min;
-            thresh_neg1mad = mad_median - 0.03f * data_range;  // 3% of range below median
-        }
-        cpgsci(6); // 品红色 - 负1MAD
-        cpgmove(thresh_neg1mad, 0);
-        cpgdraw(thresh_neg1mad, max_count * 1.1f);
-        cpgptxt(thresh_neg1mad, max_count * 0.75f, 0.0, 0.0, "-1*MAD");
-
-        // 新增 +2MAD 线
-        float thresh_2mad = mad_median + 2.0f * mad_mad;
-        if (mad_mad < 1e-6f || thresh_2mad <= mad_median) {
-            float data_range = mad_max - mad_min;
-            thresh_2mad = mad_median + 0.06f * data_range;  // 6% of range above median
-        }
-        cpgsci(8); // 橙色 - 正2MAD
-        cpgmove(thresh_2mad, 0);
-        cpgdraw(thresh_2mad, max_count * 1.1f);
-        cpgptxt(thresh_2mad, max_count * 0.90f, 0.0, 0.0, "2*MAD");
-
-        // 中位线
-        cpgsci(1); // 白色
-        cpgmove(mad_median, 0);
-        cpgdraw(mad_median, max_count * 1.1f);
-        cpgptxt(mad_median, max_count * 0.65f, 0.0, 0.0, "Median");
+        cpgsci(1); // 恢复白色
 
         // === 添加高斯拟合曲线 ===
         printf("Fitting Gaussian curve to MAD histogram...\n");
@@ -997,6 +974,7 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
         float *y_data = (float *)malloc(nbins * sizeof(float));
         int fit_points = 0;
         
+        // --- 第一个图：高斯曲线拟合 ---
         for (i = 0; i < nbins; i++) {
             if (hist[i] > 0) {  // 只使用非零的bin进行拟合
                 x_data[fit_points] = plot_min + (i + 0.5f) * bin_width;  // bin center
@@ -1005,43 +983,41 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
             }
         }
         
-        if (fit_points > 3) {  // 需要至少3个点进行高斯拟合
-            // 使用现有的simple_curve_fit函数进行拟合
-            float fitted_sigma = simple_curve_fit(x_data, y_data, fit_points, mad_median);
+        // 使用现有的simple_curve_fit函数进行拟合
+        float fitted_sigma = simple_curve_fit(x_data, y_data, fit_points, mad_median);
+        printf("Gaussian fit: center=%.6f, sigma=%.6f\n", mad_median, fitted_sigma);
+        
+        // --- 第一个图：绘制拟合的高斯曲线 ---
+        cpgsci(5); // 青色
+        cpgsls(2); // 虚线
+        
+        int curve_points = 200;
+        float curve_step = (plot_max - plot_min) / curve_points;
+        
+        for (i = 0; i < curve_points; i++) {
+            float x = plot_min + i * curve_step;
+            float y = max_count * gaus(x, mad_median, fitted_sigma);
             
-            printf("Gaussian fit: center=%.6f, sigma=%.6f\n", mad_median, fitted_sigma);
-            
-            // 绘制拟合的高斯曲线
-            cpgsci(5); // 青色
-            cpgsls(2); // 虚线
-            
-            int curve_points = 200;
-            float curve_step = (plot_max - plot_min) / curve_points;
-            
-            for (i = 0; i < curve_points; i++) {
-                float x = plot_min + i * curve_step;
-                float y = max_count * gaus(x, mad_median, fitted_sigma);
-                
-                if (i == 0) {
-                    cpgmove(x, y);
-                } else {
-                    cpgdraw(x, y);
-                }
+            if (i == 0) {
+                cpgmove(x, y);
+            } else {
+                cpgdraw(x, y);
             }
-            
-            // 添加拟合曲线标签
-            cpgptxt(mad_median + fitted_sigma, max_count * 0.4f, 0.0, 0.0, "Gaussian Fit");
-            
-            cpgsls(1); // 恢复实线
-        } else {
-            printf("Insufficient data points for Gaussian fitting (%d points)\n", fit_points);
         }
         
+        cpgptxt(mad_median + fitted_sigma, max_count * 0.4f, 0.0, 0.0, "Gaussian Fit");
+        cpgsls(1);
+
         free(x_data);
         free(y_data);
 
         cpgsci(1); // 恢复白色
+        // *** 第一个图绘制完成 ***
 
+        //=============================================================================
+        // 🔍 第二个图：放大MAD直方图 (Zoomed MAD Histogram - Range 0-0.25) 
+        //=============================================================================
+        
         // === 添加0到0.25区间的放大直方图 ===
         printf("Creating zoomed MAD histogram for range 0-0.25...\n");
         
@@ -1055,19 +1031,19 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
         }
         
         if (has_data_in_range) {
-            // 创建新页面用于放大直方图
-            cpgpage();
-            cpgvstd();
-            cpgsch(1.2);
+            // --- 第二个图：创建新页面和设置 ---
+            cpgpage();                          // 创建新页面用于放大直方图
+            cpgvstd();                         // 设置标准视窗
+            cpgsch(1.2);                       // 设置字符大小
             
-            // 为0-0.25区间创建细分直方图
-            int zoom_nbins = 50; // 使用更多bin获得更高分辨率
+            // --- 第二个图：为0-0.25区间创建细分直方图数据 ---
+            int zoom_nbins = 50;               // 使用更多bin获得更高分辨率
             float zoom_min = 0.0f;
             float zoom_max = 0.25f;
             float zoom_bin_width = (zoom_max - zoom_min) / zoom_nbins;
             float *zoom_hist = (float *)calloc(zoom_nbins, sizeof(float));
             
-            // 填充放大直方图
+            // --- 第二个图：填充放大直方图数据 ---
             int zoom_count = 0;
             for (i = 0; i < nchan; i++) {
                 if (channel_mad[i] >= zoom_min && channel_mad[i] <= zoom_max) {
@@ -1079,113 +1055,41 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
                 }
             }
             
-            // 计算放大区间的最大计数
+            // --- 第二个图：计算放大区间的最大计数 ---
             float zoom_max_count = 0;
             for (i = 0; i < zoom_nbins; i++) {
                 if (zoom_hist[i] > zoom_max_count) zoom_max_count = zoom_hist[i];
             }
             
             if (zoom_max_count > 0) {
-                // 设置坐标系
-                cpgswin(zoom_min, zoom_max, 0, zoom_max_count * 1.1f);
-                cpgbox("BCNST", 0.0, 0, "BCNST", 0.0, 0);
-                cpglab("Channel MAD", "Number of Channels", "Channel MAD Distribution (Zoomed: 0-0.25)");
+                // --- 第二个图：设置坐标系和标签 ---
+                cpgswin(zoom_min, zoom_max, 0, zoom_max_count * 1.1f);     // 设置世界坐标
+                cpgbox("BCNST", 0.0, 0, "BCNST", 0.0, 0);                  // 绘制坐标轴
+                cpglab("Channel MAD", "Number of Channels", "Channel MAD Distribution (Zoomed: 0-0.25)");  // 添加标签
                 
-                // 绘制放大的直方图条
+                // --- 第二个图：绘制放大的直方图条 ---
                 cpgsci(2); // 红色
                 for (i = 0; i < zoom_nbins; i++) {
                     if (zoom_hist[i] > 0) {
                         float x1 = zoom_min + i * zoom_bin_width;
                         float x2 = zoom_min + (i + 1) * zoom_bin_width;
-                        cpgrect(x1, x2, 0, zoom_hist[i]);
+                        cpgrect(x1, x2, 0, zoom_hist[i]);       // 绘制每个放大直方图条
                     }
                 }
                 
-                // 在放大图中添加相关阈值线（如果在范围内）
-                if (mad_median >= zoom_min && mad_median <= zoom_max) {
-                    cpgsci(1); // 白色
-                    cpgmove(mad_median, 0);
-                    cpgdraw(mad_median, zoom_max_count * 1.1f);
-                    cpgptxt(mad_median, zoom_max_count * 0.9f, 0.0, 0.0, "Median");
+                // --- 第二个图：绘制统一的11条阈值线系统（放大版本） ---
+                for (int i = 0; i < NUM_ALL_THRESHOLDS; i++) {
+                    if (threshold_enabled[i] && all_thresh_values[i] >= zoom_min && all_thresh_values[i] <= zoom_max) {
+                        cpgsci(all_threshold_colors[i]);                    // 设置阈值线颜色
+                        cpgmove(all_thresh_values[i], 0);                   // 移动到起点
+                        cpgdraw(all_thresh_values[i], zoom_max_count * 1.1f);  // 绘制垂直线
+                        cpgptxt(all_thresh_values[i], zoom_max_count * all_y_positions[i], 0.0, 0.0, all_threshold_labels[i]);  // 添加标签
+                    }
                 }
                 
-                if (thresh_1mad >= zoom_min && thresh_1mad <= zoom_max) {
-                    cpgsci(6); // 品红色
-                    cpgmove(thresh_1mad, 0);
-                    cpgdraw(thresh_1mad, zoom_max_count * 1.1f);
-                    cpgptxt(thresh_1mad, zoom_max_count * 0.8f, 0.0, 0.0, "1*MAD");
-                }
-                
-                if (thresh_neg1mad >= zoom_min && thresh_neg1mad <= zoom_max) {
-                    cpgsci(6); // 品红色
-                    cpgmove(thresh_neg1mad, 0);
-                    cpgdraw(thresh_neg1mad, zoom_max_count * 1.1f);
-                    cpgptxt(thresh_neg1mad, zoom_max_count * 0.7f, 0.0, 0.0, "-1*MAD");
-                }
-                
-                if (thresh_2mad >= zoom_min && thresh_2mad <= zoom_max) {
-                    cpgsci(8); // 橙色
-                    cpgmove(thresh_2mad, 0);
-                    cpgdraw(thresh_2mad, zoom_max_count * 1.1f);
-                    cpgptxt(thresh_2mad, zoom_max_count * 0.6f, 0.0, 0.0, "2*MAD");
-                }
-                
-                // 添加负2倍MAD线
-                float thresh_neg2mad = mad_median - 2.0f * mad_mad;
-                if (mad_mad < 1e-6f || thresh_neg2mad >= mad_median) {
-                    float data_range = mad_max - mad_min;
-                    thresh_neg2mad = mad_median - 0.06f * data_range;  // 6% of range below median
-                }
-                if (thresh_neg2mad >= zoom_min && thresh_neg2mad <= zoom_max) {
-                    cpgsci(8); // 橙色
-                    cpgmove(thresh_neg2mad, 0);
-                    cpgdraw(thresh_neg2mad, zoom_max_count * 1.1f);
-                    cpgptxt(thresh_neg2mad, zoom_max_count * 0.5f, 0.0, 0.0, "-2*MAD");
-                }
-                
-                if (thresh_3mad >= zoom_min && thresh_3mad <= zoom_max) {
-                    cpgsci(3); // 绿色
-                    cpgmove(thresh_3mad, 0);
-                    cpgdraw(thresh_3mad, zoom_max_count * 1.1f);
-                    cpgptxt(thresh_3mad, zoom_max_count * 0.4f, 0.0, 0.0, "3*MAD");
-                }
-                
-                // 添加负3倍MAD线
-                float thresh_neg3mad = mad_median - 3.0f * mad_mad;
-                if (mad_mad < 1e-6f || thresh_neg3mad >= mad_median) {
-                    float data_range = mad_max - mad_min;
-                    thresh_neg3mad = mad_median - 0.09f * data_range;  // 9% of range below median
-                }
-                if (thresh_neg3mad >= zoom_min && thresh_neg3mad <= zoom_max) {
-                    cpgsci(3); // 绿色
-                    cpgmove(thresh_neg3mad, 0);
-                    cpgdraw(thresh_neg3mad, zoom_max_count * 1.1f);
-                    cpgptxt(thresh_neg3mad, zoom_max_count * 0.3f, 0.0, 0.0, "-3*MAD");
-                }
-                
-                if (thresh_5mad >= zoom_min && thresh_5mad <= zoom_max) {
-                    cpgsci(4); // 蓝色
-                    cpgmove(thresh_5mad, 0);
-                    cpgdraw(thresh_5mad, zoom_max_count * 1.1f);
-                    cpgptxt(thresh_5mad, zoom_max_count * 0.2f, 0.0, 0.0, "5*MAD");
-                }
-                
-                // 添加负5倍MAD线
-                float thresh_neg5mad = mad_median - 5.0f * mad_mad;
-                if (mad_mad < 1e-6f || thresh_neg5mad >= mad_median) {
-                    float data_range = mad_max - mad_min;
-                    thresh_neg5mad = mad_median - 0.15f * data_range;  // 15% of range below median
-                }
-                if (thresh_neg5mad >= zoom_min && thresh_neg5mad <= zoom_max) {
-                    cpgsci(4); // 蓝色
-                    cpgmove(thresh_neg5mad, 0);
-                    cpgdraw(thresh_neg5mad, zoom_max_count * 1.1f);
-                    cpgptxt(thresh_neg5mad, zoom_max_count * 0.1f, 0.0, 0.0, "-5*MAD");
-                }
-                
-                // Add Gaussian curve fitting to zoomed histogram
-                if (zoom_count >= 10) {  // Need sufficient data points for fitting
-                    // Convert zoomed histogram to data points for fitting
+                // --- 第二个图：高斯曲线拟合（针对放大直方图） ---
+                if (zoom_count >= 10) {  // 需要足够的数据点进行拟合
+                    // 将放大直方图转换为拟合用的数据点
                     int fit_points = 0;
                     float *fit_x = calloc(zoom_nbins, sizeof(float));
                     float *fit_y = calloc(zoom_nbins, sizeof(float));
@@ -1199,7 +1103,7 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
                             }
                         }
                         
-                        if (fit_points >= 3) {  // Minimum points for Gaussian fit
+                        if (fit_points >= 3) {  // 高斯拟合需要的最少点数
                             // Fit Gaussian curve using existing simple_curve_fit function
                             float fitted_sigma = simple_curve_fit(fit_x, fit_y, fit_points, mad_median);
                             
@@ -1231,6 +1135,7 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
                 
                 cpgsci(1); // 恢复白色
                 printf("Zoomed MAD histogram completed! (%d channels in 0-0.25 range)\n", zoom_count);
+                // *** 第二个图绘制完成 ***
             } else {
                 printf("No data found in 0-0.25 range for MAD histogram\n");
             }
@@ -1239,6 +1144,10 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
         } else {
             printf("No MAD data in 0-0.25 range, skipping zoomed histogram\n");
         }
+
+        //=============================================================================
+        // 🏁 两个图的绘制全部完成
+        //=============================================================================
 
         printf("MAD histogram plot completed!\n");
         free(hist);
@@ -1329,99 +1238,35 @@ void visualizeChannelStd(float *data, int nsamp, int nchan, int plot)
     printf("STD Min: %.6f\n", std_min);
     printf("STD Max: %.6f\n", std_max);
     
-    // Calculate suggested thresholds based on statistics
-    float thresh_neg1std = std_median - 1.0f * std_std;
-    float thresh_1std = std_median + 1.0f * std_std;
-    float thresh_2std = std_median + 2.0f * std_std;
-    float thresh_3std = std_median + 3.0f * std_std;
-    float thresh_5std = std_median + 5.0f * std_std;
+    // 统一的阈值计算系统（移除fallback逻辑）
+    float multipliers[6] = {-1.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f};
+    float threshold_values[6];
+    const char* threshold_names[6] = {"-1*STD", "1*STD", "2*STD", "3*STD", "4*STD", "5*STD"};
     
-    // Range-based fallbacks for edge cases
-    if (std_std < 1e-6f || thresh_neg1std >= std_median) {
-        float data_range = std_max - std_min;
-        thresh_neg1std = std_median - 0.03f * data_range;
-    }
-    if (std_std < 1e-6f || thresh_1std <= std_median) {
-        float data_range = std_max - std_min;
-        thresh_1std = std_median + 0.03f * data_range;
-    }
-    if (std_std < 1e-6f || thresh_2std <= std_median) {
-        float data_range = std_max - std_min;
-        thresh_2std = std_median + 0.06f * data_range;
-    }
-    if (std_std < 1e-6f || thresh_3std <= std_median) {
-        float data_range = std_max - std_min;
-        thresh_3std = std_median + 0.09f * data_range;
-    }
-    if (std_std < 1e-6f || thresh_5std <= std_median) {
-        float data_range = std_max - std_min;
-        thresh_5std = std_median + 0.15f * data_range;
+    // 直接计算所有阈值
+    for (int i = 0; i < 6; i++) {
+        threshold_values[i] = std_median + multipliers[i] * std_std;
     }
     
+    // 统一打印阈值
     printf("\n=== Suggested Thresholds ===\n");
-    printf("-1*STD threshold: %.6f\n", thresh_neg1std);
-    printf("1*STD threshold: %.6f\n", thresh_1std);
-    printf("2*STD threshold: %.6f\n", thresh_2std);
-    printf("3*STD threshold: %.6f\n", thresh_3std);
-    printf("5*STD threshold: %.6f\n", thresh_5std);
-    
-    // Count channels that would be flagged at different thresholds
-    int count_neg1std = 0, count_1std = 0, count_2std = 0, count_3std = 0, count_5std = 0;
-    for (i = 0; i < nchan; i++)
-    {
-        if (channel_std[i] < thresh_neg1std) count_neg1std++;
-        if (channel_std[i] > thresh_1std) count_1std++;
-        if (channel_std[i] > thresh_2std) count_2std++;
-        if (channel_std[i] > thresh_3std) count_3std++;
-        if (channel_std[i] > thresh_5std) count_5std++;
+    for (int i = 0; i < 6; i++) {
+        printf("%s threshold: %.6f\n", threshold_names[i], threshold_values[i]);
     }
     
-    printf("\n=== Channels flagged at different thresholds ===\n");
-    printf("-1*STD: %d channels (%.2f%%)\n", count_neg1std, (float)count_neg1std/nchan*100);
-    printf("1*STD: %d channels (%.2f%%)\n", count_1std, (float)count_1std/nchan*100);
-    printf("2*STD: %d channels (%.2f%%)\n", count_2std, (float)count_2std/nchan*100);
-    printf("3*STD: %d channels (%.2f%%)\n", count_3std, (float)count_3std/nchan*100);
-    printf("5*STD: %d channels (%.2f%%)\n", count_5std, (float)count_5std/nchan*100);
+    // Print threshold statistics using the new function
+    printThresholdStatistics(channel_std, nchan, threshold_values, threshold_names, 6, "STD");
     
+    // =====================================================================
+    // 第一部分：绘制完整范围的STD直方图（包含所有统一的阈值线）
+    // =====================================================================
     if (plot)
     {
-        // 首先统计STD值的分布特征
-        int unique_values = 0;
-        int zero_count = 0;
-        float min_diff = 1e6f;
-        
-        for (i = 0; i < nchan; i++) {
-            if (channel_std[i] == 0.0f) zero_count++;
-            
-            // 检查是否是新的唯一值
-            int is_unique = 1;
-            for (j = 0; j < i; j++) {
-                float diff = fabsf(channel_std[i] - channel_std[j]);
-                if (diff < 1e-9f) {
-                    is_unique = 0;
-                    break;
-                } else if (diff > 1e-9f && diff < min_diff) {
-                    min_diff = diff;
-                }
-            }
-            if (is_unique) unique_values++;
-        }
-        
-        // 使用适应性bin数量，对高度离散的数据减少bin数
-        int nbins;
-        if (unique_values < nchan / 10) {
-            // 如果STD值高度离散，使用较少的bin数避免稀疏直方图
-            nbins = unique_values * 2;  // 每个唯一值分配2个bin
-            if (nbins < 20) nbins = 20;
-            if (nbins > 60) nbins = 60;
-            printf("Detected highly quantized STD values, using %d bins (adaptive)\n", nbins);
-        } else {
-            // 标准情况，使用更多bin获得细分辨率
-            nbins = (int)(sqrt(nchan) * 2);
-            if (nbins < 30) nbins = 30;
-            if (nbins > 100) nbins = 100;
-            printf("Using %d bins for standard STD distribution\n", nbins);
-        }
+        // 使用标准的直方图bin数量（STD离散化问题已在算法层面解决）
+        int nbins = (int)(sqrt(nchan) * 2);
+        if (nbins < 30) nbins = 30;
+        if (nbins > 100) nbins = 100;
+        printf("Using %d bins for STD histogram\n", nbins);
         
         float *hist = (float *)calloc(nbins, sizeof(float));
         float plot_min = std_min;
@@ -1439,55 +1284,16 @@ void visualizeChannelStd(float *data, int nsamp, int nchan, int plot)
         }
         float bin_width = (plot_max - plot_min) / nbins;
 
-        // 调试信息：打印实际STD值的分布
-        printf("=== Debug: Analyzing STD value distribution ===\n");
-        printf("First 10 STD values: ");
-        for (i = 0; i < 10 && i < nchan; i++) {
-            printf("%.6f ", channel_std[i]);
-        }
-        printf("\n");
-        
-        printf("Total channels: %d, Unique STD values: %d, Zero STD values: %d\n", 
-               nchan, unique_values, zero_count);
-        printf("Minimum non-zero difference between STD values: %.9f\n", min_diff);
-        printf("STD value range: [%.6f, %.6f]\n", std_min, std_max);
-        printf("Plot range: [%.6f, %.6f], bin_width: %.6f, nbins: %d\n", 
-               plot_min, plot_max, bin_width, nbins);
-        
-        // 分析STD值的量化程度
-        printf("Analyzing STD value quantization...\n");
-        if (unique_values < nchan / 10) {
-            printf("WARNING: STD values appear highly quantized (%d unique values for %d channels)\n", 
-                   unique_values, nchan);
-            printf("This suggests the input data may be heavily digitized or have low dynamic range.\n");
-        }
+        printf("STD value range: [%.6f, %.6f], using %d bins\n", std_min, std_max, nbins);
 
-        // 填充直方图并添加调试信息
+        // 填充直方图
         for (i = 0; i < nchan; i++)
         {
             int bin = (int)((channel_std[i] - plot_min) / bin_width);
             if (bin < 0) bin = 0;
             if (bin >= nbins) bin = nbins - 1;
             hist[bin]++;
-            
-            // 调试：打印前几个值的bin分配
-            if (i < 10) {
-                printf("STD[%d]=%.6f -> bin %d\n", i, channel_std[i], bin);
-            }
         }
-
-        // 统计非零bin数量
-        int non_zero_bins = 0;
-        for (i = 0; i < nbins; i++) {
-            if (hist[i] > 0) {
-                non_zero_bins++;
-                if (non_zero_bins <= 10) { // 只打印前10个非零bin
-                    printf("Bin %d: %.0f channels (x-range: %.6f to %.6f)\n", 
-                           i, hist[i], plot_min + i * bin_width, plot_min + (i + 1) * bin_width);
-                }
-            }
-        }
-        printf("Total non-zero bins: %d out of %d\n", non_zero_bins, nbins);
 
         // 计算最大计数
         float max_count = 0;
@@ -1515,44 +1321,60 @@ void visualizeChannelStd(float *data, int nsamp, int nchan, int plot)
             cpgrect(x1, x2, 0, hist[i]);
         }
 
-        // 阈值线
-        cpgsci(3); // 绿色 - 正3倍STD
-        cpgmove(thresh_3std, 0);
-        cpgdraw(thresh_3std, max_count * 1.1f);
-        cpgptxt(thresh_3std, max_count * 1.05f, 0.0, 0.0, "3*STD");
+        // === 统一的阈值配置系统（类似MAD函数） ===
+        // 阈值对控制开关：[±1, ±2, ±3, ±4, ±5]
+        int threshold_pair_enabled[5] = {1, 1, 1, 0, 1}; // ±1,±2,±3开启，±4关闭，±5开启
+        int show_median = 1; // 显示中位线
+        
+        // 计算负值阈值（使用已有的正值阈值进行对称计算）
+        float thresh_neg1std = threshold_values[0];  // 直接使用前面计算的结果
+        float thresh_neg2std = std_median - (threshold_values[2] - std_median);  // 相对于中位值对称
+        float thresh_neg3std = std_median - (threshold_values[3] - std_median);
+        float thresh_neg4std = std_median - (threshold_values[4] - std_median);
+        float thresh_neg5std = std_median - (threshold_values[5] - std_median);
+        
+        // 统一的阈值数组配置
+        float all_thresh_values[11] = {
+            thresh_neg5std, thresh_neg4std, thresh_neg3std, thresh_neg2std, thresh_neg1std,
+            std_median,
+            threshold_values[1], threshold_values[2], threshold_values[3], threshold_values[4], threshold_values[5]
+        };
+        
+        char *all_threshold_labels[11] = {
+            "-5*STD", "-4*STD", "-3*STD", "-2*STD", "-1*STD",
+            "Median",
+            "1*STD", "2*STD", "3*STD", "4*STD", "5*STD"
+        };
+        
+        int all_threshold_colors[11] = {4, 7, 3, 8, 6, 1, 6, 8, 3, 7, 4}; // 对称配色
+        float all_y_positions[11] = {0.1f, 0.2f, 0.3f, 0.5f, 0.7f, 0.65f, 0.75f, 0.9f, 1.05f, 1.0f, 0.85f};
 
-        cpgsci(4); // 蓝色 - 正5倍STD
-        cpgmove(thresh_5std, 0);
-        cpgdraw(thresh_5std, max_count * 1.1f);
-        cpgptxt(thresh_5std, max_count * 1.00f, 0.0, 0.0, "5*STD");
-
-        // +1倍STD 线
-        cpgsci(6); // 品红色 - 正1倍STD
-        cpgmove(thresh_1std, 0);
-        cpgdraw(thresh_1std, max_count * 1.1f);
-        cpgptxt(thresh_1std, max_count * 0.85f, 0.0, 0.0, "1*STD");
-
-        // -1倍STD 线
-        cpgsci(6); // 品红色 - 负1倍STD
-        cpgmove(thresh_neg1std, 0);
-        cpgdraw(thresh_neg1std, max_count * 1.1f);
-        cpgptxt(thresh_neg1std, max_count * 0.75f, 0.0, 0.0, "-1*STD");
-
-        // +2倍STD 线
-        cpgsci(8); // 橙色 - 正2倍STD
-        cpgmove(thresh_2std, 0);
-        cpgdraw(thresh_2std, max_count * 1.1f);
-        cpgptxt(thresh_2std, max_count * 0.90f, 0.0, 0.0, "2*STD");
-
-        // 中位线
-        cpgsci(1); // 白色
-        cpgmove(std_median, 0);
-        cpgdraw(std_median, max_count * 1.1f);
-        cpgptxt(std_median, max_count * 0.65f, 0.0, 0.0, "Median");
+        // 绘制阈值线
+        for (int thresh_idx = 0; thresh_idx < 11; thresh_idx++) {
+            int should_draw = 0;
+            
+            if (thresh_idx == 5) { // 中位线
+                should_draw = show_median;
+            } else {
+                // 阈值对：索引0,1,2,3,4对应负值，索引6,7,8,9,10对应正值
+                int pair_idx = (thresh_idx < 5) ? (4 - thresh_idx) : (thresh_idx - 6);
+                should_draw = threshold_pair_enabled[pair_idx];
+            }
+            
+            if (should_draw) {
+                cpgsci(all_threshold_colors[thresh_idx]);
+                cpgmove(all_thresh_values[thresh_idx], 0);
+                cpgdraw(all_thresh_values[thresh_idx], max_count * 1.1f);
+                cpgptxt(all_thresh_values[thresh_idx], max_count * all_y_positions[thresh_idx], 
+                       0.0, 0.0, all_threshold_labels[thresh_idx]);
+            }
+        }
 
         cpgsci(1); // 恢复白色
 
-        // === 添加0到0.25区间的放大直方图 ===
+        // =====================================================================
+        // 第二部分：绘制0-0.25区间的放大STD直方图（细节视图）
+        // =====================================================================
         printf("Creating zoomed STD histogram for range 0-0.25...\n");
         
         // 检查是否有数据在0-0.25范围内
@@ -1611,86 +1433,28 @@ void visualizeChannelStd(float *data, int nsamp, int nchan, int plot)
                     }
                 }
                 
-                // 在放大图中添加相关阈值线（如果在范围内）
-                if (std_median >= zoom_min && std_median <= zoom_max) {
-                    cpgsci(1); // 白色
-                    cpgmove(std_median, 0);
-                    cpgdraw(std_median, zoom_max_count * 1.1f);
-                    cpgptxt(std_median, zoom_max_count * 0.9f, 0.0, 0.0, "Median");
-                }
-                
-                if (thresh_1std >= zoom_min && thresh_1std <= zoom_max) {
-                    cpgsci(6); // 品红色
-                    cpgmove(thresh_1std, 0);
-                    cpgdraw(thresh_1std, zoom_max_count * 1.1f);
-                    cpgptxt(thresh_1std, zoom_max_count * 0.8f, 0.0, 0.0, "1*STD");
-                }
-                
-                if (thresh_neg1std >= zoom_min && thresh_neg1std <= zoom_max) {
-                    cpgsci(6); // 品红色
-                    cpgmove(thresh_neg1std, 0);
-                    cpgdraw(thresh_neg1std, zoom_max_count * 1.1f);
-                    cpgptxt(thresh_neg1std, zoom_max_count * 0.7f, 0.0, 0.0, "-1*STD");
-                }
-                
-                if (thresh_2std >= zoom_min && thresh_2std <= zoom_max) {
-                    cpgsci(8); // 橙色
-                    cpgmove(thresh_2std, 0);
-                    cpgdraw(thresh_2std, zoom_max_count * 1.1f);
-                    cpgptxt(thresh_2std, zoom_max_count * 0.6f, 0.0, 0.0, "2*STD");
-                }
-                
-                // 添加负2倍STD线
-                float thresh_neg2std = std_median - 2.0f * std_std;
-                if (std_std < 1e-6f || thresh_neg2std >= std_median) {
-                    float data_range = std_max - std_min;
-                    thresh_neg2std = std_median - 0.06f * data_range;  // 6% of range below median
-                }
-                if (thresh_neg2std >= zoom_min && thresh_neg2std <= zoom_max) {
-                    cpgsci(8); // 橙色
-                    cpgmove(thresh_neg2std, 0);
-                    cpgdraw(thresh_neg2std, zoom_max_count * 1.1f);
-                    cpgptxt(thresh_neg2std, zoom_max_count * 0.5f, 0.0, 0.0, "-2*STD");
-                }
-                
-                if (thresh_3std >= zoom_min && thresh_3std <= zoom_max) {
-                    cpgsci(3); // 绿色
-                    cpgmove(thresh_3std, 0);
-                    cpgdraw(thresh_3std, zoom_max_count * 1.1f);
-                    cpgptxt(thresh_3std, zoom_max_count * 0.4f, 0.0, 0.0, "3*STD");
-                }
-                
-                // 添加负3倍STD线
-                float thresh_neg3std = std_median - 3.0f * std_std;
-                if (std_std < 1e-6f || thresh_neg3std >= std_median) {
-                    float data_range = std_max - std_min;
-                    thresh_neg3std = std_median - 0.09f * data_range;  // 9% of range below median
-                }
-                if (thresh_neg3std >= zoom_min && thresh_neg3std <= zoom_max) {
-                    cpgsci(3); // 绿色
-                    cpgmove(thresh_neg3std, 0);
-                    cpgdraw(thresh_neg3std, zoom_max_count * 1.1f);
-                    cpgptxt(thresh_neg3std, zoom_max_count * 0.3f, 0.0, 0.0, "-3*STD");
-                }
-                
-                if (thresh_5std >= zoom_min && thresh_5std <= zoom_max) {
-                    cpgsci(4); // 蓝色
-                    cpgmove(thresh_5std, 0);
-                    cpgdraw(thresh_5std, zoom_max_count * 1.1f);
-                    cpgptxt(thresh_5std, zoom_max_count * 0.2f, 0.0, 0.0, "5*STD");
-                }
-                
-                // 添加负5倍STD线
-                float thresh_neg5std = std_median - 5.0f * std_std;
-                if (std_std < 1e-6f || thresh_neg5std >= std_median) {
-                    float data_range = std_max - std_min;
-                    thresh_neg5std = std_median - 0.15f * data_range;  // 15% of range below median
-                }
-                if (thresh_neg5std >= zoom_min && thresh_neg5std <= zoom_max) {
-                    cpgsci(4); // 蓝色
-                    cpgmove(thresh_neg5std, 0);
-                    cpgdraw(thresh_neg5std, zoom_max_count * 1.1f);
-                    cpgptxt(thresh_neg5std, zoom_max_count * 0.1f, 0.0, 0.0, "-5*STD");
+                // === 使用统一系统绘制放大图中的阈值线 ===
+                for (int thresh_idx = 0; thresh_idx < 11; thresh_idx++) {
+                    int should_draw = 0;
+                    
+                    if (thresh_idx == 5) { // 中位线
+                        should_draw = show_median;
+                    } else {
+                        // 阈值对：索引0,1,2,3,4对应负值，索引6,7,8,9,10对应正值
+                        int pair_idx = (thresh_idx < 5) ? (4 - thresh_idx) : (thresh_idx - 6);
+                        should_draw = threshold_pair_enabled[pair_idx];
+                    }
+                    
+                    if (should_draw && all_thresh_values[thresh_idx] >= zoom_min && all_thresh_values[thresh_idx] <= zoom_max) {
+                        cpgsci(all_threshold_colors[thresh_idx]);
+                        cpgmove(all_thresh_values[thresh_idx], 0);
+                        cpgdraw(all_thresh_values[thresh_idx], zoom_max_count * 1.1f);
+                        // 调整y位置以适应放大图
+                        float zoom_y_pos = 0.1f + (thresh_idx * 0.08f);
+                        if (zoom_y_pos > 0.9f) zoom_y_pos = 0.9f;
+                        cpgptxt(all_thresh_values[thresh_idx], zoom_max_count * zoom_y_pos, 
+                               0.0, 0.0, all_threshold_labels[thresh_idx]);
+                    }
                 }
                 
                 cpgsci(1); // 恢复白色
@@ -2033,14 +1797,14 @@ void identSubstNSigma(
                 if (maskedRatio > 0.001f) { // Print if >0.1% flagged
                     #pragma omp critical
                     {
-                        printf("Channel %d: %d/%d flagged (%.3f%%), range [%d-%d] (%.1f%% span)", 
-                               chan, maskedCount, nsamp, maskedRatio*100, 
-                               firstFlagged, lastFlagged, rangeRatio*100);
+                        // printf("Channel %d: %d/%d flagged (%.3f%%), range [%d-%d] (%.1f%% span)", 
+                        //        chan, maskedCount, nsamp, maskedRatio*100, 
+                        //        firstFlagged, lastFlagged, rangeRatio*100);
                         if (maskedRatio > killThresh) {
                             if (shouldKillChannel) {
-                                printf(" -> KILLING ENTIRE CHANNEL");
+                                // printf(" -> KILLING ENTIRE CHANNEL");
                             } else {
-                                printf(" -> SKIPPED (localized RFI)");
+                                // printf(" -> SKIPPED (localized RFI)");
                             }
                         }
                         printf("\n");

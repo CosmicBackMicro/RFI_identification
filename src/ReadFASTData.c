@@ -18,6 +18,10 @@
 #include "transpose.h"
 #include "psrPalett.h"
 
+#ifdef HAVE_CUDA
+#include "cuda_acceleration.h"
+#endif
+
 #ifndef PI
 #define PI 3.14159265358979323846
 #endif
@@ -627,10 +631,33 @@ void writeFITSDataset(unsigned char *outRawData, float *scale, float *offset,
 int main(int argc, char *argv[])
 {
     setup_openmp(20);
+    
     Metadata m;
 
     int status = parseCommandLineArguments(argc, argv, &m);
+    if (status != 0) {
+        return status;
+    }
     readMetadata(&m);
+
+    // Initialize CUDA if available and enabled
+#ifdef HAVE_CUDA
+    if (m.enableCuda && cuda_isAvailable()) {
+        if (cuda_init() == 0) {
+            printf("CUDA acceleration enabled.\n");
+        } else {
+            printf("CUDA initialization failed, using CPU only.\n");
+            m.enableCuda = 0; // Disable CUDA for this session
+        }
+    } else if (!m.enableCuda) {
+        printf("CUDA acceleration disabled by user.\n");
+    } else {
+        printf("CUDA not available, using CPU only.\n");
+    }
+#else
+    printf("Built without CUDA support, using CPU only.\n");
+    m.enableCuda = 0; // Ensure consistency
+#endif
 
     fitsfile *fptr = NULL;
     int fits_status = 0;
@@ -646,6 +673,8 @@ int main(int argc, char *argv[])
         memset(saveName, 0, requiredSize);
         snprintf(saveName, requiredSize, "%s/%s_%.2f_%d_%d.ps/VCPS",
                  m.datasetPath, sourceName, 0.0, m.binFactorTime, m.binFactorFreq);
+        // 初始化PGPLOT图形输出系统，设置输出设备为PostScript文件
+        // 参数：设备数量=1，文件名包含路径和设备类型，子图布局为2列×3行
         cpgbeg(1, saveName, 2, 3);
         free(sourceName);
         free(saveName);
@@ -730,7 +759,27 @@ int main(int argc, char *argv[])
             memcpy(scaleBinned, scale, sizeof(float) * nchanBinned);
             memcpy(offsetBinned, offset, sizeof(float) * nchanBinned);
         }
+        
+        // CUDA-accelerated transpose (with fallback to CPU)
+        printf("Performing matrix transpose (%d x %d)...\n", nsampBinned, nchanBinned);
+#ifdef HAVE_CUDA
+        if (m.enableCuda && cuda_isAvailable()) {
+            double start_time = omp_get_wtime();
+            cuda_transpose(outData, outDataT, nsampBinned, nchanBinned);
+            double cuda_time = omp_get_wtime() - start_time;
+            printf("CUDA transpose completed in %.4f seconds\n", cuda_time);
+        } else {
+            double start_time = omp_get_wtime();
+            transpose(outData, nsampBinned, nchanBinned, outDataT);
+            double cpu_time = omp_get_wtime() - start_time;
+            printf("CPU transpose completed in %.4f seconds\n", cpu_time);
+        }
+#else
+        double start_time = omp_get_wtime();
         transpose(outData, nsampBinned, nchanBinned, outDataT);
+        double cpu_time = omp_get_wtime() - start_time;
+        printf("CPU transpose completed in %.4f seconds\n", cpu_time);
+#endif
         
         if (m.generateMasks)
         {
@@ -738,10 +787,13 @@ int main(int argc, char *argv[])
 
             if (m.plot)
             { // Plot raw data
+                // 创建新的图形页面，为绘制原始数据做准备
                 cpgpage();
                 cpgmtxt("T", 3.0, 0.35, 0.5, "Raw Data");
-                // Use downsampled frequency array for plotting
+                // 使用降采样后的频率数组绘制原始数据的动态频谱图
+                // 显示频率-时间二维数据分布，用于观察原始射电信号强度分布
                 plotDownsampSEDStd(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL);
+                cpgpage(); // PDF文件的subplot换一行
             }
 
 
@@ -758,23 +810,31 @@ int main(int argc, char *argv[])
             {
                 char mask_Subst_filename[256];
                 sprintf(mask_Subst_filename, "%smask_Subst_%d.png", m.datasetPath, ii);
+                // 将NSigma替换处理后的全局RFI掩码保存为PNG图像文件
+                // 白色像素表示正常数据，黑色像素表示被标记为RFI的位置
                 writeIndexMaskPNG(globalMask, nsampBinned, nchanBinned, mask_Subst_filename);
             }
 
             if (m.plot)
             { // Plot result after NSigma substitution
+                // 创建新的图形页面，显示NSigma替换处理后的结果
                 cpgpage();
                 // plotDataAndMask(&m, blocksPerRead, outDataT, freqArray, startTime, numiter, globalMask);
+                // 绘制数据和RFI掩码的叠加图，显示NSigma替换算法的RFI检测效果
+                // 正常数据以色彩图显示，被标记的RFI区域以特殊颜色突出显示
                 plotDataAndMaskStd(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, globalMask);
             }
 
             if (m.plot)
             { // Plot result after mean-std normalization
+                // 创建新的图形页面，显示均值-标准差归一化后的结果
                 cpgpage();
                 char text2[100];
                 snprintf(text2, sizeof(text2), "Result after mean-std normalization with %.2f sigma", NSigma);
                 cpgmtxt("T", 3.5, 0.5, 0.5, text2);
                 // plotDownsampSED(&m, blocksPerRead, outDataT, freqArray, startTime, numiter, NULL);
+                // 绘制经过均值-标准差归一化处理后的动态频谱图
+                // 显示数据标准化后的分布状态，便于后续RFI检测算法的处理
                 plotDownsampSEDStd(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL);
             }
 
@@ -794,16 +854,21 @@ int main(int argc, char *argv[])
             {
                 char mask_ST_filename[256];
                 sprintf(mask_ST_filename, "%smask_ST_%d.png", m.datasetPath, ii);
+                // 将SumThreshold算法生成的RFI检测掩码保存为PNG图像文件
+                // 显示二维sum-threshold算法检测到的RFI分布情况
                 writeIndexMaskPNG(mask_ST, nsampBinned, nchanBinned, mask_ST_filename);
             }
 
             if (m.plot)
             { // Plot result of RFI detection, before pixel substitution
+                // 创建新的图形页面，显示RFI检测结果（像素替换前）
                 cpgpage();
                 char text3[100];
                 snprintf(text3, sizeof(text3), "Result of RFI detection with chi=%.2f", timesOfSigma);
                 cpgmtxt("T", 3.5, 0.5, 0.5, text3);
                 // plotDataAndMask(&m, blocksPerRead, outDataT, freqArray, startTime, numiter, mask_ST);
+                // 绘制SumThreshold检测算法识别RFI后的数据和掩码叠加图
+                // 显示被检测为RFI的像素位置，用于评估检测算法的效果
                 plotDataAndMaskStd(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, mask_ST);
             }
 
@@ -814,10 +879,14 @@ int main(int argc, char *argv[])
 
             if (m.plot)
             {
+                // 创建新的图形页面，显示像素替换后的最终处理结果
                 cpgpage();
                 cpgmtxt("T", 3.5, 0.5, 0.5, "Result after pixel substitution");
                 // plotDownsampSED(&m, blocksPerRead, outDataT, freqArray, startTime, numiter, NULL);
+                // 绘制经过RFI像素替换处理后的最终动态频谱图
+                // 显示去除RFI后的清洁射电数据，用于后续天体物理分析
                 plotDownsampSEDStd(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL);
+                // 创建额外的空白页面，用于分隔不同数据块的图形输出
                 cpgpage();
             }
         }
@@ -902,6 +971,7 @@ int main(int argc, char *argv[])
     }
 
     // Cleanup
+    // 关闭PGPLOT图形输出系统，完成所有图形文件的写入和资源清理
     if (m.plot) cpgend();
     fits_close_file(fptr, &fits_status);
     free(freqArray);
@@ -924,6 +994,15 @@ int main(int argc, char *argv[])
     }
     free(finalMedian);
     free(finalStd);
+    
+    // Cleanup CUDA resources
+#ifdef HAVE_CUDA
+    if (m.enableCuda && cuda_isAvailable()) {
+        cuda_cleanup();
+        printf("CUDA resources cleaned up.\n");
+    }
+#endif
+    
     return status;
 }
 

@@ -19,6 +19,7 @@ static struct option long_options[] = {
     {"write", required_argument, NULL, 'W'},            // --write
     {"doSubstitution", required_argument, NULL, 'e'},   // --doSubstitution
     {"doSumThreshold", required_argument, NULL, 'r'},   // --doSumThreshold
+    {"enableCuda", required_argument, NULL, 'c'},       // --enableCuda
     {"help", no_argument, NULL, 'h'},                   // --help
     {NULL, 0, NULL, 0}                                  // End Mark for Options
 };

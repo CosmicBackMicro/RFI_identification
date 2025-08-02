@@ -36,6 +36,15 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot);
 
 void visualizeChannelStd(float *data, int nsamp, int nchan, int plot);
 
+void printThresholdStatistics(const float *channel_values, int nchan, 
+                             const float *thresh_values, const char **threshold_names, 
+                             int num_thresholds, const char *metric_name);
+
+void drawUnifiedThresholdLines(const float *thresh_values, const char **threshold_labels,
+                              const int *threshold_colors, const float *threshold_y_positions,
+                              const int *threshold_enabled, int num_thresholds,
+                              float max_count, float x_min, float x_max);
+
 void identSubstNSigma(
     float *data, int nsamp, int nchan, 
     float Nsigma, int iterationIndex, int plot,

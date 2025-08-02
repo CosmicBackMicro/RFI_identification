@@ -71,9 +71,10 @@ int parseCommandLineArguments(int argc, char *argv[], Metadata *m) {
     m->timeDuration = 0.0f;
     m->doSubstitution = 1;
     m->doSumThreshold = 1;
+    m->enableCuda = 1;  // Default: enable CUDA if available
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "i:S:d:s:t:f:r:e:M:p:n:P:W:h", long_options, NULL))) {
+    while ((opt = getopt_long(argc, argv, "i:S:d:s:t:f:r:e:M:p:n:P:W:c:h", long_options, NULL))) {
         if (opt == -1) break;
 
         switch (opt) {
@@ -116,6 +117,9 @@ int parseCommandLineArguments(int argc, char *argv[], Metadata *m) {
             case 'r':
                 m->doSumThreshold = atoi(optarg);
                 break;
+            case 'c':
+                m->enableCuda = atoi(optarg);
+                break;
             case 'h':
                 printf("Usage: %s [OPTIONS]\n", argv[0]);
                 printf("Options:\n");
@@ -129,6 +133,7 @@ int parseCommandLineArguments(int argc, char *argv[], Metadata *m) {
                 printf("  -M, --generateMasks=MASKS     Whether to generate masks\n");
                 printf("  -p, --datasetPath=PATH        Path to dataset\n");
                 printf("  -P, --plot=MODE               Plot or not\n");
+                printf("  -c, --enableCuda=MODE         Enable CUDA acceleration (1=enable, 0=disable)\n");
                 printf("  -h, --help                    Show this help message\n");
                 break;
                 return 1; // Return non-zero to indicate no further processing

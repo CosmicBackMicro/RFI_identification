@@ -34,7 +34,7 @@
                 "--startTime=0.0",
                 "--generateMasks=1",
                 "--datasetPath=/home/cbm/deRFI/output",
-                "--enableCuda=1",
+                "--enableCuda=0",
             ],
             "stopAtEntry": false,
             "cwd": "${fileDirname}",

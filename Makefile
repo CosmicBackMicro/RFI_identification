@@ -130,8 +130,6 @@ DEPS := $(patsubst $(SRC_DIR)/%.c,$(DEP_DIR)/%.d,$(SRCS))
 ifeq ($(HAS_NVCC),1)
 ifneq ($(CU_SRCS),)
     ALL_OBJS := $(OBJS) $(CU_OBJS)
-    CFLAGS += -DHAVE_CUDA
-    CXXFLAGS += -DHAVE_CUDA
     NVCC_FLAGS := -O3 -arch=sm_50 -Xcompiler -fPIC
 else
     ALL_OBJS := $(OBJS)
@@ -144,7 +142,7 @@ endif
 TARGET := $(BUILD_DIR)/ReadFASTData
 
 # 库路径和链接选项
-LIBS := -lcfitsio -lgfortran -lcpgplot -lm -lfftw3f -lpng
+LIBS := -lcfitsio -lgfortran -lcpgplot -lm -lfftw3f -lpng -ldl -lgsl -lgslcblas
 # 添加OpenMP支持
 ifeq ($(findstring -fopenmp,$(CFLAGS)),-fopenmp)
     LIBS += -lgomp

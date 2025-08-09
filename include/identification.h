@@ -49,4 +49,10 @@ void identSubstNSigma(
     float *data, int nsamp, int nchan, 
     float Nsigma, int iterationIndex, int plot,
     int *horizontalMask, int *verticalMask, int *globalMask,
-    float *finalMedian, float *finalStd);
+    float *finalMedian, float *finalStd, int cudaReady);
+
+void identSubstNSigma_Experiment(
+    float *data, int nsamp, int nchan, 
+    float Nsigma, int iterationIndex, int plot,
+    int *horizontalMask, int *verticalMask, int *globalMask,
+    float *finalMedian, float *finalStd, int cudaReady);

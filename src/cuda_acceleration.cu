@@ -1,13 +1,3 @@
-/*
- * CUDA Acceleration Module for deRFI
- * 
- * This file contains CUDA implementations of compute-intensive functions
- * from the RFI detection pipeline to accelerate processing on GPU.
- * 
- * Author: GitHub Copilot
- * Date: 2025-08-02
- */
-
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 #include <stdio.h>
@@ -16,6 +6,9 @@
 
 // Include header for CUDA functions
 #include "cuda_acceleration.h"
+
+// Ensure C linkage for interface functions
+extern "C" {
 
 // CUDA error checking macro
 #define CUDA_CHECK(call) \
@@ -167,7 +160,7 @@ __global__ void downsample2DKernel(const float *input, float *output,
 /**
  * CUDA-accelerated channel median subtraction
  */
-void cuda_subtractChannelMedians(float *data, const float *channel_medians, 
+void cuda_subtractChannelMedians_impl(float *data, const float *channel_medians, 
                                 int nsamp, int nchan)
 {
     int total_size = nsamp * nchan;
@@ -199,7 +192,7 @@ void cuda_subtractChannelMedians(float *data, const float *channel_medians,
 /**
  * CUDA-accelerated channel statistics calculation
  */
-void cuda_calculateChannelStats(const float *data, float *means, float *stds, 
+void cuda_calculateChannelStats_impl(const float *data, float *means, float *stds, 
                                int nsamp, int nchan)
 {
     int total_size = nsamp * nchan;
@@ -233,7 +226,7 @@ void cuda_calculateChannelStats(const float *data, float *means, float *stds,
 /**
  * CUDA-accelerated matrix transpose
  */
-void cuda_transpose(const float *input, float *output, int rows, int cols)
+void cuda_transpose_impl(const float *input, float *output, int rows, int cols)
 {
     // Device memory allocation
     float *d_input, *d_output;
@@ -261,7 +254,7 @@ void cuda_transpose(const float *input, float *output, int rows, int cols)
 /**
  * CUDA-accelerated 2D downsampling
  */
-void cuda_downsample2D(const float *input, float *output, 
+void cuda_downsample2D_impl(const float *input, float *output, 
                       int nsamp, int nchan,
                       int binFactorTime, int binFactorFreq)
 {
@@ -296,54 +289,134 @@ void cuda_downsample2D(const float *input, float *output,
     CUDA_CHECK(cudaFree(d_output));
 }
 
+// ============================================================================
+// Binary Morphological Filtering (binarySIR) CUDA Implementation
+// ============================================================================
+
 /**
- * Initialize CUDA and check device capabilities
+ * CUDA kernel for binary morphological filtering with window-based neighbor counting
+ * Each thread processes one pixel in the 2D mask
  */
-int cuda_init()
+__global__ void binarySIRKernel(int *mask, int nsamp, int nchan,
+                               int win_samp, int win_chan,
+                               float thr_up, float thr_down)
 {
-    int deviceCount;
-    CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
+    // Calculate global thread position
+    int i = blockIdx.x * blockDim.x + threadIdx.x; // time sample index
+    int j = blockIdx.y * blockDim.y + threadIdx.y; // channel index
     
-    if (deviceCount == 0) {
-        fprintf(stderr, "No CUDA-capable devices found.\n");
-        return -1;
+    // Check bounds
+    if (i >= nsamp || j >= nchan) return;
+    
+    // Calculate window radii
+    const int rad_samp = win_samp / 2;
+    const int rad_chan = win_chan / 2;
+    
+    int count = 0, total = 0;
+    
+    // Count neighbors in the window
+    for (int dj = -rad_chan; dj <= rad_chan; dj++) {
+        int jj = j + dj;
+        if (jj < 0 || jj >= nchan) continue;
+        
+        for (int di = -rad_samp; di <= rad_samp; di++) {
+            int ii = i + di;
+            if (ii < 0 || ii >= nsamp) continue;
+            
+            // Check if neighbor is flagged (non-zero)
+            if (mask[jj * nsamp + ii] != 0) count++;
+            total++;
+        }
     }
     
-    // Use the first device
-    CUDA_CHECK(cudaSetDevice(0));
-    
-    cudaDeviceProp deviceProp;
-    CUDA_CHECK(cudaGetDeviceProperties(&deviceProp, 0));
-    
-    printf("CUDA Device Initialized:\n");
-    printf("  Device: %s\n", deviceProp.name);
-    printf("  Compute Capability: %d.%d\n", deviceProp.major, deviceProp.minor);
-    printf("  Global Memory: %.1f GB\n", deviceProp.totalGlobalMem / (1024.0f * 1024.0f * 1024.0f));
-    printf("  Multiprocessors: %d\n", deviceProp.multiProcessorCount);
-    printf("  Max Threads per Block: %d\n", deviceProp.maxThreadsPerBlock);
-    
-    return 0;
+    // Apply threshold-based decision
+    if (total > 0) {
+        float ratio = (float)count / total;
+        if (ratio >= thr_up) {
+            mask[j * nsamp + i] = 1;
+        } else if (ratio < thr_down) {
+            mask[j * nsamp + i] = 0;
+        }
+        // If ratio is between thresholds, keep original value
+    }
 }
 
 /**
- * Cleanup CUDA resources
+ * Host function for CUDA-accelerated binarySIR morphological filtering
  */
-void cuda_cleanup()
+void cuda_binarySIR_impl(int *mask, int nsamp, int nchan,
+                        int win_samp, int win_chan, 
+                        float thr_up, float thr_down)
 {
-    CUDA_CHECK(cudaDeviceReset());
-}
-
-/**
- * Check if CUDA is available and functional
- */
-int cuda_isAvailable()
-{
-    int deviceCount;
-    cudaError_t error = cudaGetDeviceCount(&deviceCount);
-    
-    if (error != cudaSuccess) {
-        return 0; // CUDA not available
+    if (!cuda_isAvailable()) {
+        printf("Error: CUDA not available for binarySIR\n");
+        return;
     }
     
-    return (deviceCount > 0) ? 1 : 0;
+    // Validate window sizes (must be odd)
+    if (((win_samp | win_chan) & 1) == 0) {
+        printf("Error: Window sizes must be odd for binarySIR\n");
+        return;
+    }
+    
+    // Count pixels before filtering for statistics
+    int pixelsBefore = 0;
+    for (int idx = 0; idx < nsamp * nchan; idx++) {
+        if (mask[idx] != 0) pixelsBefore++;
+    }
+    
+    size_t maskSize = nsamp * nchan * sizeof(int);
+    int *d_mask;
+    
+    // Allocate device memory
+    CUDA_CHECK(cudaMalloc(&d_mask, maskSize));
+    
+    // Copy mask to device
+    CUDA_CHECK(cudaMemcpy(d_mask, mask, maskSize, cudaMemcpyHostToDevice));
+    
+    // Configure kernel launch parameters
+    dim3 blockSize(16, 16);  // 16x16 threads per block
+    dim3 gridSize((nsamp + blockSize.x - 1) / blockSize.x,
+                  (nchan + blockSize.y - 1) / blockSize.y);
+    
+    printf("Launching binarySIR CUDA kernel: grid(%d,%d), block(%d,%d)\n",
+           gridSize.x, gridSize.y, blockSize.x, blockSize.y);
+    printf("Processing %dx%d mask with %dx%d window (thresholds: %.3f/%.3f)\n",
+           nsamp, nchan, win_samp, win_chan, thr_up, thr_down);
+    
+    // Launch kernel
+    binarySIRKernel<<<gridSize, blockSize>>>(d_mask, nsamp, nchan,
+                                            win_samp, win_chan,
+                                            thr_up, thr_down);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
+    // Copy result back to host
+    CUDA_CHECK(cudaMemcpy(mask, d_mask, maskSize, cudaMemcpyDeviceToHost));
+    
+    // Count pixels after filtering for statistics
+    int pixelsAfter = 0;
+    for (int idx = 0; idx < nsamp * nchan; idx++) {
+        if (mask[idx] != 0) pixelsAfter++;
+    }
+    
+    printf("CUDA binarySIR filtering statistics:\n");
+    printf("  - Window size: %dx%d (samples x channels)\n", win_samp, win_chan);
+    printf("  - Thresholds: up=%.3f, down=%.3f\n", thr_up, thr_down);
+    printf("  - Pixels before: %d/%d (%.4f%%)\n", 
+           pixelsBefore, nsamp*nchan, (float)pixelsBefore/(nsamp*nchan)*100);
+    printf("  - Pixels after: %d/%d (%.4f%%)\n", 
+           pixelsAfter, nsamp*nchan, (float)pixelsAfter/(nsamp*nchan)*100);
+    printf("  - Filtered out: %d pixels (%.4f%%)\n", 
+           pixelsBefore - pixelsAfter, (float)(pixelsBefore - pixelsAfter)/(nsamp*nchan)*100);
+    printf("  - Reduction ratio: %.2fx\n", 
+           pixelsBefore > 0 ? (float)pixelsBefore/pixelsAfter : 0.0f);
+    
+    // Cleanup device memory
+    CUDA_CHECK(cudaFree(d_mask));
 }
+
+// CUDA implementation functions are now called via weak symbols from wrapper
+// The wrapper handles availability checking and error reporting
+
+} // extern "C"

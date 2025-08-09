@@ -13,6 +13,7 @@ typedef struct {
     int doSubstitution;
     int doSumThreshold;
     int enableCuda;  // 0 = disable CUDA, 1 = enable CUDA (default)
+    int cudaReady;   // 0 = CUDA not available/initialized, 1 = CUDA ready to use
 
     /* From FITS Header */
     int nchan;

@@ -17,10 +17,7 @@
 #include "cmd.h"
 #include "transpose.h"
 #include "psrPalett.h"
-
-#ifdef HAVE_CUDA
 #include "cuda_acceleration.h"
-#endif
 
 #ifndef PI
 #define PI 3.14159265358979323846
@@ -247,12 +244,13 @@ void downsamp2D(float *array, int nsamp, int nchan,
     int nsampBinned = nsamp / binFactorTime;
     int nchanBinned = nchan / binFactorFreq;
     if (isTranspose) {
+        int i, j, ti, fj;
         #pragma omp parallel for collapse(2)
-        for (int i = 0; i < nsampBinned; i++) {
-            for (int j = 0; j < nchanBinned; j++) {
+        for (i = 0; i < nsampBinned; i++) {
+            for (j = 0; j < nchanBinned; j++) {
                 float sum = 0.0f;
-                for (int ti = 0; ti < binFactorTime; ti++) {
-                    for (int fj = 0; fj < binFactorFreq; fj++) {
+                for (ti = 0; ti < binFactorTime; ti++) {
+                    for (fj = 0; fj < binFactorFreq; fj++) {
                         int samp_idx = i * binFactorTime + ti;
                         int freq_idx = j * binFactorFreq + fj;
                         sum += array[freq_idx * nsamp + samp_idx];
@@ -262,12 +260,13 @@ void downsamp2D(float *array, int nsamp, int nchan,
             }
         }
     } else {
+        int i, j, ti, fj;
         #pragma omp parallel for collapse(2)
-        for (int i = 0; i < nsampBinned; i++) {
-            for (int j = 0; j < nchanBinned; j++) {
+        for (i = 0; i < nsampBinned; i++) {
+            for (j = 0; j < nchanBinned; j++) {
                 float sum = 0.0f;
-                for (int ti = 0; ti < binFactorTime; ti++) {
-                    for (int fj = 0; fj < binFactorFreq; fj++) {
+                for (ti = 0; ti < binFactorTime; ti++) {
+                    for (fj = 0; fj < binFactorFreq; fj++) {
                         int samp_idx = i * binFactorTime + ti;
                         int freq_idx = j * binFactorFreq + fj;
                         sum += array[samp_idx * nchan + freq_idx];
@@ -512,7 +511,8 @@ void readRawBlock(fitsfile *fptr, int blockIndex, int blocksPerRead, int nchan, 
                  &nulval, scale, &anynul, status);
 
     // Read all data blocks
-    for (int k = 0; k < blocksPerRead; k++) {
+    int k;
+    for (k = 0; k < blocksPerRead; k++) {
         fits_get_colnum(fptr, CASESEN, "DATA", &col, status);
         fits_read_col(fptr, TBYTE, col, blockIndex * blocksPerRead + k + 1, 1, blockSize, 
                      &nulval, outRawData + k * blockSize, &anynul, status);
@@ -534,7 +534,8 @@ void writeBlock(
 
     fits_movnam_hdu(fptr, BINARY_TBL, "SUBINT", 0, status);
 
-    for (int k = 0; k < blocksPerRead; k++) {
+    int k;
+    for (k = 0; k < blocksPerRead; k++) {
         if (firstrow > naxis2) {
             printf("Reached end of file at block %d\n", firstrow);
             break;
@@ -578,7 +579,7 @@ void writeFITSDataset(unsigned char *outRawData, float *scale, float *offset,
         return;
     }
 
-    /* --- 创建二进制表结构（与原始文件一致）--- */
+    /* --- Create binary table structure (consistent with original file) --- */
     char *ttype[] = {"DAT_OFFS", "DAT_SCL", "DATA"};
     char *tunit[] = {"", "", "RAW"};
     char *tform[3];
@@ -590,7 +591,7 @@ void writeFITSDataset(unsigned char *outRawData, float *scale, float *offset,
     tform[1] = tform_scl;
     tform[2] = tform_data;
     
-    // 创建二进制表HDU（SUBINT类型）
+    // Create binary table HDU (SUBINT type)
     fits_create_tbl(fptr, BINARY_TBL, 0, 3, ttype, tform, tunit, "SUBINT", status);
     if (*status) {
         fits_report_error(stderr, *status);
@@ -598,7 +599,7 @@ void writeFITSDataset(unsigned char *outRawData, float *scale, float *offset,
         return;
     }
 
-    /* --- 写入表头关键字 --- */
+    /* --- Write header keywords --- */
     fits_write_key(fptr, TFLOAT, "TBIN", &m->tbinBinned, "Time per sample (s)", status);
     fits_write_key(fptr, TFLOAT, "CHAN_BW", &m->chan_bwBinned, "Channel bandwidth (MHz)", status);
     fits_write_key(fptr, TINT, "NSBLK", &nsampBinned, "Samples per block", status);
@@ -611,16 +612,16 @@ void writeFITSDataset(unsigned char *outRawData, float *scale, float *offset,
     strftime(dateStr, sizeof(dateStr), "%Y-%m-%dT%H:%M:%S", t);
     fits_write_key(fptr, TSTRING, "DATE", dateStr, "File creation date", status);
 
-    /* --- 写入数据列（与readRawBlock对称）--- */
+    /* --- Write data columns (symmetric with readRawBlock) --- */
     int col_offs, col_scl, col_data;
     fits_get_colnum(fptr, CASEINSEN, "DAT_OFFS", &col_offs, status);
     fits_get_colnum(fptr, CASEINSEN, "DAT_SCL", &col_scl, status);
     fits_get_colnum(fptr, CASEINSEN, "DATA", &col_data, status);
-    fits_write_col(fptr, TFLOAT, col_offs, 1, 1, nchanBinned, offset, status);  // 写入offset数组
-    fits_write_col(fptr, TFLOAT, col_scl, 1, 1, nchanBinned, scale, status);     // 写入scale数组
-    fits_write_col(fptr, TBYTE, col_data, 1, 1, nsampBinned*nchanBinned, outRawData, status); // 写入原始数据
+    fits_write_col(fptr, TFLOAT, col_offs, 1, 1, nchanBinned, offset, status);  // Write offset array
+    fits_write_col(fptr, TFLOAT, col_scl, 1, 1, nchanBinned, scale, status);     // Write scale array
+    fits_write_col(fptr, TBYTE, col_data, 1, 1, nsampBinned*nchanBinned, outRawData, status); // Write raw data
 
-    // 关闭文件
+    // Close file
     fits_close_file(fptr, status);
     if (*status) {
         fits_report_error(stderr, *status);
@@ -640,24 +641,25 @@ int main(int argc, char *argv[])
     }
     readMetadata(&m);
 
-    // Initialize CUDA if available and enabled
-#ifdef HAVE_CUDA
-    if (m.enableCuda && cuda_isAvailable()) {
-        if (cuda_init() == 0) {
-            printf("CUDA acceleration enabled.\n");
+    // Initialize CUDA if requested by user
+    m.cudaReady = 0; // Default: CUDA not ready
+    if (m.enableCuda) {
+        if (cuda_isAvailable()) {
+            if (cuda_init() == 0) {
+                printf("CUDA acceleration enabled.\n");
+                m.cudaReady = 1; // CUDA is ready to use
+            } else {
+                printf("CUDA initialization failed, using CPU only.\n");
+                m.enableCuda = 0; // Disable CUDA for this session
+            }
         } else {
-            printf("CUDA initialization failed, using CPU only.\n");
-            m.enableCuda = 0; // Disable CUDA for this session
+            fprintf(stderr, "Error: You requested CUDA acceleration, but CUDA is not available on this system.\n");
+            fprintf(stderr, "Please run without --enableCuda option and check CUDA installation.\n");
+            return -1;
         }
-    } else if (!m.enableCuda) {
-        printf("CUDA acceleration disabled by user.\n");
     } else {
-        printf("CUDA not available, using CPU only.\n");
+        printf("Message: --enableCuda option not found, using CPU. \n");
     }
-#else
-    printf("Built without CUDA support, using CPU only.\n");
-    m.enableCuda = 0; // Ensure consistency
-#endif
 
     fitsfile *fptr = NULL;
     int fits_status = 0;
@@ -673,8 +675,8 @@ int main(int argc, char *argv[])
         memset(saveName, 0, requiredSize);
         snprintf(saveName, requiredSize, "%s/%s_%.2f_%d_%d.ps/VCPS",
                  m.datasetPath, sourceName, 0.0, m.binFactorTime, m.binFactorFreq);
-        // 初始化PGPLOT图形输出系统，设置输出设备为PostScript文件
-        // 参数：设备数量=1，文件名包含路径和设备类型，子图布局为2列×3行
+        // Initialize PGPLOT graphics system, set output device to PostScript file
+        // Parameters: device count=1, filename with path and device type, subplot layout 2x3
         cpgbeg(1, saveName, 2, 3);
         free(sourceName);
         free(saveName);
@@ -762,8 +764,7 @@ int main(int argc, char *argv[])
         
         // CUDA-accelerated transpose (with fallback to CPU)
         printf("Performing matrix transpose (%d x %d)...\n", nsampBinned, nchanBinned);
-#ifdef HAVE_CUDA
-        if (m.enableCuda && cuda_isAvailable()) {
+        if (m.cudaReady) {
             double start_time = omp_get_wtime();
             cuda_transpose(outData, outDataT, nsampBinned, nchanBinned);
             double cuda_time = omp_get_wtime() - start_time;
@@ -774,67 +775,60 @@ int main(int argc, char *argv[])
             double cpu_time = omp_get_wtime() - start_time;
             printf("CPU transpose completed in %.4f seconds\n", cpu_time);
         }
-#else
-        double start_time = omp_get_wtime();
-        transpose(outData, nsampBinned, nchanBinned, outDataT);
-        double cpu_time = omp_get_wtime() - start_time;
-        printf("CPU transpose completed in %.4f seconds\n", cpu_time);
-#endif
         
         if (m.generateMasks)
         {
             memset(mask_ST, 0, sizeof(int) * nsampBinned * nchanBinned);
 
+            // Plot the unprocessed raw data
             if (m.plot)
-            { // Plot raw data
-                // 创建新的图形页面，为绘制原始数据做准备
-                cpgpage();
+            { 
+                cpgpage(); // Create new graphics page
                 cpgmtxt("T", 3.0, 0.35, 0.5, "Raw Data");
-                // 使用降采样后的频率数组绘制原始数据的动态频谱图
-                // 显示频率-时间二维数据分布，用于观察原始射电信号强度分布
+                // Plot original data dynamic spectrum using downsampled frequency array
+                // Display frequency-time 2D data distribution for observing radio signal intensity
                 plotDownsampSEDStd(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL);
-                cpgpage(); // PDF文件的subplot换一行
             }
 
 
-            // float NSigma = 5.0f;
+
             float NSigma = 10.0f;
-            // float NSigma = 3.0f;
             if (m.doSubstitution)
             {
-                identSubstNSigma(outDataT, nsampBinned, nchanBinned, NSigma, ii, m.plot,
-                                 horizontalMask, verticalMask, globalMask, finalMedian, finalStd);             
+                identSubstNSigma_Experiment(outDataT, nsampBinned, nchanBinned, NSigma, ii, m.plot,
+                                 horizontalMask, verticalMask, globalMask, finalMedian, finalStd, m.cudaReady);
+                
             }
 
             if (writeMasks)
             {
                 char mask_Subst_filename[256];
                 sprintf(mask_Subst_filename, "%smask_Subst_%d.png", m.datasetPath, ii);
-                // 将NSigma替换处理后的全局RFI掩码保存为PNG图像文件
-                // 白色像素表示正常数据，黑色像素表示被标记为RFI的位置
+                // Save global RFI mask after pixel substitution as PNG image
+                // White pixels represent normal data, black pixels represent RFI locations
                 writeIndexMaskPNG(globalMask, nsampBinned, nchanBinned, mask_Subst_filename);
             }
 
             if (m.plot)
             { // Plot result after NSigma substitution
-                // 创建新的图形页面，显示NSigma替换处理后的结果
+                // Create new graphics page to show NSigma substitution results
                 cpgpage();
                 // plotDataAndMask(&m, blocksPerRead, outDataT, freqArray, startTime, numiter, globalMask);
-                // 绘制数据和RFI掩码的叠加图，显示NSigma替换算法的RFI检测效果
-                // 正常数据以色彩图显示，被标记的RFI区域以特殊颜色突出显示
+                // Plot data and RFI mask overlay showing NSigma algorithm detection effect
+                // Normal data shown in color map, flagged RFI regions highlighted in special colors
                 plotDataAndMaskStd(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, globalMask);
             }
 
             if (m.plot)
             { // Plot result after mean-std normalization
-                // 创建新的图形页面，显示均值-标准差归一化后的结果
+                // Create new graphics page to show mean-std normalization results
                 cpgpage();
                 char text2[100];
                 snprintf(text2, sizeof(text2), "Result after mean-std normalization with %.2f sigma", NSigma);
                 cpgmtxt("T", 3.5, 0.5, 0.5, text2);
                 // plotDownsampSED(&m, blocksPerRead, outDataT, freqArray, startTime, numiter, NULL);
-                // 绘制经过均值-标准差归一化处理后的动态频谱图
-                // 显示数据标准化后的分布状态，便于后续RFI检测算法的处理
+                // Plot dynamic spectrum after mean-std normalization processing
+                // Show data distribution state after standardization for subsequent RFI detection
                 plotDownsampSEDStd(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL);
             }
 
@@ -847,28 +841,35 @@ int main(int argc, char *argv[])
             {
                 sumthreshold_2d(outDataT, nsampBinned, nchanBinned,
                                 mask_chanRFI, mask_ST, timesOfSigma, M_len);
-                binarySIR(mask_ST, nsampBinned, nchanBinned, win_samp, win_chan, thrup, thrdown);
+                
+                // Apply binarySIR morphological filtering with CUDA acceleration if available
+                if (m.cudaReady) {
+                    printf("Using CUDA-accelerated binarySIR filtering...\n");
+                    cuda_binarySIR(mask_ST, nsampBinned, nchanBinned, win_samp, win_chan, thrup, thrdown);
+                } else {
+                    binarySIR(mask_ST, nsampBinned, nchanBinned, win_samp, win_chan, thrup, thrdown);
+                }
             }
 
             if (writeMasks)
             {
                 char mask_ST_filename[256];
                 sprintf(mask_ST_filename, "%smask_ST_%d.png", m.datasetPath, ii);
-                // 将SumThreshold算法生成的RFI检测掩码保存为PNG图像文件
-                // 显示二维sum-threshold算法检测到的RFI分布情况
+                // Save RFI detection mask generated by SumThreshold algorithm as PNG image
+                // Show RFI distribution detected by 2D sum-threshold algorithm
                 writeIndexMaskPNG(mask_ST, nsampBinned, nchanBinned, mask_ST_filename);
             }
 
             if (m.plot)
             { // Plot result of RFI detection, before pixel substitution
-                // 创建新的图形页面，显示RFI检测结果（像素替换前）
+                // Create new graphics page to show RFI detection results (before pixel substitution)
                 cpgpage();
                 char text3[100];
                 snprintf(text3, sizeof(text3), "Result of RFI detection with chi=%.2f", timesOfSigma);
                 cpgmtxt("T", 3.5, 0.5, 0.5, text3);
                 // plotDataAndMask(&m, blocksPerRead, outDataT, freqArray, startTime, numiter, mask_ST);
-                // 绘制SumThreshold检测算法识别RFI后的数据和掩码叠加图
-                // 显示被检测为RFI的像素位置，用于评估检测算法的效果
+                // Plot data and mask overlay after SumThreshold detection algorithm
+                // Show flagged RFI pixel locations for evaluating detection algorithm performance
                 plotDataAndMaskStd(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, mask_ST);
             }
 
@@ -879,15 +880,13 @@ int main(int argc, char *argv[])
 
             if (m.plot)
             {
-                // 创建新的图形页面，显示像素替换后的最终处理结果
+                // Create new graphics page to show final results after pixel substitution
                 cpgpage();
                 cpgmtxt("T", 3.5, 0.5, 0.5, "Result after pixel substitution");
                 // plotDownsampSED(&m, blocksPerRead, outDataT, freqArray, startTime, numiter, NULL);
-                // 绘制经过RFI像素替换处理后的最终动态频谱图
-                // 显示去除RFI后的清洁射电数据，用于后续天体物理分析
+                // Plot final dynamic spectrum after RFI pixel substitution processing
+                // Show clean radio data after RFI removal for subsequent astrophysical analysis
                 plotDownsampSEDStd(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL);
-                // 创建额外的空白页面，用于分隔不同数据块的图形输出
-                cpgpage();
             }
         }
 
@@ -971,7 +970,7 @@ int main(int argc, char *argv[])
     }
 
     // Cleanup
-    // 关闭PGPLOT图形输出系统，完成所有图形文件的写入和资源清理
+    // Close PGPLOT graphics system, complete all graphics file writing and resource cleanup
     if (m.plot) cpgend();
     fits_close_file(fptr, &fits_status);
     free(freqArray);
@@ -996,12 +995,10 @@ int main(int argc, char *argv[])
     free(finalStd);
     
     // Cleanup CUDA resources
-#ifdef HAVE_CUDA
-    if (m.enableCuda && cuda_isAvailable()) {
+    if (m.cudaReady) {
         cuda_cleanup();
         printf("CUDA resources cleaned up.\n");
     }
-#endif
     
     return status;
 }
@@ -1020,22 +1017,23 @@ void extractChannelMask(int *inputMask, int *outputMask, int nsamp, int nchan,
     // Initialize output mask to all zeros
     memset(outputMask, 0, nsamp * nchan * sizeof(int));
     
+    int k, i, j;
     if (isTranspose) {
         // For transposed layout: nsamp x nchan
-        for (int k = 0; k < numChannels; k++) {
+        for (k = 0; k < numChannels; k++) {
             int chanIdx = channelIndices[k];
             if (chanIdx >= 0 && chanIdx < nchan) {
-                for (int i = 0; i < nsamp; i++) {
+                for (i = 0; i < nsamp; i++) {
                     outputMask[i * nchan + chanIdx] = inputMask[i * nchan + chanIdx];
                 }
             }
         }
     } else {
         // For normal layout: nchan x nsamp
-        for (int k = 0; k < numChannels; k++) {
+        for (k = 0; k < numChannels; k++) {
             int chanIdx = channelIndices[k];
             if (chanIdx >= 0 && chanIdx < nchan) {
-                for (int j = 0; j < nsamp; j++) {
+                for (j = 0; j < nsamp; j++) {
                     outputMask[chanIdx * nsamp + j] = inputMask[chanIdx * nsamp + j];
                 }
             }
@@ -1062,17 +1060,18 @@ void extractChannelRangeMask(int *inputMask, int *outputMask, int nsamp, int nch
     if (endChannel >= nchan) endChannel = nchan - 1;
     if (startChannel > endChannel) return;
     
+    int chanIdx, i, j;
     if (isTranspose) {
         // For transposed layout: nsamp x nchan
-        for (int chanIdx = startChannel; chanIdx <= endChannel; chanIdx++) {
-            for (int i = 0; i < nsamp; i++) {
+        for (chanIdx = startChannel; chanIdx <= endChannel; chanIdx++) {
+            for (i = 0; i < nsamp; i++) {
                 outputMask[i * nchan + chanIdx] = inputMask[i * nchan + chanIdx];
             }
         }
     } else {
         // For normal layout: nchan x nsamp  
-        for (int chanIdx = startChannel; chanIdx <= endChannel; chanIdx++) {
-            for (int j = 0; j < nsamp; j++) {
+        for (chanIdx = startChannel; chanIdx <= endChannel; chanIdx++) {
+            for (j = 0; j < nsamp; j++) {
                 outputMask[chanIdx * nsamp + j] = inputMask[chanIdx * nsamp + j];
             }
         }

@@ -55,6 +55,7 @@ int parseCommandLineArguments(int argc, char *argv[], Metadata *m) {
         {"blocksPerRead", required_argument, 0, 'n'},
         {"plot", required_argument, 0, 'P'},
         {"write", required_argument, 0, 'W'},
+        {"enableCuda", required_argument, 0, 'c'},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
     };
@@ -63,11 +64,10 @@ int parseCommandLineArguments(int argc, char *argv[], Metadata *m) {
     m->binFactorTime = 1;
     m->binFactorFreq = 1;
     m->savePlot = 1;
-    m->blocksPerRead = 1;
+    m->blocksPerRead = 1;  // Default to 1 block per read
     m->generateMasks = 0;
     m->datasetPath = "./dataset/";
     m->startTime = 0.0f;
-    m->blocksPerRead = 0;
     m->timeDuration = 0.0f;
     m->doSubstitution = 1;
     m->doSumThreshold = 1;
@@ -135,7 +135,6 @@ int parseCommandLineArguments(int argc, char *argv[], Metadata *m) {
                 printf("  -P, --plot=MODE               Plot or not\n");
                 printf("  -c, --enableCuda=MODE         Enable CUDA acceleration (1=enable, 0=disable)\n");
                 printf("  -h, --help                    Show this help message\n");
-                break;
                 return 1; // Return non-zero to indicate no further processing
         }
     }

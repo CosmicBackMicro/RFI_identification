@@ -8,11 +8,18 @@
 #include <omp.h>
 #include "cpgplot.h"
 
+// GSL headers for nonlinear fitting
+#include <gsl/gsl_multifit_nlinear.h>
+#include <gsl/gsl_statistics.h>
+#include <gsl/gsl_vector.h>
+#include <gsl/gsl_blas.h>
+
 #include "ReadFASTData.h"
 #include "findStats.h"
 #include "identification.h"
 #include "transpose.h"
 #include "plot.h"
+#include "cuda_acceleration.h"
 
 #ifndef PI
 #define PI 3.14159265358979323846
@@ -21,6 +28,168 @@
 float gaus(float x, float med, float sigma)
 {
     return expf(-(x - med) * (x - med) / (2 * sigma * sigma)) / (sqrtf(2 * PI) * sigma);
+}
+
+// New function for amplitude-included Gaussian
+float gaus_with_amplitude(float x, float amplitude, float mean, float sigma)
+{
+    return amplitude * expf(-(x - mean) * (x - mean) / (2 * sigma * sigma));
+}
+
+/**
+ * @brief Residual function for three-parameter Gaussian fitting
+ * Parameters: [0]=amplitude, [1]=mean, [2]=sigma
+ * Data is passed as void pointer to array of [x_array, y_array, &n]
+ */
+int gaussian_residual_f(const gsl_vector *params, void *data, gsl_vector *f) {
+    void **data_array = (void **)data;
+    float *x = (float *)data_array[0];
+    float *y = (float *)data_array[1];
+    int n = *(int *)data_array[2];  // Fix: use int instead of size_t
+    
+    double A = gsl_vector_get(params, 0);      // amplitude
+    double mu = gsl_vector_get(params, 1);     // mean
+    double sigma = gsl_vector_get(params, 2);  // standard deviation
+    
+    // Prevent negative or zero sigma
+    if (sigma <= 0) {
+        sigma = 1e-6;
+    }
+    
+    int i;
+    for (i = 0; i < n; i++) {  // Fix: use int instead of size_t
+        double xi = x[i];
+        double yi = y[i];
+        double model = A * exp(-(xi - mu) * (xi - mu) / (2.0 * sigma * sigma));
+        // Residual = observed - predicted
+        gsl_vector_set(f, i, yi - model);
+    }
+    
+    return GSL_SUCCESS;
+}
+
+/**
+ * @brief Three-parameter Gaussian fitting using GSL Levenberg-Marquardt
+ * @param x X data points
+ * @param y Y data points
+ * @param n Number of data points
+ * @param fitted_amplitude Output: fitted amplitude
+ * @param fitted_mu Output: fitted mean
+ * @param fitted_sigma Output: fitted standard deviation
+ * @return 1 for success, 0 for failure
+ */
+int gsl_gaussian_fit(float *x, float *y, int n,
+    float *fitted_amplitude, float *fitted_mu, float *fitted_sigma)
+{
+    // Essential check: sufficient data points for 3-parameter fitting
+    if (n < 4) {
+        printf("GSL Gaussian fit: Insufficient data points (%d < 4)\n", n);
+        return 0;
+    }
+    
+    // Find initial parameter estimates
+    float max_y = y[0];
+    float min_x = x[0], max_x = x[0];
+    float sum_x_weighted = 0.0f, sum_y = 0.0f;
+    
+    int i;
+    for (i = 0; i < n; i++) {
+        if (y[i] > max_y) max_y = y[i];
+        if (x[i] < min_x) min_x = x[i];
+        if (x[i] > max_x) max_x = x[i];
+        sum_x_weighted += x[i] * y[i];
+        sum_y += y[i];
+    }
+    
+    // Calculate initial parameters
+    float initial_mu = (sum_y > 0) ? sum_x_weighted / sum_y : (min_x + max_x) / 2.0f;
+    
+    float sum_weighted_var = 0.0f;
+    for (i = 0; i < n; i++) {
+        float dx = x[i] - initial_mu;
+        sum_weighted_var += y[i] * dx * dx;
+    }
+    float initial_sigma = (sum_y > 0) ? sqrtf(sum_weighted_var / sum_y) : (max_x - min_x) / 6.0f;
+    
+    float estimated_bin_width = (max_x - min_x) / (n - 1);
+    float initial_amplitude = max_y * estimated_bin_width * sqrtf(2 * PI) * initial_sigma;
+    
+    // Basic safety bounds
+    if (initial_sigma <= 0) initial_sigma = (max_x - min_x) / 10.0f;
+    if (initial_amplitude <= 0) initial_amplitude = max_y * 0.1f;
+    
+    // Set up GSL fitting
+    const gsl_multifit_nlinear_type *T = gsl_multifit_nlinear_trust;
+    gsl_multifit_nlinear_parameters fdf_params = gsl_multifit_nlinear_default_parameters();    
+    gsl_multifit_nlinear_workspace *w;
+    gsl_multifit_nlinear_fdf fdf;
+    
+    // Prepare data as pointer array for function parameters
+    void *data_ptrs[3];
+    data_ptrs[0] = x;
+    data_ptrs[1] = y;
+    data_ptrs[2] = &n;
+    
+    // Set up function
+    fdf.f = gaussian_residual_f;
+    fdf.df = NULL;   // Use numerical differentiation
+    fdf.fvv = NULL;  // Use numerical second derivatives
+    fdf.n = n;       // number of data points
+    fdf.p = 3;       // number of parameters
+    fdf.params = data_ptrs;
+    
+    // Allocate workspace
+    w = gsl_multifit_nlinear_alloc(T, &fdf_params, n, 3);
+    
+    // Initial parameter vector
+    gsl_vector *params_init = gsl_vector_alloc(3);
+    gsl_vector_set(params_init, 0, initial_amplitude);
+    gsl_vector_set(params_init, 1, initial_mu);
+    gsl_vector_set(params_init, 2, initial_sigma);
+    
+    // Essential check: GSL initialization
+    int status = gsl_multifit_nlinear_init(params_init, &fdf, w);
+    if (status != GSL_SUCCESS) {
+        printf("GSL Gaussian fit: Initialization failed\n");
+        gsl_vector_free(params_init);
+        gsl_multifit_nlinear_free(w);
+        return 0;
+    }
+    
+    // Iterate to find solution
+    int info;
+    const int max_iterations = 100;
+    const double xtol = 1e-8;
+    const double gtol = 1e-8;
+    const double ftol = 1e-8;
+    
+    int iter;
+    for (iter = 0; iter < max_iterations; iter++) {
+        status = gsl_multifit_nlinear_iterate(w);
+        
+        if (status == GSL_ENOPROG) break;
+        if (status != GSL_SUCCESS) break;
+        
+        // Test for convergence
+        status = gsl_multifit_nlinear_test(xtol, gtol, ftol, &info, w);
+        if (status == GSL_SUCCESS) break;
+    }
+    
+    // Get final results
+    gsl_vector *final_params = gsl_multifit_nlinear_position(w);
+    
+    *fitted_amplitude = (float)gsl_vector_get(final_params, 0);
+    *fitted_mu = (float)gsl_vector_get(final_params, 1);
+    *fitted_sigma = (float)gsl_vector_get(final_params, 2);
+    
+    // Essential check: validate final results
+    int success = (*fitted_sigma > 0 && *fitted_amplitude > 0) ? 1 : 0;
+    
+    // Clean up
+    gsl_vector_free(params_init);
+    gsl_multifit_nlinear_free(w);
+    
+    return success;
 }
 
 float simple_curve_fit(float *x, float *y, int n, float med)
@@ -63,7 +232,8 @@ void subtractChannelMedians(float *data, int nsamp, int nchan)
     float *temp_data = (float *)malloc(nsamp * sizeof(float));
     
     // Calculate median for each channel
-    for (int i = 0; i < nchan; i++) {
+    int i, j;
+    for (i = 0; i < nchan; i++) {
         // Copy channel data for median calculation
         memcpy(temp_data, data + i * nsamp, nsamp * sizeof(float));
         channel_medians[i] = median(temp_data, nsamp);
@@ -75,8 +245,8 @@ void subtractChannelMedians(float *data, int nsamp, int nchan)
     
     // Subtract median from each channel
     #pragma omp parallel for
-    for (int i = 0; i < nchan; i++) {
-        for (int j = 0; j < nsamp; j++) {
+    for (i = 0; i < nchan; i++) {
+        for (j = 0; j < nsamp; j++) {
             data[i * nsamp + j] -= channel_medians[i];
         }
     }
@@ -205,7 +375,8 @@ void sumthreshold_1d(
     const float eta_i[] = {1.0f};
 
     // Pre-compute M and chi_i values
-    for (int i = 0; i < M_len; i++) {
+    int i, j, e, m;
+    for (i = 0; i < M_len; i++) {
         M[i] = powf(2.0f, (float)i);
         chi_i[i] = chi_1 / powf(p, log2f(M[i]));
     }
@@ -214,19 +385,19 @@ void sumthreshold_1d(
     memset(local_mask, 0, length * sizeof(int));
 
     // Main thresholding logic
-    for (int e = 0; e < eta_len; e++) {
+    for (e = 0; e < eta_len; e++) {
         float current_eta = eta_i[e];
-        for (int m = 0; m < M_len; m++) {
+        for (m = 0; m < M_len; m++) {
             int window = (int)M[m];
             float threshold = chi_i[m] / current_eta;
 
             // Window processing
-            for (int i = 0; i <= length - window; i++) {
+            for (i = 0; i <= length - window; i++) {
                 float sum = 0.0f;
                 int count = 0;
 
                 // Calculate sum and count
-                for (int j = 0; j < window; j++) {
+                for (j = 0; j < window; j++) {
                     if (!mask[i + j]) {
                         sum += fabsf(temp_data[i + j]);
                         count++;
@@ -235,7 +406,7 @@ void sumthreshold_1d(
 
                 // Apply threshold
                 if (count > 0 && (sum / count) > threshold) {
-                    for (int j = 0; j < window; j++) {
+                    for (j = 0; j < window; j++) {
                         local_mask[i + j] = 1;
                     }
                 }
@@ -244,7 +415,7 @@ void sumthreshold_1d(
     }
 
     // Merge masks
-    for (int i = 0; i < length; i++) {
+    for (i = 0; i < length; i++) {
         mask[i] |= local_mask[i];
     }
 }
@@ -279,7 +450,8 @@ void sumthreshold_2d(
 
     // Calculate channel statistics
     float means[nchan], stds[nchan];
-    for (int i = 0; i < nchan; i++) {
+    int i, j;
+    for (i = 0; i < nchan; i++) {
         findMeanStd(&temp_dataT[i * nsamp], nsamp, &means[i], &stds[i]);
     }
 
@@ -290,15 +462,15 @@ void sumthreshold_2d(
 
     // Normalize data
     #pragma omp parallel for collapse(2)
-    for (int j = 0; j < nchan; j++) {
-        for (int i = 0; i < nsamp; i++) {
+    for (j = 0; j < nchan; j++) {
+        for (i = 0; i < nsamp; i++) {
             temp_dataT[j * nsamp + i] = (temp_dataT[j * nsamp + i] - global_mean) / (global_std + 1e-6f);
         }
     }
 
     // Time-axis processing with optimized 1D
     #pragma omp parallel for
-    for (int j = 0; j < nchan; j++) {
+    for (j = 0; j < nchan; j++) {
         sumthreshold_1d(&temp_dataT[j * nsamp], nsamp, &mask[j * nsamp], 
                        chi_1, M_len, temp_data_1d, local_mask_1d, M, chi_i);
     }
@@ -309,15 +481,15 @@ void sumthreshold_2d(
 
     // Frequency-axis processing
     #pragma omp parallel for
-    for (int i = 0; i < nsamp; i++) {
+    for (i = 0; i < nsamp; i++) {
         sumthreshold_1d(&transposed_data[i * nchan], nchan, &temp_maskT[i * nchan], 
                        chi_1, M_len, temp_data_1d, local_mask_1d, M, chi_i);
     }
 
     // Merge masks
     #pragma omp parallel for collapse(2)
-    for (int i = 0; i < nsamp; i++) {
-        for (int j = 0; j < nchan; j++) {
+    for (i = 0; i < nsamp; i++) {
+        for (j = 0; j < nchan; j++) {
             mask[j * nsamp + i] |= temp_maskT[i * nchan + j];
         }
     }
@@ -476,7 +648,8 @@ void binarySIR(
     
     // Count pixels before filtering
     int pixelsBefore = 0;
-    for (int idx = 0; idx < nsamp * nchan; idx++) {
+    int idx;
+    for (idx = 0; idx < nsamp * nchan; idx++) {
         if (mask[idx] != 0) pixelsBefore++;
     }
     
@@ -508,7 +681,7 @@ void binarySIR(
     
     // Count pixels after filtering and report statistics
     int pixelsAfter = 0;
-    for (int idx = 0; idx < nsamp * nchan; idx++) {
+    for (idx = 0; idx < nsamp * nchan; idx++) {
         if (mask[idx] != 0) pixelsAfter++;
     }
     
@@ -669,8 +842,9 @@ void printThresholdStatistics(const float *channel_values, int nchan,
     int *threshold_counts = (int *)calloc(num_thresholds, sizeof(int));
     
     // Count channels that would be flagged at different thresholds
-    for (int i = 0; i < nchan; i++) {
-        for (int idx = 0; idx < num_thresholds; idx++) {
+    int i, idx;
+    for (i = 0; i < nchan; i++) {
+        for (idx = 0; idx < num_thresholds; idx++) {
             // For negative thresholds (like -1*MAD), count values less than threshold
             // For positive thresholds, count values greater than threshold
             if (strstr(threshold_names[idx], "-") == threshold_names[idx]) {
@@ -684,7 +858,7 @@ void printThresholdStatistics(const float *channel_values, int nchan,
     }
     
     printf("\n=== Channels flagged at different %s thresholds ===\n", metric_name);
-    for (int idx = 0; idx < num_thresholds; idx++) {
+    for (idx = 0; idx < num_thresholds; idx++) {
         printf("%s: %d channels (%.2f%%)\n", 
                threshold_names[idx], threshold_counts[idx], 
                (float)threshold_counts[idx]/nchan*100);
@@ -693,12 +867,8 @@ void printThresholdStatistics(const float *channel_values, int nchan,
     free(threshold_counts);
 }
 
-/// @brief 绘制统一的阈值线系统
-/// @param thresh_values 所有阈值的实际值数组
-/// @param threshold_labels 阈值标签数组  
-/// @param threshold_colors 阈值颜色数组
-/// @brief Calculate and visualize channel Median Absolute Difference (MAD) statistics for threshold determination
-/// MAD is calculated as the median of absolute differences between adjacent data points in each channel
+/// @brief Calculate and visualize channel Median Absolute Deviation (MAD) statistics for threshold determination
+/// MAD is calculated as the mean of absolute deviations from median for each channel
 /// @param data Input data array (nsamp * nchan)
 /// @param nsamp Number of time samples
 /// @param nchan Number of frequency channels
@@ -734,36 +904,6 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
             // Calculate MAD as mean of absolute deviations from median
             channel_mad[i] = sum_abs_dev / nsamp;
             
-            // 调试：分析第一个通道的偏差分布
-            if (i == 0 && nsamp > 10) {
-                printf("=== Debug: First channel MAD analysis ===\n");
-                printf("Channel median: %.6f\n", channel_median[i]);
-                printf("First 20 absolute deviations: ");
-                for (int k = 0; k < 20 && k < nsamp; k++) {
-                    printf("%.6f ", temp_data[k]);
-                }
-                printf("\n");
-                
-                // 统计唯一偏差值数量
-                int unique_devs = 0;
-                int zero_devs = 0;
-                for (int k = 0; k < nsamp; k++) {
-                    if (temp_data[k] == 0.0f) zero_devs++;
-                    
-                    int is_unique_dev = 1;
-                    for (int l = 0; l < k; l++) {
-                        if (fabsf(temp_data[k] - temp_data[l]) < 1e-9f) {
-                            is_unique_dev = 0;
-                            break;
-                        }
-                    }
-                    if (is_unique_dev) unique_devs++;
-                }
-                printf("Channel 0: %d total samples, %d unique deviations, %d zero deviations\n", 
-                       nsamp, unique_devs, zero_devs);
-                printf("Mean absolute deviation: %.9f\n", sum_abs_dev / nsamp);
-                printf("Channel 0 MAD: %.9f\n", channel_mad[i]);
-            }
         } else {
             // If only one sample, set MAD to 0
             channel_mad[i] = 0.0f;
@@ -797,9 +937,7 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
     printf("MAD Min: %.6f\n", mad_min);
     printf("MAD Max: %.6f\n", mad_max);
     
-    // === 统一的11条阈值线系统 ===
-    
-    // === 统一的11条阈值线系统 ===
+    // Unified 11-threshold line system
     const int NUM_ALL_THRESHOLDS = 11;
     float all_thresh_values[11];
     const char* all_threshold_labels[11] = {
@@ -807,50 +945,50 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
         "Median", 
         "+1*MAD", "+2*MAD", "+3*MAD", "+4*MAD", "+5*MAD"
     };
-    const int all_threshold_colors[11] = {4, 7, 3, 8, 6, 1, 6, 8, 3, 7, 4}; // 蓝 黄 绿 橙 品红 白 品红 橙 绿 黄 蓝
+    const int all_threshold_colors[11] = {4, 7, 3, 8, 6, 1, 6, 8, 3, 7, 4}; // Color scheme: blue, yellow, green, orange, magenta, white, etc.
     const float all_y_positions[11] = {0.15f, 0.25f, 0.35f, 0.45f, 0.75f, 0.65f, 0.85f, 0.90f, 1.05f, 1.00f, 0.95f};
     
-    // 成对阈值控制开关：6个开关控制±1, ±2, ±3, ±4, ±5和中位线
+    // Paired threshold control switches: 5 switches control ±1, ±2, ±3, ±4, ±5 and median line
     const int show_median = 1;              
-    const int threshold_pair_enabled[5] = {1, 1, 1, 0, 1}; // ±1, ±2, ±3, ±4, ±5 对的开关
+    const int threshold_pair_enabled[5] = {1, 1, 1, 0, 1}; // Enable/disable ±1, ±2, ±3, ±4, ±5 pairs
     
-    // 根据成对开关生成11个位置的启用数组
+    // Generate enabled array for 11 positions based on paired switches
     int threshold_enabled[11];
-    for (int i = 0; i < 5; i++) {
-        // 负阈值 (-5*MAD 到 -1*MAD，索引0-4)
-        threshold_enabled[4-i] = threshold_pair_enabled[i]; // i=0→索引4(±1), i=1→索引3(±2), 依此类推
-        // 正阈值 (+1*MAD 到 +5*MAD，索引6-10)  
-        threshold_enabled[6+i] = threshold_pair_enabled[i]; // i=0→索引6(±1), i=1→索引7(±2), 依此类推
+    for (i = 0; i < 5; i++) {
+        // Negative thresholds (-5*MAD to -1*MAD, indices 0-4)
+        threshold_enabled[4-i] = threshold_pair_enabled[i]; // i=0→index4(±1), i=1→index3(±2), etc.
+        // Positive thresholds (+1*MAD to +5*MAD, indices 6-10)  
+        threshold_enabled[6+i] = threshold_pair_enabled[i]; // i=0→index6(±1), i=1→index7(±2), etc.
     }
-    threshold_enabled[5] = show_median; // 中位线 (索引5)
+    threshold_enabled[5] = show_median; // Median line (index 5)
     
-    // 统一计算所有11条阈值线的值
-    for (int i = 0; i < NUM_ALL_THRESHOLDS; i++) {
+    // Calculate all 11 threshold line values uniformly
+    for (i = 0; i < NUM_ALL_THRESHOLDS; i++) {
         if (i < 5) {
-            // 负阈值：-5*MAD 到 -1*MAD (索引0-4)
+            // Negative thresholds: -5*MAD to -1*MAD (indices 0-4)
             float multiplier = (float)(5 - i); // i=0→5, i=1→4, i=2→3, i=3→2, i=4→1
             all_thresh_values[i] = mad_median - multiplier * mad_mad;
         } else if (i == 5) {
-            // 中位线 (索引5)
+            // Median line (index 5)
             all_thresh_values[i] = mad_median;
         } else {
-            // 正阈值：+1*MAD 到 +5*MAD (索引6-10)
+            // Positive thresholds: +1*MAD to +5*MAD (indices 6-10)
             float multiplier = (float)(i - 5); // i=6→1, i=7→2, i=8→3, i=9→4, i=10→5
             all_thresh_values[i] = mad_median + multiplier * mad_mad;
         }
     }
     
-    // 输出开启的阈值线统计
+    // Output enabled threshold line statistics
     printf("\n=== Enabled Threshold Statistics ===\n");
-    for (int i = 0; i < NUM_ALL_THRESHOLDS; i++) {
+    for (i = 0; i < NUM_ALL_THRESHOLDS; i++) {
         if (threshold_enabled[i]) {
             printf("%s threshold: %.6f\n", all_threshold_labels[i], all_thresh_values[i]);
         }
     }
     
-    // 只对启用的阈值进行统计分析
+    // Statistical analysis only for enabled thresholds
     int enabled_count = 0;
-    for (int i = 0; i < NUM_ALL_THRESHOLDS; i++) {
+    for (i = 0; i < NUM_ALL_THRESHOLDS; i++) {
         if (threshold_enabled[i]) enabled_count++;
     }
     
@@ -859,7 +997,7 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
         const char **enabled_names = malloc(enabled_count * sizeof(const char*));
         
         int idx = 0;
-        for (int i = 0; i < NUM_ALL_THRESHOLDS; i++) {
+        for (i = 0; i < NUM_ALL_THRESHOLDS; i++) {
             if (threshold_enabled[i]) {
                 enabled_values[idx] = all_thresh_values[i];
                 enabled_names[idx] = all_threshold_labels[i];
@@ -876,10 +1014,10 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
     if (plot)
     {
         //=============================================================================
-        // 📊 第一个图：完整MAD直方图 (Full MAD Histogram)
+        // Part 1: Full MAD Histogram
         //=============================================================================
         
-        // 使用标准的直方图bin数量（MAD离散化问题已在算法层面解决）
+        // Use standard histogram bin count
         int nbins = (int)(sqrt(nchan) * 2);
         if (nbins < 30) nbins = 30;
         if (nbins > 100) nbins = 100;
@@ -889,13 +1027,13 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
         float plot_min = mad_min;
         float plot_max = mad_max;
         
-        // 为避免边界问题，略微扩展范围
+        // Slightly expand range to avoid boundary issues
         float range = plot_max - plot_min;
         if (range > 0) {
             plot_min -= 0.01f * range;
             plot_max += 0.01f * range;
         } else {
-            // 如果所有值相同，创建小范围
+            // If all values are the same, create small range
             plot_min -= 0.001f;
             plot_max += 0.001f;
         }
@@ -903,7 +1041,7 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
 
         printf("MAD value range: [%.6f, %.6f], using %d bins\n", mad_min, mad_max, nbins);
 
-        // 填充直方图
+        // Fill histogram
         for (i = 0; i < nchan; i++)
         {
             int bin = (int)((channel_mad[i] - plot_min) / bin_width);
@@ -915,12 +1053,12 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
             }
         }
 
-        // 统计非零bin数量
+        // Count non-zero bins
         int non_zero_bins = 0;
         for (i = 0; i < nbins; i++) {
             if (hist[i] > 0) {
                 non_zero_bins++;
-                if (non_zero_bins <= 10) { // 只打印前10个非零bin
+                if (non_zero_bins <= 10) { // Only print first 10 non-zero bins
                     printf("Bin %d: %.0f channels (x-range: %.6f to %.6f)\n", 
                            i, hist[i], plot_min + i * bin_width, plot_min + (i + 1) * bin_width);
                 }
@@ -928,75 +1066,125 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
         }
         printf("Total non-zero bins: %d out of %d\n", non_zero_bins, nbins);
 
-        // 计算最大计数
+        // Calculate maximum count
         float max_count = 0;
         for (i = 0; i < nbins; i++)
         {
             if (hist[i] > max_count) max_count = hist[i];
         }
 
-        // --- 第一个图：绘制完整MAD直方图 ---
+        // Plot 1: Create full MAD histogram
         printf("Creating MAD histogram plot...\n");
-        cpgpage();                          // 创建新页面
-        cpgvstd();                         // 设置标准视窗
-        cpgsch(1.2);                       // 设置字符大小
-        cpgswin(plot_min, plot_max, 0, max_count * 1.1f);  // 设置世界坐标
-        cpgbox("BCNST", 0.0, 0, "BCNST", 0.0, 0);          // 绘制坐标轴
-        cpglab("Channel MAD", "Number of Channels", "Channel MAD Distribution");  // 添加标签
+        cpgpage();                          // Create new page
+        cpgvstd();                         // Set standard viewport
+        cpgsch(1.2);                       // Set character size
+        cpgswin(plot_min, plot_max, 0, max_count * 1.1f);  // Set world coordinates
+        cpgbox("BCNST", 0.0, 0, "BCNST", 0.0, 0);          // Draw coordinate axes
+        cpglab("Channel MAD", "Number of Channels", "Channel MAD Distribution");  // Add labels
         printf("MAD histogram axes set up complete\n");
 
-        // --- 第一个图：绘制直方图条 ---
-        cpgsci(2); // 红色
+        // Plot 1: Draw histogram bars
+        cpgsci(2); // Red color
         for (i = 0; i < nbins; i++)
         {
             float x1 = plot_min + i * bin_width;
             float x2 = plot_min + (i + 1) * bin_width;
-            cpgrect(x1, x2, 0, hist[i]);   // 绘制每个直方图条
+            cpgrect(x1, x2, 0, hist[i]);   // Draw each histogram bar
         }
 
-        // --- 第一个图：绘制统一的11条阈值线系统 ---
-        for (int i = 0; i < NUM_ALL_THRESHOLDS; i++) {
+        // Plot 1: Draw unified 11-threshold line system
+        for (i = 0; i < NUM_ALL_THRESHOLDS; i++) {
             if (threshold_enabled[i] && all_thresh_values[i] >= plot_min && all_thresh_values[i] <= plot_max) {
-                cpgsci(all_threshold_colors[i]);                    // 设置阈值线颜色
-                cpgmove(all_thresh_values[i], 0);                   // 移动到起点
-                cpgdraw(all_thresh_values[i], max_count * 1.1f);    // 绘制垂直线
-                cpgptxt(all_thresh_values[i], max_count * all_y_positions[i], 0.0, 0.0, all_threshold_labels[i]);  // 添加标签
+                cpgsci(all_threshold_colors[i]);                    // Set threshold line color
+                cpgmove(all_thresh_values[i], 0);                   // Move to starting point
+                cpgdraw(all_thresh_values[i], max_count * 1.1f);    // Draw vertical line
+                cpgptxt(all_thresh_values[i], max_count * all_y_positions[i], 0.0, 0.0, all_threshold_labels[i]);  // Add label
             }
         }
 
-        cpgsci(1); // 恢复白色
+        cpgsci(1); // Restore white color
 
-        // === 添加高斯拟合曲线 ===
+        // Add Gaussian fitting curve
         printf("Fitting Gaussian curve to MAD histogram...\n");
         
-        // 准备拟合数据：将直方图转换为x-y数据点
+        // Unified Gaussian fitting threshold control
+        const float gaussian_fit_sigma_threshold = 5.0f;  // Sigma threshold for Gaussian fitting range
+        
+        // Define sigma range around median for fitting
+        float fit_range_min = mad_median - gaussian_fit_sigma_threshold * mad_mad;
+        float fit_range_max = mad_median + gaussian_fit_sigma_threshold * mad_mad;
+        printf("Gaussian fitting range: [%.6f, %.6f] (median ± %.1fσ)\n", fit_range_min, fit_range_max, gaussian_fit_sigma_threshold);
+        
+        // Prepare fitting data: convert histogram to x-y data points within 5-sigma range
         float *x_data = (float *)malloc(nbins * sizeof(float));
         float *y_data = (float *)malloc(nbins * sizeof(float));
         int fit_points = 0;
         
-        // --- 第一个图：高斯曲线拟合 ---
+        // Plot 1: Gaussian curve fitting (only use data within median ± configurable σ)
         for (i = 0; i < nbins; i++) {
-            if (hist[i] > 0) {  // 只使用非零的bin进行拟合
-                x_data[fit_points] = plot_min + (i + 0.5f) * bin_width;  // bin center
-                y_data[fit_points] = hist[i];
-                fit_points++;
+            if (hist[i] > 0) {  // Only use non-zero bins for fitting
+                float bin_center = plot_min + (i + 0.5f) * bin_width;
+                // Only include bins within sigma range around median
+                if (bin_center >= fit_range_min && bin_center <= fit_range_max) {
+                    x_data[fit_points] = bin_center;
+                    y_data[fit_points] = hist[i];
+                    fit_points++;
+                }
             }
         }
+        printf("Using %d out of %d bins for Gaussian fitting (within %.1fσ range)\n", fit_points, non_zero_bins, gaussian_fit_sigma_threshold);
         
-        // 使用现有的simple_curve_fit函数进行拟合
-        float fitted_sigma = simple_curve_fit(x_data, y_data, fit_points, mad_median);
-        printf("Gaussian fit: center=%.6f, sigma=%.6f\n", mad_median, fitted_sigma);
+        // Simple zero-bin removal: set the first y value to zero to eliminate instrument artifacts
+        if (fit_points > 0) {
+            printf("Removing potential instrument artifact: y_data[0] = %.1f -> 0.0\n", y_data[0]);
+            y_data[0] = 0.0f;
+        }
         
-        // --- 第一个图：绘制拟合的高斯曲线 ---
-        cpgsci(5); // 青色
-        cpgsls(2); // 虚线
+        // Use GSL three-parameter Gaussian fitting
+        float fitted_amplitude, fitted_mu, fitted_sigma;
+        
+        int gsl_success = gsl_gaussian_fit(x_data, y_data, fit_points, &fitted_amplitude, &fitted_mu, &fitted_sigma);
+        
+        if (gsl_success) {
+            printf("GSL Gaussian fit (%.1fσ range): amplitude=%.2f, center=%.6f, sigma=%.6f\n", 
+                   gaussian_fit_sigma_threshold, fitted_amplitude, fitted_mu, fitted_sigma);
+        } else {
+            printf("GSL Gaussian fit failed, falling back to simple fit\n");
+            fitted_sigma = simple_curve_fit(x_data, y_data, fit_points, mad_median);
+            fitted_amplitude = 0.0f;  // Will calculate below
+            fitted_mu = mad_median;
+            printf("Fallback Gaussian fit (%.1fσ range): center=%.6f, sigma=%.6f\n", gaussian_fit_sigma_threshold, fitted_mu, fitted_sigma);
+        }
+        
+        // If amplitude is not valid, calculate it as before
+        if (!gsl_success || fitted_amplitude <= 0) {
+            // Calculate appropriate amplitude for the fitted Gaussian
+            // Find the maximum of the fitted data points to scale the Gaussian properly
+            float max_fitted_y = 0.0f;
+            for (i = 0; i < fit_points; i++) {
+                if (y_data[i] > max_fitted_y) max_fitted_y = y_data[i];
+            }
+            
+            // Calculate the theoretical peak value of the normalized Gaussian
+            float gaussian_peak = gaus(fitted_mu, fitted_mu, fitted_sigma);
+            
+            // Scale factor to make the Gaussian curve match the histogram amplitude
+            fitted_amplitude = max_fitted_y / gaussian_peak;
+            
+            printf("Calculated amplitude scaling: max_fitted_y=%.1f, gaussian_peak=%.6f, amplitude=%.1f\n", 
+                   max_fitted_y, gaussian_peak, fitted_amplitude);
+        }
+        
+        // Plot 1: Draw fitted Gaussian curve
+        cpgsci(5); // Cyan color
+        cpgsls(2); // Dashed line
         
         int curve_points = 200;
         float curve_step = (plot_max - plot_min) / curve_points;
         
         for (i = 0; i < curve_points; i++) {
             float x = plot_min + i * curve_step;
-            float y = max_count * gaus(x, mad_median, fitted_sigma);
+            float y = gaus_with_amplitude(x, fitted_amplitude, fitted_mu, fitted_sigma);
             
             if (i == 0) {
                 cpgmove(x, y);
@@ -1005,23 +1193,23 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
             }
         }
         
-        cpgptxt(mad_median + fitted_sigma, max_count * 0.4f, 0.0, 0.0, "Gaussian Fit");
+        cpgptxt(mad_median + fitted_sigma, max_count * 0.4f, 0.0, 0.0, "Gaussian Fit (5σ)");
         cpgsls(1);
 
         free(x_data);
         free(y_data);
 
-        cpgsci(1); // 恢复白色
-        // *** 第一个图绘制完成 ***
+        cpgsci(1); // Restore white color
+        // *** Plot 1 complete ***
 
         //=============================================================================
-        // 🔍 第二个图：放大MAD直方图 (Zoomed MAD Histogram - Range 0-0.25) 
+        // Part 2: Zoomed MAD Histogram (Range 0-0.25) 
         //=============================================================================
         
-        // === 添加0到0.25区间的放大直方图 ===
+        // Add zoomed histogram for 0-0.25 range
         printf("Creating zoomed MAD histogram for range 0-0.25...\n");
         
-        // 检查是否有数据在0-0.25范围内
+        // Check if there is data in 0-0.25 range
         int has_data_in_range = 0;
         for (i = 0; i < nchan; i++) {
             if (channel_mad[i] >= 0.0f && channel_mad[i] <= 0.25f) {
@@ -1031,19 +1219,19 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
         }
         
         if (has_data_in_range) {
-            // --- 第二个图：创建新页面和设置 ---
-            cpgpage();                          // 创建新页面用于放大直方图
-            cpgvstd();                         // 设置标准视窗
-            cpgsch(1.2);                       // 设置字符大小
+            // Plot 2: Create new page and setup
+            cpgpage();                          // Create new page for zoomed histogram
+            cpgvstd();                         // Set standard viewport
+            cpgsch(1.2);                       // Set character size
             
-            // --- 第二个图：为0-0.25区间创建细分直方图数据 ---
-            int zoom_nbins = 50;               // 使用更多bin获得更高分辨率
+            // Plot 2: Create fine-grained histogram data for 0-0.25 range
+            int zoom_nbins = 50;               // Use more bins for higher resolution
             float zoom_min = 0.0f;
             float zoom_max = 0.25f;
             float zoom_bin_width = (zoom_max - zoom_min) / zoom_nbins;
             float *zoom_hist = (float *)calloc(zoom_nbins, sizeof(float));
             
-            // --- 第二个图：填充放大直方图数据 ---
+            // Plot 2: Fill zoomed histogram data
             int zoom_count = 0;
             for (i = 0; i < nchan; i++) {
                 if (channel_mad[i] >= zoom_min && channel_mad[i] <= zoom_max) {
@@ -1055,87 +1243,61 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
                 }
             }
             
-            // --- 第二个图：计算放大区间的最大计数 ---
+            // Plot 2: Calculate maximum count for zoomed range
             float zoom_max_count = 0;
             for (i = 0; i < zoom_nbins; i++) {
                 if (zoom_hist[i] > zoom_max_count) zoom_max_count = zoom_hist[i];
             }
             
             if (zoom_max_count > 0) {
-                // --- 第二个图：设置坐标系和标签 ---
-                cpgswin(zoom_min, zoom_max, 0, zoom_max_count * 1.1f);     // 设置世界坐标
-                cpgbox("BCNST", 0.0, 0, "BCNST", 0.0, 0);                  // 绘制坐标轴
-                cpglab("Channel MAD", "Number of Channels", "Channel MAD Distribution (Zoomed: 0-0.25)");  // 添加标签
+                // Plot 2: Set coordinate system and labels
+                cpgswin(zoom_min, zoom_max, 0, zoom_max_count * 1.1f);     // Set world coordinates
+                cpgbox("BCNST", 0.0, 0, "BCNST", 0.0, 0);                  // Draw coordinate axes
+                cpglab("Channel MAD", "Number of Channels", "Channel MAD Distribution (Zoomed: 0-0.25)");  // Add labels
                 
-                // --- 第二个图：绘制放大的直方图条 ---
-                cpgsci(2); // 红色
+                // Plot 2: Draw zoomed histogram bars
+                cpgsci(2); // Red color
                 for (i = 0; i < zoom_nbins; i++) {
                     if (zoom_hist[i] > 0) {
                         float x1 = zoom_min + i * zoom_bin_width;
                         float x2 = zoom_min + (i + 1) * zoom_bin_width;
-                        cpgrect(x1, x2, 0, zoom_hist[i]);       // 绘制每个放大直方图条
+                        cpgrect(x1, x2, 0, zoom_hist[i]);       // Draw each zoomed histogram bar
                     }
                 }
                 
-                // --- 第二个图：绘制统一的11条阈值线系统（放大版本） ---
-                for (int i = 0; i < NUM_ALL_THRESHOLDS; i++) {
+                // Plot 2: Draw unified 11-threshold line system (zoomed version)
+                for (i = 0; i < NUM_ALL_THRESHOLDS; i++) {
                     if (threshold_enabled[i] && all_thresh_values[i] >= zoom_min && all_thresh_values[i] <= zoom_max) {
-                        cpgsci(all_threshold_colors[i]);                    // 设置阈值线颜色
-                        cpgmove(all_thresh_values[i], 0);                   // 移动到起点
-                        cpgdraw(all_thresh_values[i], zoom_max_count * 1.1f);  // 绘制垂直线
-                        cpgptxt(all_thresh_values[i], zoom_max_count * all_y_positions[i], 0.0, 0.0, all_threshold_labels[i]);  // 添加标签
+                        cpgsci(all_threshold_colors[i]);                    // Set threshold line color
+                        cpgmove(all_thresh_values[i], 0);                   // Move to starting point
+                        cpgdraw(all_thresh_values[i], zoom_max_count * 1.1f);  // Draw vertical line
+                        cpgptxt(all_thresh_values[i], zoom_max_count * all_y_positions[i], 0.0, 0.0, all_threshold_labels[i]);  // Add label
                     }
                 }
                 
-                // --- 第二个图：高斯曲线拟合（针对放大直方图） ---
-                if (zoom_count >= 10) {  // 需要足够的数据点进行拟合
-                    // 将放大直方图转换为拟合用的数据点
-                    int fit_points = 0;
-                    float *fit_x = calloc(zoom_nbins, sizeof(float));
-                    float *fit_y = calloc(zoom_nbins, sizeof(float));
+                // Plot 2: Draw the same Gaussian curve as in the full histogram (using fitted results from full histogram)
+                cpgsci(5); // Cyan color for fit
+                cpgsls(2); // Dashed line style
+                
+                float zoom_curve_points = 200;
+                for (i = 0; i < zoom_curve_points; i++) {
+                    float x = zoom_min + i * (zoom_max - zoom_min) / (zoom_curve_points - 1);
+                    float y = gaus_with_amplitude(x, fitted_amplitude, fitted_mu, fitted_sigma);
                     
-                    if (fit_x && fit_y) {
-                        for (int i = 0; i < zoom_nbins; i++) {
-                            if (zoom_hist[i] > 0) {
-                                fit_x[fit_points] = zoom_min + (i + 0.5f) * zoom_bin_width;
-                                fit_y[fit_points] = (float)zoom_hist[i];
-                                fit_points++;
-                            }
-                        }
-                        
-                        if (fit_points >= 3) {  // 高斯拟合需要的最少点数
-                            // Fit Gaussian curve using existing simple_curve_fit function
-                            float fitted_sigma = simple_curve_fit(fit_x, fit_y, fit_points, mad_median);
-                            
-                            if (fitted_sigma > 1e-6f) {
-                                printf("Zoomed histogram Gaussian fit: center=%.6f, sigma=%.6f\n", mad_median, fitted_sigma);
-                                
-                                // Draw fitted Gaussian curve
-                                cpgsci(5); // Cyan color for fit
-                                cpgsls(2); // Dashed line style
-                                
-                                float fit_curve_x[200], fit_curve_y[200];
-                                int n_curve = 200;
-                                for (int i = 0; i < n_curve; i++) {
-                                    fit_curve_x[i] = zoom_min + i * (zoom_max - zoom_min) / (n_curve - 1);
-                                    fit_curve_y[i] = zoom_max_count * gaus(fit_curve_x[i], mad_median, fitted_sigma);
-                                }
-                                cpgline(n_curve, fit_curve_x, fit_curve_y);
-                                
-                                cpgsls(1); // Back to solid line
-                                cpgptxt(zoom_min + (zoom_max - zoom_min) * 0.7f, zoom_max_count * 0.85f, 
-                                        0.0, 0.0, "Gaussian Fit");
-                            }
-                        }
+                    if (i == 0) {
+                        cpgmove(x, y);
+                    } else {
+                        cpgdraw(x, y);
                     }
-                    
-                    free(fit_x);
-                    free(fit_y);
                 }
                 
-                cpgsci(1); // 恢复白色
+                cpgsls(1); // Back to solid line
+                cpgptxt(zoom_min + (zoom_max - zoom_min) * 0.7f, zoom_max_count * 0.85f, 
+                        0.0, 0.0, "Gaussian Fit (5σ)");
+                
+                cpgsci(1); // Restore white color
                 printf("Zoomed MAD histogram completed! (%d channels in 0-0.25 range)\n", zoom_count);
-                // *** 第二个图绘制完成 ***
+                // *** Plot 2 complete ***
             } else {
                 printf("No data found in 0-0.25 range for MAD histogram\n");
             }
@@ -1146,7 +1308,7 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
         }
 
         //=============================================================================
-        // 🏁 两个图的绘制全部完成
+        // Both plots completed
         //=============================================================================
 
         printf("MAD histogram plot completed!\n");
@@ -1192,18 +1354,6 @@ void visualizeChannelStd(float *data, int nsamp, int nchan, int plot)
             float mean_squared_dev = sum_squared_dev / nsamp;
             channel_std[i] = sqrtf(mean_squared_dev);
             
-            // 调试：分析第一个通道的偏差分布
-            if (i == 0 && nsamp > 10) {
-                printf("=== Debug: First channel std analysis ===\n");
-                printf("Channel median: %.6f\n", channel_median[i]);
-                printf("First 20 squared deviations: ");
-                for (int k = 0; k < 20 && k < nsamp; k++) {
-                    printf("%.6f ", temp_data[k]);
-                }
-                printf("\n");
-                printf("Mean squared deviation: %.9f\n", mean_squared_dev);
-                printf("Channel 0 STD: %.9f\n", channel_std[i]);
-            }
         } else {
             // If only one sample, set STD to 0
             channel_std[i] = 0.0f;
@@ -1238,31 +1388,33 @@ void visualizeChannelStd(float *data, int nsamp, int nchan, int plot)
     printf("STD Min: %.6f\n", std_min);
     printf("STD Max: %.6f\n", std_max);
     
-    // 统一的阈值计算系统（移除fallback逻辑）
+    // Unified threshold calculation system
     float multipliers[6] = {-1.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f};
     float threshold_values[6];
     const char* threshold_names[6] = {"-1*STD", "1*STD", "2*STD", "3*STD", "4*STD", "5*STD"};
     
-    // 直接计算所有阈值
-    for (int i = 0; i < 6; i++) {
+    // Calculate all thresholds directly
+    for (i = 0; i < 6; i++) {
         threshold_values[i] = std_median + multipliers[i] * std_std;
     }
     
-    // 统一打印阈值
+    // Print thresholds uniformly
     printf("\n=== Suggested Thresholds ===\n");
-    for (int i = 0; i < 6; i++) {
+    for (i = 0; i < 6; i++) {
         printf("%s threshold: %.6f\n", threshold_names[i], threshold_values[i]);
     }
     
-    // Print threshold statistics using the new function
     printThresholdStatistics(channel_std, nchan, threshold_values, threshold_names, 6, "STD");
     
     // =====================================================================
-    // 第一部分：绘制完整范围的STD直方图（包含所有统一的阈值线）
+    // Part 1: Draw full-range STD histogram (including all unified threshold lines)
     // =====================================================================
     if (plot)
     {
-        // 使用标准的直方图bin数量（STD离散化问题已在算法层面解决）
+        // Variable to store Gaussian fitting result for use in both full and zoomed histograms
+        float fitted_sigma = 0.0f;
+        
+        // Use standard histogram bin count
         int nbins = (int)(sqrt(nchan) * 2);
         if (nbins < 30) nbins = 30;
         if (nbins > 100) nbins = 100;
@@ -1272,13 +1424,13 @@ void visualizeChannelStd(float *data, int nsamp, int nchan, int plot)
         float plot_min = std_min;
         float plot_max = std_max;
         
-        // 为避免边界问题，略微扩展范围
+        // Slightly expand range to avoid boundary issues
         float range = plot_max - plot_min;
         if (range > 0) {
             plot_min -= 0.01f * range;
             plot_max += 0.01f * range;
         } else {
-            // 如果所有值相同，创建小范围
+            // If all values are the same, create a small range
             plot_min -= 0.001f;
             plot_max += 0.001f;
         }
@@ -1286,7 +1438,7 @@ void visualizeChannelStd(float *data, int nsamp, int nchan, int plot)
 
         printf("STD value range: [%.6f, %.6f], using %d bins\n", std_min, std_max, nbins);
 
-        // 填充直方图
+        // Fill histogram
         for (i = 0; i < nchan; i++)
         {
             int bin = (int)((channel_std[i] - plot_min) / bin_width);
@@ -1295,14 +1447,14 @@ void visualizeChannelStd(float *data, int nsamp, int nchan, int plot)
             hist[bin]++;
         }
 
-        // 计算最大计数
+        // Calculate maximum count
         float max_count = 0;
         for (i = 0; i < nbins; i++)
         {
             if (hist[i] > max_count) max_count = hist[i];
         }
 
-        // 绘制直方图
+        // Draw histogram
         printf("Creating STD histogram plot...\n");
         cpgpage();
         cpgvstd();
@@ -1312,8 +1464,8 @@ void visualizeChannelStd(float *data, int nsamp, int nchan, int plot)
         cpglab("Channel STD", "Number of Channels", "Channel STD Distribution");
         printf("STD histogram axes set up complete\n");
 
-        // 绘制实心直方图条
-        cpgsci(2); // 红色
+        // Draw solid histogram bars
+        cpgsci(2); // Red color
         for (i = 0; i < nbins; i++)
         {
             float x1 = plot_min + i * bin_width;
@@ -1321,19 +1473,19 @@ void visualizeChannelStd(float *data, int nsamp, int nchan, int plot)
             cpgrect(x1, x2, 0, hist[i]);
         }
 
-        // === 统一的阈值配置系统（类似MAD函数） ===
-        // 阈值对控制开关：[±1, ±2, ±3, ±4, ±5]
-        int threshold_pair_enabled[5] = {1, 1, 1, 0, 1}; // ±1,±2,±3开启，±4关闭，±5开启
-        int show_median = 1; // 显示中位线
+        // === Unified threshold configuration system (similar to MAD function) ===
+        // Threshold pair control switches: [±1, ±2, ±3, ±4, ±5]
+        int threshold_pair_enabled[5] = {1, 1, 1, 0, 1}; // ±1,±2,±3 enabled, ±4 disabled, ±5 enabled
+        int show_median = 1; // Show median line
         
-        // 计算负值阈值（使用已有的正值阈值进行对称计算）
-        float thresh_neg1std = threshold_values[0];  // 直接使用前面计算的结果
-        float thresh_neg2std = std_median - (threshold_values[2] - std_median);  // 相对于中位值对称
+        // Calculate negative thresholds (using existing positive thresholds for symmetric calculation)
+        float thresh_neg1std = threshold_values[0];  // Use previously calculated result directly
+        float thresh_neg2std = std_median - (threshold_values[2] - std_median);  // Symmetric relative to median
         float thresh_neg3std = std_median - (threshold_values[3] - std_median);
         float thresh_neg4std = std_median - (threshold_values[4] - std_median);
         float thresh_neg5std = std_median - (threshold_values[5] - std_median);
         
-        // 统一的阈值数组配置
+        // Unified threshold array configuration
         float all_thresh_values[11] = {
             thresh_neg5std, thresh_neg4std, thresh_neg3std, thresh_neg2std, thresh_neg1std,
             std_median,
@@ -1346,17 +1498,18 @@ void visualizeChannelStd(float *data, int nsamp, int nchan, int plot)
             "1*STD", "2*STD", "3*STD", "4*STD", "5*STD"
         };
         
-        int all_threshold_colors[11] = {4, 7, 3, 8, 6, 1, 6, 8, 3, 7, 4}; // 对称配色
+        int all_threshold_colors[11] = {4, 7, 3, 8, 6, 1, 6, 8, 3, 7, 4}; // Symmetric coloring
         float all_y_positions[11] = {0.1f, 0.2f, 0.3f, 0.5f, 0.7f, 0.65f, 0.75f, 0.9f, 1.05f, 1.0f, 0.85f};
 
-        // 绘制阈值线
-        for (int thresh_idx = 0; thresh_idx < 11; thresh_idx++) {
+        // Draw threshold lines
+        int thresh_idx;
+        for (thresh_idx = 0; thresh_idx < 11; thresh_idx++) {
             int should_draw = 0;
             
-            if (thresh_idx == 5) { // 中位线
+            if (thresh_idx == 5) { // Median line
                 should_draw = show_median;
             } else {
-                // 阈值对：索引0,1,2,3,4对应负值，索引6,7,8,9,10对应正值
+                // Threshold pairs: indices 0,1,2,3,4 for negative values, indices 6,7,8,9,10 for positive values
                 int pair_idx = (thresh_idx < 5) ? (4 - thresh_idx) : (thresh_idx - 6);
                 should_draw = threshold_pair_enabled[pair_idx];
             }
@@ -1370,14 +1523,116 @@ void visualizeChannelStd(float *data, int nsamp, int nchan, int plot)
             }
         }
 
-        cpgsci(1); // 恢复白色
+        cpgsci(1); // Restore white color
+
+        // Add Gaussian fitting curve
+        printf("Fitting Gaussian curve to STD histogram...\n");
+        
+        // Unified Gaussian fitting threshold control (same as MAD function)
+        const float gaussian_fit_sigma_threshold = 5.0f;  // Sigma threshold for Gaussian fitting range
+        
+        // Define sigma range around median for fitting
+        float fit_range_min = std_median - gaussian_fit_sigma_threshold * std_std;
+        float fit_range_max = std_median + gaussian_fit_sigma_threshold * std_std;
+        printf("Gaussian fitting range: [%.6f, %.6f] (median ± %.1fσ)\n", fit_range_min, fit_range_max, gaussian_fit_sigma_threshold);
+        
+        // Count non-zero bins for debugging
+        int non_zero_bins = 0;
+        for (i = 0; i < nbins; i++) {
+            if (hist[i] > 0) non_zero_bins++;
+        }
+        
+        // Prepare fitting data: convert histogram to x-y data points within 5-sigma range
+        float *x_data = (float *)malloc(nbins * sizeof(float));
+        float *y_data = (float *)malloc(nbins * sizeof(float));
+        int fit_points = 0;
+        
+        // Gaussian curve fitting (only use data within median ± configurable σ)
+        for (i = 0; i < nbins; i++) {
+            if (hist[i] > 0) {  // Only use non-zero bins for fitting
+                float bin_center = plot_min + (i + 0.5f) * bin_width;
+                // Only include bins within sigma range around median
+                if (bin_center >= fit_range_min && bin_center <= fit_range_max) {
+                    x_data[fit_points] = bin_center;
+                    y_data[fit_points] = hist[i];
+                    fit_points++;
+                }
+            }
+        }
+        printf("Using %d out of %d bins for Gaussian fitting (within %.1fσ range)\n", fit_points, non_zero_bins, gaussian_fit_sigma_threshold);
+        
+        // Simple zero-bin removal: set the first y value to zero to eliminate instrument artifacts
+        if (fit_points > 0) {
+            printf("Removing potential instrument artifact: y_data[0] = %.1f -> 0.0\n", y_data[0]);
+            y_data[0] = 0.0f;
+        }
+        
+        // Use GSL three-parameter Gaussian fitting
+        float fitted_amplitude, fitted_mu;
+        int gsl_success = gsl_gaussian_fit(x_data, y_data, fit_points, &fitted_amplitude, &fitted_mu, &fitted_sigma);
+        
+        if (gsl_success) {
+            printf("GSL Gaussian fit (%.1fσ range): amplitude=%.2f, center=%.6f, sigma=%.6f\n", 
+                   gaussian_fit_sigma_threshold, fitted_amplitude, fitted_mu, fitted_sigma);
+        } else {
+            printf("GSL Gaussian fit failed, falling back to simple fit\n");
+            fitted_sigma = simple_curve_fit(x_data, y_data, fit_points, std_median);
+            fitted_amplitude = 0.0f;  // Will calculate below
+            fitted_mu = std_median;
+            printf("Fallback Gaussian fit (%.1fσ range): center=%.6f, sigma=%.6f\n", gaussian_fit_sigma_threshold, fitted_mu, fitted_sigma);
+        }
+        
+        // If amplitude is not valid, calculate it as before
+        if (!gsl_success || fitted_amplitude <= 0) {
+            // Calculate appropriate amplitude for the fitted Gaussian
+            // Find the maximum of the fitted data points to scale the Gaussian properly
+            float max_fitted_y = 0.0f;
+            for (i = 0; i < fit_points; i++) {
+                if (y_data[i] > max_fitted_y) max_fitted_y = y_data[i];
+            }
+            
+            // Calculate the theoretical peak value of the normalized Gaussian
+            float gaussian_peak = gaus(fitted_mu, fitted_mu, fitted_sigma);
+            
+            // Scale factor to make the Gaussian curve match the histogram amplitude
+            fitted_amplitude = max_fitted_y / gaussian_peak;
+            
+            printf("Calculated amplitude scaling: max_fitted_y=%.1f, gaussian_peak=%.6f, amplitude=%.1f\n", 
+                   max_fitted_y, gaussian_peak, fitted_amplitude);
+        }
+        
+        // Draw fitted Gaussian curve
+        cpgsci(5); // Cyan color
+        cpgsls(2); // Dashed line
+        
+        int curve_points = 200;
+        float curve_step = (plot_max - plot_min) / curve_points;
+        
+        for (i = 0; i < curve_points; i++) {
+            float x = plot_min + i * curve_step;
+            float y = gaus_with_amplitude(x, fitted_amplitude, fitted_mu, fitted_sigma);
+            
+            if (i == 0) {
+                cpgmove(x, y);
+            } else {
+                cpgdraw(x, y);
+            }
+        }
+        
+        cpgptxt(fitted_mu + fitted_sigma, max_count * 0.4f, 0.0, 0.0, "Gaussian Fit (5σ)");
+        cpgsls(1);
+
+        free(x_data);
+        free(y_data);
+
+        cpgsci(1); // Restore white color
 
         // =====================================================================
-        // 第二部分：绘制0-0.25区间的放大STD直方图（细节视图）
+        // Second part: Draw zoomed STD histogram for 0-0.25 range (detailed view)
         // =====================================================================
         printf("Creating zoomed STD histogram for range 0-0.25...\n");
         
-        // 检查是否有数据在0-0.25范围内
+        // Check if there is data in the 0-0.25 range
         int has_data_in_range = 0;
         for (i = 0; i < nchan; i++) {
             if (channel_std[i] >= 0.0f && channel_std[i] <= 0.25f) {
@@ -1387,19 +1642,19 @@ void visualizeChannelStd(float *data, int nsamp, int nchan, int plot)
         }
         
         if (has_data_in_range) {
-            // 创建新页面用于放大直方图
+            // Create new page for zoomed histogram
             cpgpage();
             cpgvstd();
             cpgsch(1.2);
             
-            // 为0-0.25区间创建细分直方图
-            int zoom_nbins = 50; // 使用更多bin获得更高分辨率
+            // Create subdivided histogram for 0-0.25 range
+            int zoom_nbins = 50; // Use more bins for higher resolution
             float zoom_min = 0.0f;
             float zoom_max = 0.25f;
             float zoom_bin_width = (zoom_max - zoom_min) / zoom_nbins;
             float *zoom_hist = (float *)calloc(zoom_nbins, sizeof(float));
             
-            // 填充放大直方图
+            // Fill zoomed histogram
             int zoom_count = 0;
             for (i = 0; i < nchan; i++) {
                 if (channel_std[i] >= zoom_min && channel_std[i] <= zoom_max) {
@@ -1411,20 +1666,20 @@ void visualizeChannelStd(float *data, int nsamp, int nchan, int plot)
                 }
             }
             
-            // 计算放大区间的最大计数
+            // Calculate maximum count in zoomed range
             float zoom_max_count = 0;
             for (i = 0; i < zoom_nbins; i++) {
                 if (zoom_hist[i] > zoom_max_count) zoom_max_count = zoom_hist[i];
             }
             
             if (zoom_max_count > 0) {
-                // 设置坐标系
+                // Set up coordinate system
                 cpgswin(zoom_min, zoom_max, 0, zoom_max_count * 1.1f);
                 cpgbox("BCNST", 0.0, 0, "BCNST", 0.0, 0);
                 cpglab("Channel STD", "Number of Channels", "Channel STD Distribution (Zoomed: 0-0.25)");
                 
-                // 绘制放大的直方图条
-                cpgsci(2); // 红色
+                // Draw zoomed histogram bars
+                cpgsci(2); // Red color
                 for (i = 0; i < zoom_nbins; i++) {
                     if (zoom_hist[i] > 0) {
                         float x1 = zoom_min + i * zoom_bin_width;
@@ -1433,14 +1688,14 @@ void visualizeChannelStd(float *data, int nsamp, int nchan, int plot)
                     }
                 }
                 
-                // === 使用统一系统绘制放大图中的阈值线 ===
-                for (int thresh_idx = 0; thresh_idx < 11; thresh_idx++) {
+                // === Use unified system to draw threshold lines in zoomed plot ===
+                for (thresh_idx = 0; thresh_idx < 11; thresh_idx++) {
                     int should_draw = 0;
                     
-                    if (thresh_idx == 5) { // 中位线
+                    if (thresh_idx == 5) { // Median line
                         should_draw = show_median;
                     } else {
-                        // 阈值对：索引0,1,2,3,4对应负值，索引6,7,8,9,10对应正值
+                        // Threshold pairs: indices 0,1,2,3,4 for negative values, indices 6,7,8,9,10 for positive values
                         int pair_idx = (thresh_idx < 5) ? (4 - thresh_idx) : (thresh_idx - 6);
                         should_draw = threshold_pair_enabled[pair_idx];
                     }
@@ -1449,7 +1704,7 @@ void visualizeChannelStd(float *data, int nsamp, int nchan, int plot)
                         cpgsci(all_threshold_colors[thresh_idx]);
                         cpgmove(all_thresh_values[thresh_idx], 0);
                         cpgdraw(all_thresh_values[thresh_idx], zoom_max_count * 1.1f);
-                        // 调整y位置以适应放大图
+                        // Adjust y position to fit zoomed plot
                         float zoom_y_pos = 0.1f + (thresh_idx * 0.08f);
                         if (zoom_y_pos > 0.9f) zoom_y_pos = 0.9f;
                         cpgptxt(all_thresh_values[thresh_idx], zoom_max_count * zoom_y_pos, 
@@ -1457,7 +1712,27 @@ void visualizeChannelStd(float *data, int nsamp, int nchan, int plot)
                     }
                 }
                 
-                cpgsci(1); // 恢复白色
+                // Draw the same Gaussian curve as in the full histogram (using fitted results from full histogram)
+                cpgsci(5); // Cyan color for fit
+                cpgsls(2); // Dashed line style
+                
+                float zoom_curve_points = 200;
+                for (i = 0; i < zoom_curve_points; i++) {
+                    float x = zoom_min + i * (zoom_max - zoom_min) / (zoom_curve_points - 1);
+                    float y = gaus_with_amplitude(x, fitted_amplitude, fitted_mu, fitted_sigma);
+                    
+                    if (i == 0) {
+                        cpgmove(x, y);
+                    } else {
+                        cpgdraw(x, y);
+                    }
+                }
+                
+                cpgsls(1); // Back to solid line
+                cpgptxt(zoom_min + (zoom_max - zoom_min) * 0.7f, zoom_max_count * 0.85f, 
+                        0.0, 0.0, "Gaussian Fit (5σ)");
+                
+                cpgsci(1); // Restore white color
                 printf("Zoomed STD histogram completed! (%d channels in 0-0.25 range)\n", zoom_count);
             } else {
                 printf("No data found in 0-0.25 range for STD histogram\n");
@@ -1527,7 +1802,7 @@ void flagChannelsByDualSumThreshold(
 void identSubstNSigma(
     float *data, int nsamp, int nchan, float Nsigma, int iterationIndex, int plot,
     int *horizontalMask, int *verticalMask, int *globalMask,
-    float *finalMedian, float *finalStd)
+    float *finalMedian, float *finalStd, int cudaReady)
 {
     // Debug output at function entry
     printf("### DEBUG: identSubstNSigma called with iterationIndex=%d, plot=%d ###\n", iterationIndex, plot);
@@ -1543,30 +1818,16 @@ void identSubstNSigma(
     float *median_temp = (float *)malloc(nsamp * nchan * sizeof(float));
     memcpy(median_temp, data, nsamp * nchan * sizeof(float));
     
-    float lastMean = 0.0f, lastStd = 0.0f, lastMedian = 0.0f;
+    float lastMean = 0.0f, lastStd = 0.0f;
     float mean = 0.0f, std = 0.0f, med = 0.0f;
-    float meanDiff = 0.0f, stdDiff = 0.0f, medianDiff = 0.0f;
+    float meanDiff = 0.0f, stdDiff = 0.0f;
     float upperBound, lowerBound;
-    float n_ref = nsamp;
+    
     int totReplaceCnt = 0;
-    // float killThresh = 0.04f; // Threshold for killing a channel if too many pixels are masked
     float killThresh = 0.2f;  // 10% pixel ratio threshold
     int i, j;
 
-    // float chanMedian[nchan];
-    // float chanMean[nchan];
-    // float chanStd[nchan];
-    // for (i = 0; i < nchan; i++) {
-    //     chanMedian[i] = median(median_temp + i * nsamp, nsamp);
-    //     findMeanStd(data + i * nsamp, nsamp, &chanMean[i], &chanStd[i]);
-    // }
-    // normalizeChannelData(data, nsamp, nchan, chanMedian, chanStd, median_temp);
-    
-    // memcpy(median_temp, data, nsamp * nchan * sizeof(float));
-    // Process each frequency channel
-
-    // 减中值 - Use the new function to subtract channel medians
-    subtractChannelMedians(data, nsamp, nchan);
+    // subtractChannelMedians(data, nsamp, nchan);
     
     // Visualize channel MAD statistics for threshold determination in first 20 iterations
     // Use iterationIndex as a proxy for iteration counter (passed from ReadFASTData.c)
@@ -1581,7 +1842,7 @@ void identSubstNSigma(
         printf("=== STD Histogram Complete ===\n");
     }
     
-    // === 1. 通道级标记 (Channel level flagging first) ===
+    // === 1. Channel level flagging first ===
     float *channel_stds = (float *)malloc(nchan * sizeof(float));
     float *channel_stds_temp = (float *)malloc(nchan * sizeof(float));
     flagChannelsByStdOutliers(data, nsamp, nchan, horizontalMask, channel_stds, channel_stds_temp);
@@ -1606,7 +1867,7 @@ void identSubstNSigma(
     printf("Channel-level flagging: %d/%d channels fully flagged (%.2f%%), skipping pixel-level detection for these\n", 
            fully_flagged_channels, nchan, (float)fully_flagged_channels/nchan*100);
     
-    // === 2. 通道内像素异常值标记 (Channel-internal pixel flagging) ===
+    // === 2. Channel-internal pixel flagging ===
     // Skip pixel-level detection for channels that are already fully flagged
     #pragma omp parallel for reduction(+:totReplaceCnt)
     for (i = 0; i < nchan; i++)
@@ -1621,14 +1882,14 @@ void identSubstNSigma(
         {
             lastMean = mean;
             lastStd = std;
-            lastMedian = med;
+            
             findMeanStd(data + i * nsamp, nsamp, &mean, &std);
             med = median(median_temp + i * nsamp, nsamp);
             meanDiff = fabsf(mean - lastMean) / lastMean;
             stdDiff = fabsf(std - lastStd) / lastStd;
-            medianDiff = fabsf(med - lastMedian) / lastMedian;
+            // medianDiff removed (not used)
 
-            float scale_row = sqrtf(n_ref / nsamp);
+            float scale_row = 1.0f;
             upperBound = med + Nsigma * scale_row * std;
             lowerBound = med - Nsigma * scale_row * std;
 
@@ -1675,12 +1936,12 @@ void identSubstNSigma(
         {
             lastMean = mean;
             lastStd = std;
-            lastMedian = med;
+            
             findMeanStd(transposedData + i * nchan, nchan, &mean, &std);
             med = median(median_temp + i * nchan, nchan);
             meanDiff = fabsf(mean - lastMean) / lastMean;
             stdDiff = fabsf(std - lastStd) / lastStd;
-            medianDiff = fabsf(med - lastMedian) / lastMedian;
+            // medianDiff removed (not used)
 
             // float scale_col = sqrtf(n_ref / nchan);
             float scale_col = 1.0f;
@@ -1718,7 +1979,8 @@ void identSubstNSigma(
     
     // Debug: Check horizontal and vertical mask statistics before combining
     int horizontalFlagged = 0, verticalFlagged = 0;
-    for (int idx = 0; idx < nsamp * nchan; idx++) {
+    int idx;
+    for (idx = 0; idx < nsamp * nchan; idx++) {
         if (horizontalMask[idx] == 1) horizontalFlagged++;
         if (verticalMask[idx] == 1) verticalFlagged++;
     }
@@ -1732,7 +1994,7 @@ void identSubstNSigma(
     
     // Debug: Check globalMask immediately after logicalOR
     int globalFlagged = 0;
-    for (int idx = 0; idx < nsamp * nchan; idx++) {
+    for (idx = 0; idx < nsamp * nchan; idx++) {
         if (globalMask[idx] == 1) globalFlagged++;
     }
     printf("Global mask flagged after logicalOR: %d/%d pixels (%.4f%%)\n", 
@@ -1742,17 +2004,24 @@ void identSubstNSigma(
     // Apply binarySIR before killThresh analysis to filter isolated pixels for better range calculation
     printf("\n=== Applying binarySIR filtering before killThresh analysis ===\n");
     int flaggedBeforeSIR = globalFlagged;
-    binarySIR(globalMask, nsamp, nchan, 3, 3, 1.0f, 0.2f); // Filter out isolated pixels
+    
+    // Use CUDA-accelerated binarySIR if available
+    if (cudaReady) {
+        printf("Using CUDA-accelerated binarySIR filtering for killThresh analysis...\n");
+        cuda_binarySIR(globalMask, nsamp, nchan, 3, 3, 1.0f, 0.2f);
+    } else {
+        binarySIR(globalMask, nsamp, nchan, 3, 3, 1.0f, 0.2f); // Filter out isolated pixels
+    }
     
     // Recount flagged pixels after binarySIR
     int flaggedAfterSIR = 0;
-    for (int idx = 0; idx < nsamp * nchan; idx++) {
+    for (idx = 0; idx < nsamp * nchan; idx++) {
         if (globalMask[idx] == 1) flaggedAfterSIR++;
     }
     printf("binarySIR filtering: %d -> %d flagged pixels (removed %d isolated pixels)\n", 
            flaggedBeforeSIR, flaggedAfterSIR, flaggedBeforeSIR - flaggedAfterSIR);
 
-    // === 3. 点干扰严重通道标记 (killThresh - flag heavily contaminated channels) ===
+    // === 3. Heavy RFI channel marking (killThresh - flag heavily contaminated channels) ===
     // Apply killThresh: if a channel has more than killThresh fraction of flagged pixels, flag the entire channel
     // Add position range check: avoid killing channels with concentrated local RFI
     printf("\n=== killThresh Analysis (threshold=%.3f) ===\n", killThresh);
@@ -1761,14 +2030,16 @@ void identSubstNSigma(
     int totalFlaggedAfter = 0;
     int localRFISkipped = 0;  // Count channels skipped due to local RFI pattern
     float rangeThreshold = 0.5f;  // If flagged pixels span <30% of channel, don't kill entire channel
+    int chan;
 
     #pragma omp parallel for reduction(+:killedChannels,localRFISkipped)
-    for (int chan = 0; chan < nchan; chan++) {
+    for (chan = 0; chan < nchan; chan++) {
         int maskedCount = 0;
         int firstFlagged = -1, lastFlagged = -1;
+        int samp;
         
         // First pass: count flagged pixels and find range
-        for (int samp = 0; samp < nsamp; samp++) {
+        for (samp = 0; samp < nsamp; samp++) {
             int idx = samp + chan * nsamp; // Corrected indexing to match original
             if (globalMask[idx]) {
                 maskedCount++;
@@ -1818,7 +2089,7 @@ void identSubstNSigma(
         
         if (shouldKillChannel) {
             killedChannels++;
-            for (int samp = 0; samp < nsamp; samp++) {
+            for (samp = 0; samp < nsamp; samp++) {
                 int idx = samp + chan * nsamp;
                 globalMask[idx] = 1;
             }
@@ -1826,7 +2097,7 @@ void identSubstNSigma(
     }
     
     // Count total flagged pixels after killThresh
-    for (int idx = 0; idx < nsamp * nchan; idx++) {
+    for (idx = 0; idx < nsamp * nchan; idx++) {
         if (globalMask[idx] == 1) totalFlaggedAfter++;
     }
     
@@ -1842,6 +2113,526 @@ void identSubstNSigma(
     free(median_temp);
 }
 
+/**
+ * @brief Perform iterative outlier detection and flagging for a single frequency channel
+ * @param data Channel data array (nsamp length)
+ * @param nsamp Number of samples in the channel
+ * @param Nsigma Sigma threshold for outlier detection
+ * @param mask Output mask for this channel (nsamp length)
+ * @param median_temp Temporary array for median calculation (nsamp length)
+ * @param good_samples Temporary array for good sample indices (nsamp length)
+ * @param random_indices Temporary array for random indices (nsamp length)
+ * @return Total number of outliers detected
+ */
+int iterativeChannelOutlierDetection(float *data, int nsamp, float Nsigma, 
+                                   int *mask, float *median_temp,
+                                   int *good_samples, int *random_indices)
+{
+    float lastMean = 0.0f, lastStd = 0.0f;
+    float mean = 0.0f, std = 0.0f, med = 0.0f;
+    float meanDiff = 0.0f, stdDiff = 0.0f;
+    float upperBound, lowerBound;
+    int totReplaceCnt = 0;
+    int iter = 0;
+    const int maxIterations = 3;
+    
+    // Copy data for median calculation
+    memcpy(median_temp, data, nsamp * sizeof(float));
+    
+    while (iter < maxIterations)
+    {
+        lastMean = mean;
+        lastStd = std;
+        
+        // Calculate statistics
+        findMeanStd(data, nsamp, &mean, &std);
+        med = median(median_temp, nsamp);
+        
+        // Calculate convergence metrics
+        if (iter > 0) {
+            meanDiff = (lastMean != 0.0f) ? fabsf(mean - lastMean) / fabsf(lastMean) : 0.0f;
+            stdDiff = (lastStd != 0.0f) ? fabsf(std - lastStd) / fabsf(lastStd) : 0.0f;
+            // medianDiff removed (not used in convergence condition)
+        }
+        
+        // Calculate bounds
+        float scale_row = 1.0f; // sqrtf(nsamp/nsamp)
+        upperBound = med + Nsigma * scale_row * std;
+        lowerBound = med - Nsigma * scale_row * std;
+        
+        // Flag outliers
+    int newOutliers = 0;
+    int j;
+    for (j = 0; j < nsamp; j++)
+        {
+            if (data[j] > upperBound || data[j] < lowerBound)
+            {
+                if (mask[j] == 0) {
+                    newOutliers++;
+                    totReplaceCnt++;
+                }
+                mask[j] = 1;
+            }
+        }
+        
+        // Check for convergence
+        if (newOutliers == 0 || (iter > 0 && meanDiff < 0.001f && stdDiff < 0.001f)) {
+            break;
+        }
+        
+        iter++;
+    }
+    
+    return totReplaceCnt;
+}
 
+/**
+ * @brief Perform iterative outlier detection and flagging for a single time sample
+ * @param data Time sample data array (nchan length) 
+ * @param nchan Number of channels in the time sample
+ * @param Nsigma Sigma threshold for outlier detection
+ * @param mask Output mask for this time sample (nchan length)
+ * @param median_temp Temporary array for median calculation (nchan length)
+ * @param good_samples Temporary array for good sample indices (nchan length)
+ * @param random_indices Temporary array for random indices (nchan length)
+ * @return Total number of outliers detected
+ */
+int iterativeTimeSampleOutlierDetection(float *data, int nchan, float Nsigma,
+                                       int *mask, float *median_temp,
+                                       int *good_samples, int *random_indices)
+{
+    float lastMean = 0.0f, lastStd = 0.0f;
+    float mean = 0.0f, std = 0.0f, med = 0.0f;
+    float meanDiff = 0.0f, stdDiff = 0.0f;
+    float upperBound, lowerBound;
+    
+    int totReplaceCnt = 0;
+    int iter = 0;
+    const int maxIterations = 3;
+    
+    // Copy data for median calculation
+    memcpy(median_temp, data, nchan * sizeof(float));
+    
+    while (iter < maxIterations)
+    {
+        lastMean = mean;
+        lastStd = std;
+        
+        // Calculate statistics
+        findMeanStd(data, nchan, &mean, &std);
+        med = median(median_temp, nchan);
+        
+        // Calculate convergence metrics
+        if (iter > 0) {
+            meanDiff = (lastMean != 0.0f) ? fabsf(mean - lastMean) / fabsf(lastMean) : 0.0f;
+            stdDiff = (lastStd != 0.0f) ? fabsf(std - lastStd) / fabsf(lastStd) : 0.0f;
+            // medianDiff removed (not used in convergence condition)
+        }
+        
+        // Calculate bounds (using scale factor of 1.0 for time samples)
+        float scale_col = 1.0f;
+        upperBound = med + Nsigma * scale_col * std;
+        lowerBound = med - Nsigma * scale_col * std;
+        
+        // Flag outliers
+    int newOutliers = 0;
+    int j;
+    for (j = 0; j < nchan; j++)
+        {
+            if (data[j] > upperBound || data[j] < lowerBound)
+            {
+                if (mask[j] == 0) {
+                    newOutliers++;
+                    totReplaceCnt++;
+                }
+                mask[j] = 1;
+            }
+        }
+        
+        // Check for convergence
+        if (newOutliers == 0 || (iter > 0 && meanDiff < 0.001f && stdDiff < 0.001f)) {
+            break;
+        }
+        
+        iter++;
+    }
+    
+    return totReplaceCnt;
+}
 
+/**
+ * @brief Perform channel-level outlier detection using extracted iterative functions
+ * @param data Input data array (nsamp * nchan)
+ * @param nsamp Number of samples per channel
+ * @param nchan Number of channels
+ * @param Nsigma Sigma threshold for outlier detection
+ * @param horizontalMask Output horizontal mask array
+ * @param channel_fully_flagged Array indicating which channels are fully flagged
+ * @return Total number of outliers detected across all channels
+ */
+int performChannelLevelDetection(float *data, int nsamp, int nchan, float Nsigma,
+                               int *horizontalMask, int *channel_fully_flagged)
+{
+    int totalOutliers = 0;
+    
+    // Allocate temporary arrays for each thread
+    #pragma omp parallel reduction(+:totalOutliers)
+    {
+        float *median_temp = (float *)malloc(nsamp * sizeof(float));
+        int *good_samples = (int *)malloc(nsamp * sizeof(int));
+        int *random_indices = (int *)malloc(nsamp * sizeof(int));
+        int i;
+        
+        #pragma omp for
+        for (i = 0; i < nchan; i++)
+        {
+            // Skip this channel if it's already fully flagged
+            if (channel_fully_flagged[i]) {
+                continue;
+            }
+            
+            // Perform iterative outlier detection for this channel
+            int channelOutliers = iterativeChannelOutlierDetection(
+                data + i * nsamp, nsamp, Nsigma,
+                horizontalMask + i * nsamp, median_temp,
+                good_samples, random_indices
+            );
+            
+            totalOutliers += channelOutliers;
+        }
+        
+        free(median_temp);
+        free(good_samples);
+        free(random_indices);
+    }
+    
+    return totalOutliers;
+}
 
+/**
+ * @brief Perform time-sample-level outlier detection using extracted iterative functions
+ * @param data Input transposed data array (nsamp * nchan, but accessed as nchan * nsamp)
+ * @param nsamp Number of time samples
+ * @param nchan Number of channels per time sample
+ * @param Nsigma Sigma threshold for outlier detection
+ * @param verticalMask Output vertical mask array (transposed layout)
+ * @return Total number of outliers detected across all time samples
+ */
+int performTimeSampleLevelDetection(float *data, int nsamp, int nchan, float Nsigma,
+                                  int *verticalMask)
+{
+    int totalOutliers = 0;
+    
+    // Allocate temporary arrays for each thread
+    #pragma omp parallel reduction(+:totalOutliers)
+    {
+        float *median_temp = (float *)malloc(nchan * sizeof(float));
+        int *good_samples = (int *)malloc(nchan * sizeof(int));
+        int *random_indices = (int *)malloc(nchan * sizeof(int));
+        int i;
+        
+        #pragma omp for
+        for (i = 0; i < nsamp; i++)
+        {
+            // Perform iterative outlier detection for this time sample
+            int sampleOutliers = iterativeTimeSampleOutlierDetection(
+                data + i * nchan, nchan, Nsigma,
+                verticalMask + i * nchan, median_temp,
+                good_samples, random_indices
+            );
+            
+            totalOutliers += sampleOutliers;
+        }
+        
+        free(median_temp);
+        free(good_samples);
+        free(random_indices);
+    }
+    
+    return totalOutliers;
+}
+
+/**
+ * @brief Apply killThresh analysis to flag heavily contaminated channels
+ * @param globalMask Input/output global mask array
+ * @param nsamp Number of time samples
+ * @param nchan Number of channels
+ * @param killThresh Threshold for flagging entire channels
+ * @param flaggedAfterSIR Initial flagged pixel count (after binarySIR)
+ * @param killedChannels Output: number of channels killed
+ * @param localRFISkipped Output: number of channels skipped due to localized RFI
+ * @param totalFlaggedAfter Output: total flagged pixels after killThresh
+ */
+void applyKillThresh(int *globalMask, int nsamp, int nchan, float killThresh, 
+                    int flaggedAfterSIR, int *killedChannels, int *localRFISkippedPtr, 
+                    int *totalFlaggedAfter)
+{
+    *killedChannels = 0;
+    *localRFISkippedPtr = 0;
+    *totalFlaggedAfter = 0;
+    float rangeThreshold = 0.5f;  // If flagged pixels span <50% of channel, don't kill entire channel
+    
+    printf("\n=== killThresh Analysis (threshold=%.3f) ===\n", killThresh);
+    
+    // Use local variables for OpenMP reduction, then assign to output parameters
+    int localKilledChannels = 0;
+    int localRFISkipped = 0;
+    
+    int chan;
+    #pragma omp parallel for reduction(+:localKilledChannels,localRFISkipped)
+    for (chan = 0; chan < nchan; chan++) {
+        int maskedCount = 0;
+        int firstFlagged = -1, lastFlagged = -1;
+        int samp;
+        
+        // First pass: count flagged pixels and find range
+        for (samp = 0; samp < nsamp; samp++) {
+            int idx = samp + chan * nsamp;
+            if (globalMask[idx]) {
+                maskedCount++;
+                if (firstFlagged == -1) firstFlagged = samp;
+                lastFlagged = samp;
+            }
+        }
+        
+        float maskedRatio = (float)maskedCount / nsamp;
+        int shouldKillChannel = 0;
+        
+        if (maskedRatio > killThresh) {
+            if (firstFlagged != -1 && lastFlagged != -1) {
+                int flaggedRange = lastFlagged - firstFlagged + 1;
+                float rangeRatio = (float)flaggedRange / nsamp;
+                
+                if (rangeRatio >= rangeThreshold) {
+                    shouldKillChannel = 1;
+                } else {
+                    localRFISkipped++;
+                }
+                
+                if (maskedRatio > 0.001f) {
+                    #pragma omp critical
+                    {
+                        // Optional detailed channel logging (currently commented out)
+                        // printf("Channel %d: %d/%d flagged (%.3f%%), range [%d-%d] (%.1f%% span)", 
+                        //        chan, maskedCount, nsamp, maskedRatio*100, 
+                        //        firstFlagged, lastFlagged, rangeRatio*100);
+                        if (maskedRatio > killThresh) {
+                            if (shouldKillChannel) {
+                                // printf(" -> KILLING ENTIRE CHANNEL");
+                            } else {
+                                // printf(" -> SKIPPED (localized RFI)");
+                            }
+                        }
+                        // printf("\n");
+                    }
+                }
+            } else {
+                shouldKillChannel = 1;
+            }
+        }
+        
+        if (shouldKillChannel) {
+            localKilledChannels++;
+            for (samp = 0; samp < nsamp; samp++) {
+                int idx = samp + chan * nsamp;
+                globalMask[idx] = 1;
+            }
+        }
+    }
+    
+    // Assign local variables to output parameters
+    *killedChannels = localKilledChannels;
+    *localRFISkippedPtr = localRFISkipped;
+    
+    // Count total flagged pixels after killThresh
+    int idx;
+    for (idx = 0; idx < nsamp * nchan; idx++) {
+        if (globalMask[idx] == 1) (*totalFlaggedAfter)++;
+    }
+}
+
+/**
+ * @brief Print killThresh analysis summary
+ * @param killedChannels Number of channels killed
+ * @param localRFISkipped Number of channels skipped due to localized RFI
+ * @param totalFlaggedBefore Flagged pixels before killThresh
+ * @param totalFlaggedAfter Flagged pixels after killThresh
+ * @param nsamp Number of time samples
+ * @param nchan Number of channels
+ */
+void printKillThreshSummary(int killedChannels, int localRFISkipped, int totalFlaggedBefore, 
+                           int totalFlaggedAfter, int nsamp, int nchan)
+{
+    float rangeThreshold = 0.5f;  // Keep consistent with applyKillThresh
+    
+    printf("killThresh Summary:\n");
+    printf("  - Killed channels: %d/%d (%.2f%%)\n", killedChannels, nchan, 
+           (float)killedChannels/nchan*100);
+    printf("  - Localized RFI skipped: %d/%d (%.2f%%)\n", localRFISkipped, nchan, 
+           (float)localRFISkipped/nchan*100);
+    printf("  - Range threshold: %.1f%% (flagged pixels must span >%.1f%% of channel to kill)\n", 
+           rangeThreshold*100, rangeThreshold*100);
+    printf("  - Flagged pixels before: %d/%d (%.2f%%)\n", totalFlaggedBefore, nsamp*nchan, 
+           (float)totalFlaggedBefore/(nsamp*nchan)*100);
+    printf("  - Flagged pixels after: %d/%d (%.2f%%)\n", totalFlaggedAfter, nsamp*nchan, 
+           (float)totalFlaggedAfter/(nsamp*nchan)*100);
+    printf("  - Additional pixels flagged: %d\n", totalFlaggedAfter - totalFlaggedBefore);
+    printf("=== End killThresh Analysis ===\n\n");
+}
+
+void identSubstNSigma_Experiment(
+    float *data, int nsamp, int nchan, float Nsigma, int iterationIndex, int plot,
+    int *horizontalMask, int *verticalMask, int *globalMask,
+    float *finalMedian, float *finalStd, int cudaReady)
+{    
+    memset(horizontalMask, 0, nsamp * nchan * sizeof(int));
+    memset(verticalMask, 0, nsamp * nchan * sizeof(int));
+    memset(globalMask, 0, nsamp * nchan * sizeof(int));
+
+    int *good_samples = (int *)malloc(nsamp * sizeof(int));
+    int *random_indices = (int *)malloc(nsamp * sizeof(int));
+    float *median_temp = (float *)malloc(nsamp * nchan * sizeof(float));
+    memcpy(median_temp, data, nsamp * nchan * sizeof(float));
+    
+    float killThresh = 0.2f;
+    int i, j;
+    
+    subtractChannelMedians(data, nsamp, nchan);
+    
+    // Visualize channel MAD statistics for threshold determination in first 20 iterations
+    // Use iterationIndex as a proxy for iteration counter (passed from ReadFASTData.c)
+    if (plot)
+    {
+        printf("=== Generating Channel MAD Histogram (Iteration %d) ===\n", iterationIndex);
+        visualizeChannelMAD(data, nsamp, nchan, 1);
+        printf("=== MAD Histogram Complete ===\n");
+        
+        printf("=== Generating Channel STD Histogram (Iteration %d) ===\n", iterationIndex);
+        visualizeChannelStd(data, nsamp, nchan, 1);
+        printf("=== STD Histogram Complete ===\n");
+    }
+    
+    // === 1. Channel level flagging first ===
+    float *channel_stds = (float *)malloc(nchan * sizeof(float));
+    float *channel_stds_temp = (float *)malloc(nchan * sizeof(float));
+    flagChannelsByStdOutliers(data, nsamp, nchan, horizontalMask, channel_stds, channel_stds_temp);
+    free(channel_stds);
+    free(channel_stds_temp);
+    
+    // Check which channels are fully flagged after channel-level detection
+    int fully_flagged_channels = 0;
+    int *channel_fully_flagged = (int *)calloc(nchan, sizeof(int));
+    for (i = 0; i < nchan; i++) {
+        int flagged_count = 0;
+        for (j = 0; j < nsamp; j++) {
+            if (horizontalMask[i * nsamp + j] == 1) {
+                flagged_count++;
+            }
+        }
+        if (flagged_count == nsamp) {
+            channel_fully_flagged[i] = 1;
+            fully_flagged_channels++;
+        }
+    }
+    printf("Channel-level flagging: %d/%d channels fully flagged (%.2f%%), skipping pixel-level detection for these\n", 
+           fully_flagged_channels, nchan, (float)fully_flagged_channels/nchan*100);
+    
+    // === 2. Channel-internal pixel flagging ===
+    printf("=== Performing channel-level outlier detection ===\n");
+    int channelOutliers = performChannelLevelDetection(data, nsamp, nchan, Nsigma, 
+                                                     horizontalMask, channel_fully_flagged);
+    printf("Channel-level detection: flagged %d outlier pixels\n", channelOutliers);
+    
+    free(good_samples);
+    free(random_indices);
+    free(channel_fully_flagged);
+
+    // === 3. Time-sample level flagging ===
+    float *transposedData = (float *)malloc(nsamp * nchan * sizeof(float));
+    int *transposedMask = (int *)calloc(nsamp * nchan, sizeof(int));
+
+    // Transpose data and mask for time-sample processing
+    transpose(data, nsamp, nchan, transposedData);
+    transpose_int(horizontalMask, nsamp, nchan, transposedMask);
+
+    printf("=== Performing time-sample-level outlier detection ===\n");
+    int timeSampleOutliers = performTimeSampleLevelDetection(transposedData, nsamp, nchan, Nsigma, transposedMask);
+    printf("Time-sample-level detection: flagged %d outlier pixels\n", timeSampleOutliers);
+
+    // Transpose back to original layout
+    transpose(transposedData, nchan, nsamp, data);
+    transpose_int(transposedMask, nchan, nsamp, verticalMask);
+    free(transposedData);
+    free(transposedMask);
+    
+    int horizontalFlagged = 0, verticalFlagged = 0;
+    int idx;
+    for (idx = 0; idx < nsamp * nchan; idx++) {
+        if (horizontalMask[idx] == 1) horizontalFlagged++;
+        if (verticalMask[idx] == 1) verticalFlagged++;
+    }
+    printf("\n=== RFI Detection Statistics ===\n");
+    printf("Horizontal mask flagged: %d/%d pixels (%.4f%%)\n", 
+           horizontalFlagged, nsamp*nchan, (float)horizontalFlagged/(nsamp*nchan)*100);
+    printf("Vertical mask flagged: %d/%d pixels (%.4f%%)\n", 
+           verticalFlagged, nsamp*nchan, (float)verticalFlagged/(nsamp*nchan)*100);
+    
+    logicalOR(horizontalMask, verticalMask, globalMask, nsamp, nchan);
+    
+    int globalFlagged = 0;
+    for (idx = 0; idx < nsamp * nchan; idx++) {
+        if (globalMask[idx] == 1) globalFlagged++;
+    }
+    printf("Global mask flagged after logicalOR: %d/%d pixels (%.4f%%)\n", 
+           globalFlagged, nsamp*nchan, (float)globalFlagged/(nsamp*nchan)*100);
+    printf("=== End RFI Detection Statistics ===\n");
+
+    // Apply binarySIR before killThresh analysis to filter isolated pixels for better range calculation
+    printf("\n=== Applying binarySIR filtering before killThresh analysis ===\n");
+    int flaggedBeforeSIR = globalFlagged;
+    
+    // Use CUDA-accelerated binarySIR if available
+    if (cudaReady) {
+        printf("Using CUDA-accelerated binarySIR filtering for killThresh analysis...\n");
+        cuda_binarySIR(globalMask, nsamp, nchan, 3, 3, 1.0f, 0.2f);
+    } else {
+        binarySIR(globalMask, nsamp, nchan, 3, 3, 1.0f, 0.2f); // Filter out isolated pixels
+    }
+    
+    // Recount flagged pixels after binarySIR
+    int flaggedAfterSIR = 0;
+    for (idx = 0; idx < nsamp * nchan; idx++) {
+        if (globalMask[idx] == 1) flaggedAfterSIR++;
+    }
+    printf("binarySIR filtering: %d -> %d flagged pixels (removed %d isolated pixels)\n", 
+           flaggedBeforeSIR, flaggedAfterSIR, flaggedBeforeSIR - flaggedAfterSIR);
+
+    // === 3. Heavy RFI channel marking (killThresh - flag heavily contaminated channels) ===
+    int killedChannels, localRFISkipped, totalFlaggedAfter;
+    applyKillThresh(globalMask, nsamp, nchan, killThresh, flaggedAfterSIR, 
+                   &killedChannels, &localRFISkipped, &totalFlaggedAfter);
+    
+    // Print killThresh analysis summary
+    printKillThreshSummary(killedChannels, localRFISkipped, flaggedAfterSIR, 
+                          totalFlaggedAfter, nsamp, nchan);
+
+    // Calculate final statistics for experimental function output
+    float finalMedian_temp, finalStd_temp;
+    findMeanStd(median_temp, nsamp * nchan, &finalMedian_temp, &finalStd_temp);
+    float finalMedian_value = median(median_temp, nsamp * nchan);
+
+    float outlierRatio = (float)(channelOutliers + timeSampleOutliers) / (nsamp * nchan);
+    if (outlierRatio > killThresh)
+    {
+        printf("WARNING: High outlier ratio %.4f > %.2f detected - data may be corrupted\n",
+               outlierRatio, killThresh);
+    }
+
+    *finalMedian = finalMedian_value;
+    *finalStd = finalStd_temp;
+
+    free(median_temp);
+
+    printf("### DEBUG: identSubstNSigma_Experiment exiting with finalMedian=%.6f, finalStd=%.6f ###\n", *finalMedian, *finalStd);
+    fflush(stdout);  // Ensure immediate output
+}

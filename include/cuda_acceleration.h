@@ -1,13 +1,3 @@
-/*
- * CUDA Acceleration Header for deRFI
- * 
- * This header declares CUDA-accelerated functions for the RFI detection pipeline.
- * Functions provide GPU acceleration for compute-intensive operations.
- * 
- * Author: GitHub Copilot
- * Date: 2025-08-02
- */
-
 #ifndef CUDA_ACCELERATION_H
 #define CUDA_ACCELERATION_H
 
@@ -86,6 +76,22 @@ void cuda_transpose(const float *input, float *output, int rows, int cols);
 void cuda_downsample2D(const float *input, float *output, 
                       int nsamp, int nchan,
                       int binFactorTime, int binFactorFreq);
+
+/**
+ * CUDA-accelerated binary morphological filtering (binarySIR)
+ * Applies structural indexing reduction with configurable window size and thresholds
+ * 
+ * @param mask Input/output binary mask array (nsamp * nchan elements, 0 or 1)
+ * @param nsamp Number of time samples per channel
+ * @param nchan Number of frequency channels
+ * @param win_samp Window size in time dimension (must be odd)
+ * @param win_chan Window size in frequency dimension (must be odd)
+ * @param thr_up Upper threshold for density ratio (0.0-1.0)
+ * @param thr_down Lower threshold for density ratio (0.0-1.0)
+ */
+void cuda_binarySIR(int *mask, int nsamp, int nchan,
+                   int win_samp, int win_chan, 
+                   float thr_up, float thr_down);
 
 // ============================================================================
 // Utility Macros

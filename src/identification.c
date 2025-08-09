@@ -37,19 +37,19 @@ float gaus_with_amplitude(float x, float amplitude, float mean, float sigma)
 }
 
 /**
- * @brief Residual function for three-parameter Gaussian fitting
- * Parameters: [0]=amplitude, [1]=mean, [2]=sigma
- * Data is passed as void pointer to array of [x_array, y_array, &n]
+ * @brief Residual function for two-parameter Gaussian fitting (fixed amplitude)
+ * Parameters: [0]=mean, [1]=sigma
+ * Data is passed as void pointer to array of [x_array, y_array, &n, &fixed_amplitude]
  */
-int gaussian_residual_f(const gsl_vector *params, void *data, gsl_vector *f) {
+int gaussian_residual_f_fixed_amp(const gsl_vector *params, void *data, gsl_vector *f) {
     void **data_array = (void **)data;
     float *x = (float *)data_array[0];
     float *y = (float *)data_array[1];
-    int n = *(int *)data_array[2];  // Fix: use int instead of size_t
+    int n = *(int *)data_array[2];
+    float fixed_amplitude = *(float *)data_array[3];  // Fixed amplitude from histogram max
     
-    double A = gsl_vector_get(params, 0);      // amplitude
-    double mu = gsl_vector_get(params, 1);     // mean
-    double sigma = gsl_vector_get(params, 2);  // standard deviation
+    double mu = gsl_vector_get(params, 0);     // mean
+    double sigma = gsl_vector_get(params, 1);  // standard deviation
     
     // Prevent negative or zero sigma
     if (sigma <= 0) {
@@ -57,10 +57,10 @@ int gaussian_residual_f(const gsl_vector *params, void *data, gsl_vector *f) {
     }
     
     int i;
-    for (i = 0; i < n; i++) {  // Fix: use int instead of size_t
+    for (i = 0; i < n; i++) {
         double xi = x[i];
         double yi = y[i];
-        double model = A * exp(-(xi - mu) * (xi - mu) / (2.0 * sigma * sigma));
+        double model = fixed_amplitude * exp(-(xi - mu) * (xi - mu) / (2.0 * sigma * sigma));
         // Residual = observed - predicted
         gsl_vector_set(f, i, yi - model);
     }
@@ -69,32 +69,30 @@ int gaussian_residual_f(const gsl_vector *params, void *data, gsl_vector *f) {
 }
 
 /**
- * @brief Three-parameter Gaussian fitting using GSL Levenberg-Marquardt
+ * @brief Two-parameter Gaussian fitting using GSL Levenberg-Marquardt (fixed amplitude)
  * @param x X data points
  * @param y Y data points
  * @param n Number of data points
- * @param fitted_amplitude Output: fitted amplitude
+ * @param fixed_amplitude Fixed amplitude value (e.g., histogram max bin value)
  * @param fitted_mu Output: fitted mean
  * @param fitted_sigma Output: fitted standard deviation
  * @return 1 for success, 0 for failure
  */
-int gsl_gaussian_fit(float *x, float *y, int n,
-    float *fitted_amplitude, float *fitted_mu, float *fitted_sigma)
+int gsl_gaussian_fit(float *x, float *y, int n, float fixed_amplitude,
+    float *fitted_mu, float *fitted_sigma)
 {
-    // Essential check: sufficient data points for 3-parameter fitting
-    if (n < 4) {
-        printf("GSL Gaussian fit: Insufficient data points (%d < 4)\n", n);
+    // Essential check: sufficient data points for 2-parameter fitting
+    if (n < 3) {
+        printf("GSL Gaussian fit (fixed amp): Insufficient data points (%d < 3)\n", n);
         return 0;
     }
     
     // Find initial parameter estimates
-    float max_y = y[0];
     float min_x = x[0], max_x = x[0];
     float sum_x_weighted = 0.0f, sum_y = 0.0f;
     
     int i;
     for (i = 0; i < n; i++) {
-        if (y[i] > max_y) max_y = y[i];
         if (x[i] < min_x) min_x = x[i];
         if (x[i] > max_x) max_x = x[i];
         sum_x_weighted += x[i] * y[i];
@@ -111,12 +109,8 @@ int gsl_gaussian_fit(float *x, float *y, int n,
     }
     float initial_sigma = (sum_y > 0) ? sqrtf(sum_weighted_var / sum_y) : (max_x - min_x) / 6.0f;
     
-    float estimated_bin_width = (max_x - min_x) / (n - 1);
-    float initial_amplitude = max_y * estimated_bin_width * sqrtf(2 * PI) * initial_sigma;
-    
     // Basic safety bounds
     if (initial_sigma <= 0) initial_sigma = (max_x - min_x) / 10.0f;
-    if (initial_amplitude <= 0) initial_amplitude = max_y * 0.1f;
     
     // Set up GSL fitting
     const gsl_multifit_nlinear_type *T = gsl_multifit_nlinear_trust;
@@ -125,32 +119,32 @@ int gsl_gaussian_fit(float *x, float *y, int n,
     gsl_multifit_nlinear_fdf fdf;
     
     // Prepare data as pointer array for function parameters
-    void *data_ptrs[3];
+    void *data_ptrs[4];
     data_ptrs[0] = x;
     data_ptrs[1] = y;
     data_ptrs[2] = &n;
+    data_ptrs[3] = &fixed_amplitude;
     
     // Set up function
-    fdf.f = gaussian_residual_f;
+    fdf.f = gaussian_residual_f_fixed_amp;
     fdf.df = NULL;   // Use numerical differentiation
     fdf.fvv = NULL;  // Use numerical second derivatives
     fdf.n = n;       // number of data points
-    fdf.p = 3;       // number of parameters
+    fdf.p = 2;       // number of parameters (mu, sigma)
     fdf.params = data_ptrs;
     
     // Allocate workspace
-    w = gsl_multifit_nlinear_alloc(T, &fdf_params, n, 3);
+    w = gsl_multifit_nlinear_alloc(T, &fdf_params, n, 2);
     
-    // Initial parameter vector
-    gsl_vector *params_init = gsl_vector_alloc(3);
-    gsl_vector_set(params_init, 0, initial_amplitude);
-    gsl_vector_set(params_init, 1, initial_mu);
-    gsl_vector_set(params_init, 2, initial_sigma);
+    // Initial parameter vector (only mu and sigma)
+    gsl_vector *params_init = gsl_vector_alloc(2);
+    gsl_vector_set(params_init, 0, initial_mu);
+    gsl_vector_set(params_init, 1, initial_sigma);
     
     // Essential check: GSL initialization
     int status = gsl_multifit_nlinear_init(params_init, &fdf, w);
     if (status != GSL_SUCCESS) {
-        printf("GSL Gaussian fit: Initialization failed\n");
+        printf("GSL Gaussian fit (fixed amp): Initialization failed\n");
         gsl_vector_free(params_init);
         gsl_multifit_nlinear_free(w);
         return 0;
@@ -178,12 +172,11 @@ int gsl_gaussian_fit(float *x, float *y, int n,
     // Get final results
     gsl_vector *final_params = gsl_multifit_nlinear_position(w);
     
-    *fitted_amplitude = (float)gsl_vector_get(final_params, 0);
-    *fitted_mu = (float)gsl_vector_get(final_params, 1);
-    *fitted_sigma = (float)gsl_vector_get(final_params, 2);
+    *fitted_mu = (float)gsl_vector_get(final_params, 0);
+    *fitted_sigma = (float)gsl_vector_get(final_params, 1);
     
     // Essential check: validate final results
-    int success = (*fitted_sigma > 0 && *fitted_amplitude > 0) ? 1 : 0;
+    int success = (*fitted_sigma > 0) ? 1 : 0;
     
     // Clean up
     gsl_vector_free(params_init);
@@ -1104,8 +1097,8 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
 
         cpgsci(1); // Restore white color
 
-        // Add Gaussian fitting curve
-        printf("Fitting Gaussian curve to MAD histogram...\n");
+        // Add Gaussian fitting curve with fixed amplitude
+        printf("Fitting Gaussian curve to MAD histogram (fixed amplitude method)...\n");
         
         // Unified Gaussian fitting threshold control
         const float gaussian_fit_sigma_threshold = 5.0f;  // Sigma threshold for Gaussian fitting range
@@ -1140,42 +1133,30 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
             y_data[0] = 0.0f;
         }
         
-        // Use GSL three-parameter Gaussian fitting
-        float fitted_amplitude, fitted_mu, fitted_sigma;
+        // Calculate fixed amplitude from main histogram max bin value
+        float main_hist_amplitude = max_count;
+        printf("Main histogram amplitude (max bin value): %.2f\n", main_hist_amplitude);
         
-        int gsl_success = gsl_gaussian_fit(x_data, y_data, fit_points, &fitted_amplitude, &fitted_mu, &fitted_sigma);
+        // Use GSL two-parameter Gaussian fitting with fixed amplitude
+        float fitted_mu, fitted_sigma;
+        
+        int gsl_success = gsl_gaussian_fit(x_data, y_data, fit_points, main_hist_amplitude, &fitted_mu, &fitted_sigma);
         
         if (gsl_success) {
-            printf("GSL Gaussian fit (%.1fσ range): amplitude=%.2f, center=%.6f, sigma=%.6f\n", 
-                   gaussian_fit_sigma_threshold, fitted_amplitude, fitted_mu, fitted_sigma);
+            printf("GSL 2-param Gaussian fit (fixed amp=%.2f): center=%.6f, sigma=%.6f\n", 
+                   main_hist_amplitude, fitted_mu, fitted_sigma);
         } else {
-            printf("GSL Gaussian fit failed, falling back to simple fit\n");
+            printf("GSL 2-param Gaussian fit failed, falling back to simple fit\n");
             fitted_sigma = simple_curve_fit(x_data, y_data, fit_points, mad_median);
-            fitted_amplitude = 0.0f;  // Will calculate below
             fitted_mu = mad_median;
-            printf("Fallback Gaussian fit (%.1fσ range): center=%.6f, sigma=%.6f\n", gaussian_fit_sigma_threshold, fitted_mu, fitted_sigma);
+            printf("Fallback Gaussian fit: center=%.6f, sigma=%.6f\n", fitted_mu, fitted_sigma);
         }
         
-        // If amplitude is not valid, calculate it as before
-        if (!gsl_success || fitted_amplitude <= 0) {
-            // Calculate appropriate amplitude for the fitted Gaussian
-            // Find the maximum of the fitted data points to scale the Gaussian properly
-            float max_fitted_y = 0.0f;
-            for (i = 0; i < fit_points; i++) {
-                if (y_data[i] > max_fitted_y) max_fitted_y = y_data[i];
-            }
-            
-            // Calculate the theoretical peak value of the normalized Gaussian
-            float gaussian_peak = gaus(fitted_mu, fitted_mu, fitted_sigma);
-            
-            // Scale factor to make the Gaussian curve match the histogram amplitude
-            fitted_amplitude = max_fitted_y / gaussian_peak;
-            
-            printf("Calculated amplitude scaling: max_fitted_y=%.1f, gaussian_peak=%.6f, amplitude=%.1f\n", 
-                   max_fitted_y, gaussian_peak, fitted_amplitude);
-        }
+        // Store fitted parameters for use in zoomed histogram
+        float global_fitted_mu = fitted_mu;
+        float global_fitted_sigma = fitted_sigma;
         
-        // Plot 1: Draw fitted Gaussian curve
+        // Plot 1: Draw fitted Gaussian curve with fixed amplitude
         cpgsci(5); // Cyan color
         cpgsls(2); // Dashed line
         
@@ -1184,7 +1165,7 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
         
         for (i = 0; i < curve_points; i++) {
             float x = plot_min + i * curve_step;
-            float y = gaus_with_amplitude(x, fitted_amplitude, fitted_mu, fitted_sigma);
+            float y = gaus_with_amplitude(x, main_hist_amplitude, global_fitted_mu, global_fitted_sigma);
             
             if (i == 0) {
                 cpgmove(x, y);
@@ -1193,7 +1174,7 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
             }
         }
         
-        cpgptxt(mad_median + fitted_sigma, max_count * 0.4f, 0.0, 0.0, "Gaussian Fit (5σ)");
+        cpgptxt(mad_median + global_fitted_sigma, max_count * 0.4f, 0.0, 0.0, "Gaussian Fit (2-param)");
         cpgsls(1);
 
         free(x_data);
@@ -1275,14 +1256,18 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
                     }
                 }
                 
-                // Plot 2: Draw the same Gaussian curve as in the full histogram (using fitted results from full histogram)
+                // Plot 2: Draw the Gaussian curve with zoomed histogram specific amplitude
+                // Calculate fixed amplitude from zoomed histogram max bin value
+                float zoom_hist_amplitude = zoom_max_count;
+                printf("Zoomed histogram amplitude (max bin value): %.2f\n", zoom_hist_amplitude);
+                
                 cpgsci(5); // Cyan color for fit
                 cpgsls(2); // Dashed line style
                 
                 float zoom_curve_points = 200;
                 for (i = 0; i < zoom_curve_points; i++) {
                     float x = zoom_min + i * (zoom_max - zoom_min) / (zoom_curve_points - 1);
-                    float y = gaus_with_amplitude(x, fitted_amplitude, fitted_mu, fitted_sigma);
+                    float y = gaus_with_amplitude(x, zoom_hist_amplitude, global_fitted_mu, global_fitted_sigma);
                     
                     if (i == 0) {
                         cpgmove(x, y);
@@ -1293,7 +1278,7 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
                 
                 cpgsls(1); // Back to solid line
                 cpgptxt(zoom_min + (zoom_max - zoom_min) * 0.7f, zoom_max_count * 0.85f, 
-                        0.0, 0.0, "Gaussian Fit (5σ)");
+                        0.0, 0.0, "Gaussian Fit (2-param)");
                 
                 cpgsci(1); // Restore white color
                 printf("Zoomed MAD histogram completed! (%d channels in 0-0.25 range)\n", zoom_count);
@@ -1525,8 +1510,8 @@ void visualizeChannelStd(float *data, int nsamp, int nchan, int plot)
 
         cpgsci(1); // Restore white color
 
-        // Add Gaussian fitting curve
-        printf("Fitting Gaussian curve to STD histogram...\n");
+        // Add Gaussian fitting curve with fixed amplitude
+        printf("Fitting Gaussian curve to STD histogram (fixed amplitude method)...\n");
         
         // Unified Gaussian fitting threshold control (same as MAD function)
         const float gaussian_fit_sigma_threshold = 5.0f;  // Sigma threshold for Gaussian fitting range
@@ -1567,41 +1552,29 @@ void visualizeChannelStd(float *data, int nsamp, int nchan, int plot)
             y_data[0] = 0.0f;
         }
         
-        // Use GSL three-parameter Gaussian fitting
-        float fitted_amplitude, fitted_mu;
-        int gsl_success = gsl_gaussian_fit(x_data, y_data, fit_points, &fitted_amplitude, &fitted_mu, &fitted_sigma);
+        // Calculate fixed amplitude from main histogram max bin value
+        float main_hist_amplitude = max_count;
+        printf("Main histogram amplitude (max bin value): %.2f\n", main_hist_amplitude);
+        
+        // Use GSL two-parameter Gaussian fitting with fixed amplitude
+        float fitted_mu;
+        int gsl_success = gsl_gaussian_fit(x_data, y_data, fit_points, main_hist_amplitude, &fitted_mu, &fitted_sigma);
         
         if (gsl_success) {
-            printf("GSL Gaussian fit (%.1fσ range): amplitude=%.2f, center=%.6f, sigma=%.6f\n", 
-                   gaussian_fit_sigma_threshold, fitted_amplitude, fitted_mu, fitted_sigma);
+            printf("GSL 2-param Gaussian fit (fixed amp=%.2f): center=%.6f, sigma=%.6f\n", 
+                   main_hist_amplitude, fitted_mu, fitted_sigma);
         } else {
-            printf("GSL Gaussian fit failed, falling back to simple fit\n");
+            printf("GSL 2-param Gaussian fit failed, falling back to simple fit\n");
             fitted_sigma = simple_curve_fit(x_data, y_data, fit_points, std_median);
-            fitted_amplitude = 0.0f;  // Will calculate below
             fitted_mu = std_median;
-            printf("Fallback Gaussian fit (%.1fσ range): center=%.6f, sigma=%.6f\n", gaussian_fit_sigma_threshold, fitted_mu, fitted_sigma);
+            printf("Fallback Gaussian fit: center=%.6f, sigma=%.6f\n", fitted_mu, fitted_sigma);
         }
         
-        // If amplitude is not valid, calculate it as before
-        if (!gsl_success || fitted_amplitude <= 0) {
-            // Calculate appropriate amplitude for the fitted Gaussian
-            // Find the maximum of the fitted data points to scale the Gaussian properly
-            float max_fitted_y = 0.0f;
-            for (i = 0; i < fit_points; i++) {
-                if (y_data[i] > max_fitted_y) max_fitted_y = y_data[i];
-            }
-            
-            // Calculate the theoretical peak value of the normalized Gaussian
-            float gaussian_peak = gaus(fitted_mu, fitted_mu, fitted_sigma);
-            
-            // Scale factor to make the Gaussian curve match the histogram amplitude
-            fitted_amplitude = max_fitted_y / gaussian_peak;
-            
-            printf("Calculated amplitude scaling: max_fitted_y=%.1f, gaussian_peak=%.6f, amplitude=%.1f\n", 
-                   max_fitted_y, gaussian_peak, fitted_amplitude);
-        }
+        // Store fitted parameters for use in zoomed histogram
+        float global_fitted_mu = fitted_mu;
+        float global_fitted_sigma = fitted_sigma;
         
-        // Draw fitted Gaussian curve
+        // Draw fitted Gaussian curve with fixed amplitude
         cpgsci(5); // Cyan color
         cpgsls(2); // Dashed line
         
@@ -1610,7 +1583,7 @@ void visualizeChannelStd(float *data, int nsamp, int nchan, int plot)
         
         for (i = 0; i < curve_points; i++) {
             float x = plot_min + i * curve_step;
-            float y = gaus_with_amplitude(x, fitted_amplitude, fitted_mu, fitted_sigma);
+            float y = gaus_with_amplitude(x, main_hist_amplitude, global_fitted_mu, global_fitted_sigma);
             
             if (i == 0) {
                 cpgmove(x, y);
@@ -1619,7 +1592,7 @@ void visualizeChannelStd(float *data, int nsamp, int nchan, int plot)
             }
         }
         
-        cpgptxt(fitted_mu + fitted_sigma, max_count * 0.4f, 0.0, 0.0, "Gaussian Fit (5σ)");
+        cpgptxt(global_fitted_mu + global_fitted_sigma, max_count * 0.4f, 0.0, 0.0, "Gaussian Fit (2-param)");
         cpgsls(1);
 
         free(x_data);
@@ -1712,14 +1685,18 @@ void visualizeChannelStd(float *data, int nsamp, int nchan, int plot)
                     }
                 }
                 
-                // Draw the same Gaussian curve as in the full histogram (using fitted results from full histogram)
+                // Draw the Gaussian curve with zoomed histogram specific amplitude
+                // Calculate fixed amplitude from zoomed histogram max bin value
+                float zoom_hist_amplitude = zoom_max_count;
+                printf("Zoomed histogram amplitude (max bin value): %.2f\n", zoom_hist_amplitude);
+                
                 cpgsci(5); // Cyan color for fit
                 cpgsls(2); // Dashed line style
                 
                 float zoom_curve_points = 200;
                 for (i = 0; i < zoom_curve_points; i++) {
                     float x = zoom_min + i * (zoom_max - zoom_min) / (zoom_curve_points - 1);
-                    float y = gaus_with_amplitude(x, fitted_amplitude, fitted_mu, fitted_sigma);
+                    float y = gaus_with_amplitude(x, zoom_hist_amplitude, global_fitted_mu, global_fitted_sigma);
                     
                     if (i == 0) {
                         cpgmove(x, y);
@@ -1730,7 +1707,7 @@ void visualizeChannelStd(float *data, int nsamp, int nchan, int plot)
                 
                 cpgsls(1); // Back to solid line
                 cpgptxt(zoom_min + (zoom_max - zoom_min) * 0.7f, zoom_max_count * 0.85f, 
-                        0.0, 0.0, "Gaussian Fit (5σ)");
+                        0.0, 0.0, "Gaussian Fit (2-param)");
                 
                 cpgsci(1); // Restore white color
                 printf("Zoomed STD histogram completed! (%d channels in 0-0.25 range)\n", zoom_count);
@@ -1903,8 +1880,8 @@ void identSubstNSigma(
                 }
             }
             
-            // substitute_pixels_1d(data + i * nsamp, nsamp, horizontalMask + i * nsamp,
-            //                      good_samples, random_indices);
+            substitute_pixels_1d(data + i * nsamp, nsamp, horizontalMask + i * nsamp,
+                                 good_samples, random_indices);
 
             // if (plot && (i == 0))
                 // calc8bitHist(data + i * nsamp, nsamp);
@@ -1958,8 +1935,8 @@ void identSubstNSigma(
                 }
             }
             
-            // substitute_pixels_1d(transposedData + i * nchan, nchan, transposedMask + i * nchan,
-            //                         good_samples_v, random_indices_v);
+            substitute_pixels_1d(transposedData + i * nchan, nchan, transposedMask + i * nchan,
+                                    good_samples_v, random_indices_v);
 
             // if (plot && (i == 0))
             //     calc8bitHist(transposedData + i * nchan, nchan);

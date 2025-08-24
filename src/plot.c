@@ -179,7 +179,21 @@ void plotDownsampLongTimeAbs(Metadata *m, int numReads, float *dsDataT, float *d
     free(dsFreqProfile);
     free(dsChannelMask);
 }
-void plotDownsampSED(Metadata *m, int numReads, float *dsDataT, float *dsFreqArray, float startTime, int currentBlock, float *baseline)
+
+/**
+ * @brief Advanced time-frequency plot with selectable panel statistics and optional mask overlay
+ * @param m Metadata structure
+ * @param numReads Number of reads  
+ * @param dsDataT Downsampled data array (transposed)
+ * @param dsFreqArray Frequency array
+ * @param startTime Start time
+ * @param currentBlock Current block index
+ * @param baseline Baseline array
+ * @param topPanelMode Mode for top panel: 0=mean, 1=std
+ * @param rightPanelMode Mode for right panel: 0=mean, 1=std
+ * @param mask Optional mask array for RFI flagging (NULL to skip mask plotting)
+ */
+void plotTimeFreqSED(Metadata *m, int numReads, float *dsDataT, float *dsFreqArray, float startTime, int currentBlock, float *baseline, int topPanelMode, int rightPanelMode, int *mask)
 {
     // === Global Layout Configuration ===
     float globalMargin = 0.1;  // Symmetric margin for left/right/top/bottom
@@ -203,267 +217,24 @@ void plotDownsampSED(Metadata *m, int numReads, float *dsDataT, float *dsFreqArr
     float fstep = chan_bwPlot;
     float fmax = dsFreqArray[nchanPlot - 1] - 0.5 * chan_bwPlot;
 
-    // == Allocate memory ===
+    // == Allocate memory for profiles ===
     float *dsDataT_deRFI = malloc(sizeof(float) * m->nsampBinned * m->nchanBinned);
-    float *dsTimeProfile = malloc(sizeof(float) * m->nsampBinned);
-    float *dsFreqProfile = malloc(sizeof(float) * m->nchanBinned);
+    float *dsTimeProfile_mean = malloc(sizeof(float) * m->nsampBinned);
+    float *dsFreqProfile_mean = malloc(sizeof(float) * m->nchanBinned);
+    float *dsTimeProfile_std = malloc(sizeof(float) * m->nsampBinned);
+    float *dsFreqProfile_std = malloc(sizeof(float) * m->nchanBinned);
     int *dsChannelMask = calloc(m->nchanBinned, sizeof(int));
 
-    getProfile(dsDataT, nsampPlot, nchanPlot, dsFreqProfile, dsTimeProfile, 1);
-    // getProfileStd(dsDataT, nsampPlot, nchanPlot, dsFreqProfile, dsTimeProfile, 1);
+    // Calculate both mean and std profiles
+    getProfile(dsDataT, nsampPlot, nchanPlot, dsFreqProfile_mean, dsTimeProfile_mean, 1);
+    getProfileStd(dsDataT, nsampPlot, nchanPlot, dsFreqProfile_std, dsTimeProfile_std, 1);
 
-    int palettType = 3;
-    double contrast = 1.0;
-    double brightness = 0.4;
-    setupPalette(palettType, contrast, brightness);
-
-    // === Main Panel: Time-Frequency Plot ===
-    float plotStartFreq = 1000.0, plotEndFreq = 1500.0;
-    int plotStartChan = ClosestFreqIdx(dsFreqArray, nchanPlot, plotStartFreq);
-    int plotEndChan = ClosestFreqIdx(dsFreqArray, nchanPlot, plotEndFreq);
-    plotStartChan = (plotStartChan < 0) ? 0 : plotStartChan;
-    plotEndChan = (plotEndChan > nchanPlot) ? nchanPlot : plotEndChan;
-
-    cpgsvp(mainPanel_x1, mainPanel_x2, mainPanel_y1, mainPanel_y2);
-    float zmin, zmax, nsig = 5.0;
-    clampPlotRange(dsDataT, nsampPlot * nchanPlot, nsig, &zmin, &zmax);
-
-    float tr[6] = {
-        startTime + currentBlock * nsampPlot * tbinPlot, tstep,
-        0, dsFreqArray[plotStartChan],
-        0, fstep};
-
-    cpgswin(tmin, tmax, fmin + plotStartChan * chan_bwPlot, fmax - (nchanPlot - plotEndChan + 1) * chan_bwPlot);
-    cpgsch(0.7);
-    cpgbox("ABINST", 0, 0, "ABINPST", 0, 0);
-
-    cpgimag(dsDataT + plotStartChan * nsampPlot,  // Data pointer offset
-            nsampPlot,                            // Number of time samples
-            plotEndChan - plotStartChan + 1,      // Number of channels
-            1, nsampPlot,                         // X range
-            1, plotEndChan - plotStartChan + 1,   // Y range
-            zmin, zmax,                           // Z range
-            tr);
-    cpglab("", "Frequency (MHz)", "");
-    cpgmtxt("B", 2.5, 0.5, 0.5, "Time (s)");
-    cpgsch(1.0);
-
-    // === Right Panel: Time-integrated Profile ===
-    cpgsvp(rightPanel_x1, rightPanel_x2, rightPanel_y1, rightPanel_y2);
-    float freqProfileMin, freqProfileMax;
-    findMinMax(dsFreqProfile, nchanPlot, &freqProfileMin, &freqProfileMax);
-    freqProfileMin -= 0.1 * (freqProfileMax - freqProfileMin);
-    freqProfileMax += 0.1 * (freqProfileMax - freqProfileMin);
-    // cpgswin(freqProfileMin, freqProfileMax, fmin, fmax);
-    cpgswin(freqProfileMin, freqProfileMax, fmin + plotStartChan * chan_bwPlot, fmax - (nchanPlot - plotEndChan + 1) * chan_bwPlot);
-    cpgsch(0.7);
-    cpgbox("BCNST", 0, 0, "BCMST", 0, 0);
-    cpgline(plotEndChan - plotStartChan + 1, dsFreqProfile, dsFreqArray + plotStartChan);
-    // cpgline(plotEndChan - plotStartChan + 1, baseline, dsFreqArray + plotStartChan);
-    // cpgline(nchanPlot, dsFreqProfile, dsFreqArray + plotStartChan);
-
-    cpgmtxt("R", 2.1, 0.5, 0.5, "Frequency (MHz)");
-    cpgmtxt("B", 3.0, 0.5, 0.5, "Intensity");
-    cpgmtxt("T", 1.0, 0.5, 0.5, "SED Curve");
-    cpgsch(1.0);
-
-    // === Right Edge: Color Bar ===
-    drawColorBar(zmin, zmax, "Intensity");
-
-    // === Top Panel: Frequency-integrated Profile ===
-    cpgsvp(topPanel_x1, topPanel_x2, topPanel_y1, topPanel_y2);
-    // Calculate time axis
-    float time[nsampPlot];
-    for (int i = 0; i < nsampPlot; i++)
-    {
-        time[i] = startTime + currentBlock * nsampPlot * tbinPlot + i * tstep;
-    }
-    float timeProfileMin, timeProfileMax;
-    findMinMax(dsTimeProfile, nsampPlot, &timeProfileMin, &timeProfileMax);
-    timeProfileMin -= 0.1 * (timeProfileMax - timeProfileMin);
-    timeProfileMax += 0.1 * (timeProfileMax - timeProfileMin);
-    cpgswin(tmin, tmax, timeProfileMin, timeProfileMax);
-    cpgsch(0.7);
-    cpgbox("BCMST", 0, 0, "BCNST", 0, 0);
-    cpgline(nsampPlot, time, dsTimeProfile); // Use downsampled time array
-    cpglab("", "Intensity", "Time (s)");
-    char *title_part1 = malloc(256 * sizeof(char));
-    char *title_part2 = malloc(256 * sizeof(char));
-    sprintf(title_part1, m->filename);
-    sprintf(title_part2, "downsamp %d for time, and %d for freq, tbin = %.4e s, channel width = %.4e MHz",
-            m->binFactorTime, m->binFactorFreq, m->tbinBinned, m->chan_bwBinned);
-    cpgmtxt("T", 4.0, 0.5, 0.5, title_part1);
-    cpgmtxt("T", 3.0, 0.5, 0.5, title_part2);
-    free(title_part1);
-    free(title_part2);
-    cpgsch(1.0);
-
-    // === Clean up ===
-    free(dsDataT_deRFI);
-    free(dsTimeProfile);
-    free(dsFreqProfile);
-    free(dsChannelMask);
-}
-
-void plotDataAndMask(Metadata *m, int numBuffs, float *dsDataT, float *dsFreqArray, float startTime, int currentBlock, int *mask)
-{
-    // === Global Layout Configuration ===
-    float globalMargin = 0.1;  // Symmetric margin for left/right/top/bottom
-    float mainPanelRight = 0.7;  // Main panel right boundary
-    float mainPanelTop = 0.7;    // Main panel top boundary
+    // Select profiles based on panel modes
+    float *dsTimeProfile = (topPanelMode == 0) ? dsTimeProfile_mean : dsTimeProfile_std;
+    float *dsFreqProfile = (rightPanelMode == 0) ? dsFreqProfile_mean : dsFreqProfile_std;
     
-    // === Panel Layout Configuration ===
-    float mainPanel_x1 = globalMargin, mainPanel_x2 = mainPanelRight, mainPanel_y1 = globalMargin, mainPanel_y2 = mainPanelTop;
-    float rightPanel_x1 = mainPanelRight, rightPanel_x2 = 1.0 - globalMargin, rightPanel_y1 = globalMargin, rightPanel_y2 = mainPanelTop;
-    float topPanel_x1 = globalMargin, topPanel_x2 = mainPanelRight, topPanel_y1 = mainPanelTop, topPanel_y2 = 1.0 - globalMargin;
-
-    // int nsampPlot = m->nsampBinned * numBuffs;
-    int nsampPlot = m->nsampBinned; // Use binned samples for plotting
-    int nchanPlot = m->nchanBinned;
-    float tbinPlot = m->tbinBinned;
-    float chan_bwPlot = m->chan_bwBinned;
-
-    float tmin = startTime + currentBlock * nsampPlot * tbinPlot + 0.5 * tbinPlot;
-    float tstep = tbinPlot;
-    float tmax = startTime + currentBlock * nsampPlot * tbinPlot + (nsampPlot - 0.5) * tbinPlot;
-    float fmin = dsFreqArray[0] + 0.5 * chan_bwPlot;
-    float fstep = chan_bwPlot;
-    float fmax = dsFreqArray[nchanPlot - 1] - 0.5 * chan_bwPlot;
-
-    // == Allocate memory ===
-    float *dsDataT_deRFI = malloc(sizeof(float) * nsampPlot * nchanPlot);
-    float *dsTimeProfile = malloc(sizeof(float) * nsampPlot);
-    float *dsFreqProfile = malloc(sizeof(float) * nsampPlot);
-    int *dsChannelMask = calloc(m->nchanBinned, sizeof(int));
-
-    getProfile(dsDataT, nsampPlot, nchanPlot, dsFreqProfile, dsTimeProfile, 1);
-    // getProfileStd(dsDataT, nsampPlot, nchanPlot, dsFreqProfile, dsTimeProfile, 1);
-
-    int palettType = 3;
-    double contrast = 1.0;
-    double brightness = 0.4;
-    setupPalette(palettType, contrast, brightness);
-
-    // === Main Panel: Time-Frequency Plot ===
-    float plotStartFreq = 1000.0, plotEndFreq = 1500.0;
-    int plotStartChan = ClosestFreqIdx(dsFreqArray, nchanPlot, plotStartFreq);
-    int plotEndChan = ClosestFreqIdx(dsFreqArray, nchanPlot, plotEndFreq);
-    plotStartChan = (plotStartChan < 0) ? 0 : plotStartChan;
-    plotEndChan = (plotEndChan > nchanPlot) ? nchanPlot : plotEndChan;
-
-    cpgsvp(mainPanel_x1, mainPanel_x2, mainPanel_y1, mainPanel_y2);
-    float zmin, zmax, nsig = 5.0;
-    clampPlotRange(dsDataT, nsampPlot * nchanPlot, nsig, &zmin, &zmax);
-
-    float tr[6] = {
-        startTime + currentBlock * nsampPlot * tbinPlot, tstep,
-        0, dsFreqArray[plotStartChan],
-        0, fstep};
-
-    cpgswin(tmin, tmax, fmin + plotStartChan * chan_bwPlot, fmax - (nchanPlot - plotEndChan + 1) * chan_bwPlot);
-
-    cpgsch(0.7);
-    cpgbox("ABINST", 0, 0, "ABINPST", 0, 0);
-
-    cpgimag(dsDataT + plotStartChan * nsampPlot,
-            nsampPlot,
-            plotEndChan - plotStartChan + 1,
-            1, nsampPlot,
-            1, plotEndChan - plotStartChan + 1,
-            zmin, zmax,
-            tr);
-
-    plotIndexMask(fmin, nchanPlot, chan_bwPlot, tmin, nsampPlot, tbinPlot, mask, plotStartChan, plotEndChan);
-
-    cpglab("", "Frequency (MHz)", "");
-    cpgmtxt("B", 2.5, 0.5, 0.5, "Time (s)");
-    cpgsch(1.0);
-
-    // === Right Panel: Time-integrated Profile ===
-    cpgsvp(rightPanel_x1, rightPanel_x2, rightPanel_y1, rightPanel_y2);
-    float freqProfileMin, freqProfileMax;
-    findMinMax(dsFreqProfile, nchanPlot, &freqProfileMin, &freqProfileMax);
-    freqProfileMin -= 0.1 * (freqProfileMax - freqProfileMin);
-    freqProfileMax += 0.1 * (freqProfileMax - freqProfileMin);
-    cpgswin(freqProfileMin, freqProfileMax, fmin + plotStartChan * chan_bwPlot, fmax - (nchanPlot - plotEndChan + 1) * chan_bwPlot);
-    cpgsch(0.7);
-    cpgbox("BCNST", 0, 0, "BCMST", 0, 0);
-    cpgline(plotEndChan - plotStartChan + 1, dsFreqProfile, dsFreqArray + plotStartChan);
-
-    cpgmtxt("R", 2.1, 0.5, 0.5, "Frequency (MHz)");
-    cpgmtxt("B", 3.0, 0.5, 0.5, "Intensity");
-    cpgmtxt("T", 1.0, 0.5, 0.5, "SED Curve");
-    cpgsch(1.0);
-
-    // === Right Edge: Color Bar ===
-    drawColorBar(zmin, zmax, "Intensity");
-
-    // === Top Panel: Frequency-integrated Profile ===
-    cpgsvp(topPanel_x1, topPanel_x2, topPanel_y1, topPanel_y2);
-    // Calculate time axis
-    float time[nsampPlot];
-    for (int i = 0; i < nsampPlot; i++)
-    {
-        time[i] = startTime + currentBlock * nsampPlot * tbinPlot + i * tstep;
-    }
-    float timeProfileMin, timeProfileMax;
-    findMinMax(dsTimeProfile, nsampPlot, &timeProfileMin, &timeProfileMax);
-    timeProfileMin -= 0.1 * (timeProfileMax - timeProfileMin);
-    timeProfileMax += 0.1 * (timeProfileMax - timeProfileMin);
-    cpgswin(tmin, tmax, timeProfileMin, timeProfileMax);
-    cpgsch(0.7);
-    cpgbox("BCMST", 0, 0, "BCNST", 0, 0);
-    cpgline(nsampPlot, time, dsTimeProfile);
-    cpglab("", "Intensity", "Time (s)");
-    char *title_part1 = malloc(256 * sizeof(char));
-    char *title_part2 = malloc(256 * sizeof(char));
-    sprintf(title_part1, m->filename);
-    sprintf(title_part2, "downsamp %d for time, and %d for freq, tbin = %.4e s, channel width = %.4e MHz",
-            m->binFactorTime, m->binFactorFreq, tbinPlot, chan_bwPlot);
-    cpgmtxt("T", 4.0, 0.5, 0.5, title_part1);
-    cpgmtxt("T", 3.0, 0.5, 0.5, title_part2);
-    free(title_part1);
-    free(title_part2);
-    cpgsch(1.0);
-
-    // === Clean up ===
-    free(dsDataT_deRFI);
-    free(dsTimeProfile);
-    free(dsFreqProfile);
-    free(dsChannelMask);
-}
-
-void plotDownsampSEDStd(Metadata *m, int numReads, float *dsDataT, float *dsFreqArray, float startTime, int currentBlock, float *baseline)
-{
-    // === Global Layout Configuration ===
-    float globalMargin = 0.1;  // Symmetric margin for left/right/top/bottom
-    float mainPanelRight = 0.7;  // Main panel right boundary
-    float mainPanelTop = 0.7;    // Main panel top boundary
-    
-    // === Panel Layout Configuration ===
-    float mainPanel_x1 = globalMargin, mainPanel_x2 = mainPanelRight, mainPanel_y1 = globalMargin, mainPanel_y2 = mainPanelTop;
-    float rightPanel_x1 = mainPanelRight, rightPanel_x2 = 1.0 - globalMargin, rightPanel_y1 = globalMargin, rightPanel_y2 = mainPanelTop;
-    float topPanel_x1 = globalMargin, topPanel_x2 = mainPanelRight, topPanel_y1 = mainPanelTop, topPanel_y2 = 1.0 - globalMargin;
-
-    int nsampPlot = m->nsampBinned; // Use binned samples for plotting
-    int nchanPlot = m->nchanBinned;
-    float tbinPlot = m->tbinBinned;
-    float chan_bwPlot = m->chan_bwBinned;
-
-    float tmin = startTime + currentBlock * nsampPlot * tbinPlot + 0.5 * tbinPlot;
-    float tstep = tbinPlot;
-    float tmax = startTime + currentBlock * nsampPlot * tbinPlot + (nsampPlot - 0.5) * tbinPlot;
-    float fmin = dsFreqArray[0] + 0.5 * chan_bwPlot;
-    float fstep = chan_bwPlot;
-    float fmax = dsFreqArray[nchanPlot - 1] - 0.5 * chan_bwPlot;
-
-    // == Allocate memory ===
-    float *dsDataT_deRFI = malloc(sizeof(float) * m->nsampBinned * m->nchanBinned);
-    float *dsTimeProfile = malloc(sizeof(float) * m->nsampBinned);
-    float *dsFreqProfile = malloc(sizeof(float) * m->nchanBinned);
-    int *dsChannelMask = calloc(m->nchanBinned, sizeof(int));
-
-    getProfileStd(dsDataT, nsampPlot, nchanPlot, dsFreqProfile, dsTimeProfile, 1);
+    const char *topPanelLabel = (topPanelMode == 0) ? "Time Mean \\gm\\di" : "Time StdDev. \\gs\\di";
+    const char *rightPanelLabel = (rightPanelMode == 0) ? "Channel Mean \\gm\\dj" : "Channel StdDev. \\gs\\dj";
 
     int palettType = 3;
     double contrast = 1.0;
@@ -497,6 +268,12 @@ void plotDownsampSEDStd(Metadata *m, int numReads, float *dsDataT, float *dsFreq
             1, plotEndChan - plotStartChan + 1,   // Y range
             zmin, zmax, // Z range
             tr);
+
+    // === Optional Mask Overlay ===
+    if (mask != NULL) {
+        plotIndexMask(fmin, nchanPlot, chan_bwPlot, tmin, nsampPlot, tbinPlot, mask, plotStartChan, plotEndChan);
+    }
+
     cpglab("", "Frequency (MHz)", "");
     cpgmtxt("B", 2.5, 0.5, 0.5, "Time (s)");
     cpgsch(1.0);
@@ -510,11 +287,11 @@ void plotDownsampSEDStd(Metadata *m, int numReads, float *dsDataT, float *dsFreq
     cpgswin(freqProfileMin, freqProfileMax, fmin + plotStartChan * chan_bwPlot, fmax - (nchanPlot - plotEndChan + 1) * chan_bwPlot);
     cpgsch(0.7);
     cpgbox("BCNST", 0, 0, "BCMST", 0, 0);
-    cpgline(plotEndChan - plotStartChan + 1, dsFreqProfile, dsFreqArray + plotStartChan);
+    cpgline(plotEndChan - plotStartChan + 1, dsFreqProfile + plotStartChan, dsFreqArray + plotStartChan);
 
     cpgmtxt("R", 2.1, 0.5, 0.5, "Frequency (MHz)");
     cpgmtxt("B", 3.0, 0.5, 0.5, "Value");
-    cpgmtxt("T", 1.0, 0.5, 0.5, "Channel StdDev.");
+    cpgmtxt("T", 1.0, 0.5, 0.5, rightPanelLabel);
     cpgsch(1.0);
 
     // === Right Edge: Color Bar ===
@@ -536,138 +313,15 @@ void plotDownsampSEDStd(Metadata *m, int numReads, float *dsDataT, float *dsFreq
     cpgsch(0.7);
     cpgbox("BCMST", 0, 0, "BCNST", 0, 0);
     cpgline(nsampPlot, time, dsTimeProfile); // Use downsampled time array
-    cpglab("", "Time StdDev.", "Time (s)");
+    cpglab("", topPanelLabel, "Time (s)");
+    
+    // Simplified title without panel mode details
     char *title_part1 = malloc(256 * sizeof(char));
     char *title_part2 = malloc(256 * sizeof(char));
     sprintf(title_part1, m->filename);
     sprintf(title_part2, "downsamp %d for time, and %d for freq, tbin = %.4e s, channel width = %.4e MHz",
             m->binFactorTime, m->binFactorFreq, m->tbinBinned, m->chan_bwBinned);
-    cpgmtxt("T", 4.0, 0.5, 0.5, title_part1);
-    cpgmtxt("T", 3.0, 0.5, 0.5, title_part2);
-    free(title_part1);
-    free(title_part2);
-    cpgsch(1.0);
-
-    // === Clean up ===
-    free(dsDataT_deRFI);
-    free(dsTimeProfile);
-    free(dsFreqProfile);
-    free(dsChannelMask);
-}
-
-void plotDataAndMaskStd(Metadata *m, int numBuffs, float *dsDataT, float *dsFreqArray, float startTime, int currentBlock, int *mask)
-{
-    // === Global Layout Configuration ===
-    float globalMargin = 0.1;  // Symmetric margin for left/right/top/bottom
-    float mainPanelRight = 0.7;  // Main panel right boundary
-    float mainPanelTop = 0.7;    // Main panel top boundary
     
-    // === Panel Layout Configuration ===
-    float mainPanel_x1 = globalMargin, mainPanel_x2 = mainPanelRight, mainPanel_y1 = globalMargin, mainPanel_y2 = mainPanelTop;
-    float rightPanel_x1 = mainPanelRight, rightPanel_x2 = 1.0 - globalMargin, rightPanel_y1 = globalMargin, rightPanel_y2 = mainPanelTop;
-    float topPanel_x1 = globalMargin, topPanel_x2 = mainPanelRight, topPanel_y1 = mainPanelTop, topPanel_y2 = 1.0 - globalMargin;
-
-    int nsampPlot = m->nsampBinned; // Use binned samples for plotting
-    int nchanPlot = m->nchanBinned;
-    float tbinPlot = m->tbinBinned;
-    float chan_bwPlot = m->chan_bwBinned;
-
-    float tmin = startTime + currentBlock * nsampPlot * tbinPlot + 0.5 * tbinPlot;
-    float tstep = tbinPlot;
-    float tmax = startTime + currentBlock * nsampPlot * tbinPlot + (nsampPlot - 0.5) * tbinPlot;
-    float fmin = dsFreqArray[0] + 0.5 * chan_bwPlot;
-    float fstep = chan_bwPlot;
-    float fmax = dsFreqArray[nchanPlot - 1] - 0.5 * chan_bwPlot;
-
-    // == Allocate memory ===
-    float *dsDataT_deRFI = malloc(sizeof(float) * nsampPlot * nchanPlot);
-    float *dsTimeProfile = malloc(sizeof(float) * nsampPlot);
-    float *dsFreqProfile = malloc(sizeof(float) * nsampPlot);
-    int *dsChannelMask = calloc(m->nchanBinned, sizeof(int));
-
-    getProfileStd(dsDataT, nsampPlot, nchanPlot, dsFreqProfile, dsTimeProfile, 1);
-
-    int palettType = 3;
-    double contrast = 1.0;
-    double brightness = 0.4;
-    setupPalette(palettType, contrast, brightness);
-
-    // === Main Panel: Time-Frequency Plot ===
-    float plotStartFreq = 1000.0, plotEndFreq = 1500.0;
-    int plotStartChan = ClosestFreqIdx(dsFreqArray, nchanPlot, plotStartFreq);
-    int plotEndChan = ClosestFreqIdx(dsFreqArray, nchanPlot, plotEndFreq);
-    plotStartChan = (plotStartChan < 0) ? 0 : plotStartChan;
-    plotEndChan = (plotEndChan > nchanPlot) ? nchanPlot : plotEndChan;
-
-    cpgsvp(mainPanel_x1, mainPanel_x2, mainPanel_y1, mainPanel_y2);
-    float zmin, zmax, nsig = 5.0;
-    clampPlotRange(dsDataT, nsampPlot * nchanPlot, nsig, &zmin, &zmax);
-
-    float tr[6] = {
-        startTime + currentBlock * nsampPlot * tbinPlot, tstep,
-        0, dsFreqArray[plotStartChan],
-        0, fstep};
-
-    cpgswin(tmin, tmax, fmin + plotStartChan * chan_bwPlot, fmax - (nchanPlot - plotEndChan + 1) * chan_bwPlot);
-
-    cpgsch(0.7);
-    cpgbox("ABINST", 0, 0, "ABINPST", 0, 0);
-
-    cpgimag(dsDataT + plotStartChan * nsampPlot,
-            nsampPlot,
-            plotEndChan - plotStartChan + 1,
-            1, nsampPlot,
-            1, plotEndChan - plotStartChan + 1,
-            zmin, zmax,
-            tr);
-
-    plotIndexMask(fmin, nchanPlot, chan_bwPlot, tmin, nsampPlot, tbinPlot, mask, plotStartChan, plotEndChan);
-
-    cpglab("", "Frequency (MHz)", "");
-    cpgmtxt("B", 2.5, 0.5, 0.5, "Time (s)");
-    cpgsch(1.0);
-
-    // === Right Panel: Time-integrated Profile ===
-    cpgsvp(rightPanel_x1, rightPanel_x2, rightPanel_y1, rightPanel_y2);
-    float freqProfileMin, freqProfileMax;
-    findMinMax(dsFreqProfile, nchanPlot, &freqProfileMin, &freqProfileMax);
-    freqProfileMin -= 0.1 * (freqProfileMax - freqProfileMin);
-    freqProfileMax += 0.1 * (freqProfileMax - freqProfileMin);
-    cpgswin(freqProfileMin, freqProfileMax, fmin + plotStartChan * chan_bwPlot, fmax - (nchanPlot - plotEndChan + 1) * chan_bwPlot);
-    cpgsch(0.7);
-    cpgbox("BCNST", 0, 0, "BCMST", 0, 0);
-    cpgline(plotEndChan - plotStartChan + 1, dsFreqProfile, dsFreqArray + plotStartChan);
-
-    cpgmtxt("R", 2.1, 0.5, 0.5, "Frequency (MHz)");
-    cpgmtxt("B", 3.0, 0.5, 0.5, "Value");
-    cpgmtxt("T", 1.0, 0.5, 0.5, "Channel StdDev.");
-    cpgsch(1.0);
-
-    // === Right Edge: Color Bar ===
-    drawColorBar(zmin, zmax, "Intensity");
-
-    // === Top Panel: Frequency-integrated Profile ===
-    cpgsvp(topPanel_x1, topPanel_x2, topPanel_y1, topPanel_y2);
-    // Calculate time axis
-    float time[nsampPlot];
-    for (int i = 0; i < nsampPlot; i++)
-    {
-        time[i] = startTime + currentBlock * nsampPlot * tbinPlot + i * tstep;
-    }
-    float timeProfileMin, timeProfileMax;
-    findMinMax(dsTimeProfile, nsampPlot, &timeProfileMin, &timeProfileMax);
-    timeProfileMin -= 0.1 * (timeProfileMax - timeProfileMin);
-    timeProfileMax += 0.1 * (timeProfileMax - timeProfileMin);
-    cpgswin(tmin, tmax, timeProfileMin, timeProfileMax);
-    cpgsch(0.7);
-    cpgbox("BCMST", 0, 0, "BCNST", 0, 0);
-    cpgline(nsampPlot, time, dsTimeProfile);
-    cpglab("", "Time StdDev.", "Time (s)");
-    char *title_part1 = malloc(256 * sizeof(char));
-    char *title_part2 = malloc(256 * sizeof(char));
-    sprintf(title_part1, m->filename);
-    sprintf(title_part2, "downsamp %d for time, and %d for freq, tbin = %.4e s, channel width = %.4e MHz",
-            m->binFactorTime, m->binFactorFreq, tbinPlot, chan_bwPlot);
     cpgmtxt("T", 4.0, 0.5, 0.5, title_part1);
     cpgmtxt("T", 3.0, 0.5, 0.5, title_part2);
     free(title_part1);
@@ -676,8 +330,10 @@ void plotDataAndMaskStd(Metadata *m, int numBuffs, float *dsDataT, float *dsFreq
 
     // === Clean up ===
     free(dsDataT_deRFI);
-    free(dsTimeProfile);
-    free(dsFreqProfile);
+    free(dsTimeProfile_mean);
+    free(dsFreqProfile_mean);
+    free(dsTimeProfile_std);
+    free(dsFreqProfile_std);
     free(dsChannelMask);
 }
 

@@ -921,7 +921,7 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
     }
     
     // Print statistics
-    printf("=== Channel MAD Statistics ===\n");
+    printf("=== Channel MAD M_j Statistics ===\n");
     printf("Total channels: %d\n", nchan);
     printf("MAD Mean: %.6f\n", mad_mean);
     printf("MAD Std:  %.6f\n", mad_std);
@@ -1073,7 +1073,7 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
         cpgsch(1.2);                       // Set character size
         cpgswin(plot_min, plot_max, 0, max_count * 1.1f);  // Set world coordinates
         cpgbox("BCNST", 0.0, 0, "BCNST", 0.0, 0);          // Draw coordinate axes
-        cpglab("Channel MAD", "Number of Channels", "Channel MAD Distribution");  // Add labels
+        cpglab("Channel MAD M\\dj\\u", "Number of Channels", "Channel MAD M\\dj\\u Distribution");  // Add labels
         printf("MAD histogram axes set up complete\n");
 
         // Plot 1: Draw histogram bars
@@ -1174,7 +1174,7 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
             }
         }
         
-        cpgptxt(mad_median + global_fitted_sigma, max_count * 0.4f, 0.0, 0.0, "Gaussian Fit (2-param)");
+        cpgptxt(mad_median + global_fitted_sigma, max_count * 0.4f, 0.0, 0.0, "Gaussian Fit");
         cpgsls(1);
 
         free(x_data);
@@ -1234,7 +1234,7 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
                 // Plot 2: Set coordinate system and labels
                 cpgswin(zoom_min, zoom_max, 0, zoom_max_count * 1.1f);     // Set world coordinates
                 cpgbox("BCNST", 0.0, 0, "BCNST", 0.0, 0);                  // Draw coordinate axes
-                cpglab("Channel MAD", "Number of Channels", "Channel MAD Distribution (Zoomed: 0-0.25)");  // Add labels
+                cpglab("Channel MAD M\\dj\\u", "Number of Channels", "Channel MAD M\\dj\\u Distribution (Zoomed: 0-0.25)");  // Add labels
                 
                 // Plot 2: Draw zoomed histogram bars
                 cpgsci(2); // Red color
@@ -1278,7 +1278,7 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
                 
                 cpgsls(1); // Back to solid line
                 cpgptxt(zoom_min + (zoom_max - zoom_min) * 0.7f, zoom_max_count * 0.85f, 
-                        0.0, 0.0, "Gaussian Fit (2-param)");
+                        0.0, 0.0, "Gaussian Fit");
                 
                 cpgsci(1); // Restore white color
                 printf("Zoomed MAD histogram completed! (%d channels in 0-0.25 range)\n", zoom_count);
@@ -1366,7 +1366,7 @@ void visualizeChannelStd(float *data, int nsamp, int nchan, int plot)
     }
     float std_std = median(temp_data, nchan);
     
-    printf("\n=== Channel STD Statistics ===\n");
+    printf("\n=== Channel STD σ_j Statistics ===\n");
     printf("Total channels: %d\n", nchan);
     printf("STD Median: %.6f\n", std_median);
     printf("STD STD: %.6f\n", std_std);
@@ -1446,7 +1446,7 @@ void visualizeChannelStd(float *data, int nsamp, int nchan, int plot)
         cpgsch(1.2);
         cpgswin(plot_min, plot_max, 0, max_count * 1.1f);
         cpgbox("BCNST", 0.0, 0, "BCNST", 0.0, 0);
-        cpglab("Channel STD", "Number of Channels", "Channel STD Distribution");
+        cpglab("Channel STD \\gs\\dj\\u", "Number of Channels", "Channel STD \\gs\\dj\\u Distribution");
         printf("STD histogram axes set up complete\n");
 
         // Draw solid histogram bars
@@ -1561,10 +1561,10 @@ void visualizeChannelStd(float *data, int nsamp, int nchan, int plot)
         int gsl_success = gsl_gaussian_fit(x_data, y_data, fit_points, main_hist_amplitude, &fitted_mu, &fitted_sigma);
         
         if (gsl_success) {
-            printf("GSL 2-param Gaussian fit (fixed amp=%.2f): center=%.6f, sigma=%.6f\n", 
+            printf("Gaussian fit (fixed amp=%.2f): center=%.6f, sigma=%.6f\n", 
                    main_hist_amplitude, fitted_mu, fitted_sigma);
         } else {
-            printf("GSL 2-param Gaussian fit failed, falling back to simple fit\n");
+            printf("Gaussian fit failed, falling back to simple fit\n");
             fitted_sigma = simple_curve_fit(x_data, y_data, fit_points, std_median);
             fitted_mu = std_median;
             printf("Fallback Gaussian fit: center=%.6f, sigma=%.6f\n", fitted_mu, fitted_sigma);
@@ -1592,7 +1592,7 @@ void visualizeChannelStd(float *data, int nsamp, int nchan, int plot)
             }
         }
         
-        cpgptxt(global_fitted_mu + global_fitted_sigma, max_count * 0.4f, 0.0, 0.0, "Gaussian Fit (2-param)");
+        cpgptxt(global_fitted_mu + global_fitted_sigma, max_count * 0.4f, 0.0, 0.0, "Gaussian Fit");
         cpgsls(1);
 
         free(x_data);
@@ -1649,7 +1649,7 @@ void visualizeChannelStd(float *data, int nsamp, int nchan, int plot)
                 // Set up coordinate system
                 cpgswin(zoom_min, zoom_max, 0, zoom_max_count * 1.1f);
                 cpgbox("BCNST", 0.0, 0, "BCNST", 0.0, 0);
-                cpglab("Channel STD", "Number of Channels", "Channel STD Distribution (Zoomed: 0-0.25)");
+                cpglab("Channel STD \\gs\\dj\\u", "Number of Channels", "Channel STD \\gs\\dj\\u Distribution (Zoomed: 0-0.25)");
                 
                 // Draw zoomed histogram bars
                 cpgsci(2); // Red color
@@ -1707,7 +1707,7 @@ void visualizeChannelStd(float *data, int nsamp, int nchan, int plot)
                 
                 cpgsls(1); // Back to solid line
                 cpgptxt(zoom_min + (zoom_max - zoom_min) * 0.7f, zoom_max_count * 0.85f, 
-                        0.0, 0.0, "Gaussian Fit (2-param)");
+                        0.0, 0.0, "Gaussian Fit");
                 
                 cpgsci(1); // Restore white color
                 printf("Zoomed STD histogram completed! (%d channels in 0-0.25 range)\n", zoom_count);
@@ -1810,13 +1810,13 @@ void identSubstNSigma(
     // Use iterationIndex as a proxy for iteration counter (passed from ReadFASTData.c)
     if (plot)
     {
-        printf("=== Generating Channel MAD Histogram (Iteration %d) ===\n", iterationIndex);
+        printf("=== Generating Channel MAD M_j Histogram (Iteration %d) ===\n", iterationIndex);
         visualizeChannelMAD(data, nsamp, nchan, 1);
-        printf("=== MAD Histogram Complete ===\n");
+        printf("=== MAD M_j Histogram Complete ===\n");
         
-        printf("=== Generating Channel STD Histogram (Iteration %d) ===\n", iterationIndex);
+        printf("=== Generating Channel STD σ_j Histogram (Iteration %d) ===\n", iterationIndex);
         visualizeChannelStd(data, nsamp, nchan, 1);
-        printf("=== STD Histogram Complete ===\n");
+        printf("=== STD σ_j Histogram Complete ===\n");
     }
     
     // === 1. Channel level flagging first ===
@@ -2480,13 +2480,13 @@ void identSubstNSigma_Experiment(
     // Use iterationIndex as a proxy for iteration counter (passed from ReadFASTData.c)
     if (plot)
     {
-        printf("=== Generating Channel MAD Histogram (Iteration %d) ===\n", iterationIndex);
+        printf("=== Generating Channel MAD M_j Histogram (Iteration %d) ===\n", iterationIndex);
         visualizeChannelMAD(data, nsamp, nchan, 1);
-        printf("=== MAD Histogram Complete ===\n");
+        printf("=== MAD M_j Histogram Complete ===\n");
         
-        printf("=== Generating Channel STD Histogram (Iteration %d) ===\n", iterationIndex);
+        printf("=== Generating Channel STD σ_j Histogram (Iteration %d) ===\n", iterationIndex);
         visualizeChannelStd(data, nsamp, nchan, 1);
-        printf("=== STD Histogram Complete ===\n");
+        printf("=== STD σ_j Histogram Complete ===\n");
     }
     
     // === 1. Channel level flagging first ===

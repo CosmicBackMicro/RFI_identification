@@ -785,9 +785,7 @@ int main(int argc, char *argv[])
             { 
                 cpgpage(); // Create new graphics page
                 cpgmtxt("T", 3.0, 0.35, 0.5, "Raw Data");
-                // Plot original data dynamic spectrum using downsampled frequency array
-                // Display frequency-time 2D data distribution for observing radio signal intensity
-                plotDownsampSEDStd(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL);
+                plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, NULL);
             }
 
 
@@ -813,10 +811,7 @@ int main(int argc, char *argv[])
             { // Plot result after NSigma substitution
                 // Create new graphics page to show NSigma substitution results
                 cpgpage();
-                // plotDataAndMask(&m, blocksPerRead, outDataT, freqArray, startTime, numiter, globalMask);
-                // Plot data and RFI mask overlay showing NSigma algorithm detection effect
-                // Normal data shown in color map, flagged RFI regions highlighted in special colors
-                plotDataAndMaskStd(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, globalMask);
+                plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, globalMask);
             }
 
             if (m.plot)
@@ -829,7 +824,8 @@ int main(int argc, char *argv[])
                 // plotDownsampSED(&m, blocksPerRead, outDataT, freqArray, startTime, numiter, NULL);
                 // Plot dynamic spectrum after mean-std normalization processing
                 // Show data distribution state after standardization for subsequent RFI detection
-                plotDownsampSEDStd(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL);
+                // 替换为新的plotTimeFreqSED函数: 顶部和右侧都显示标准差，无掩码
+                plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, NULL);
             }
 
             float timesOfSigma = 8.0f;
@@ -862,15 +858,11 @@ int main(int argc, char *argv[])
 
             if (m.plot)
             { // Plot result of RFI detection, before pixel substitution
-                // Create new graphics page to show RFI detection results (before pixel substitution)
                 cpgpage();
                 char text3[100];
                 snprintf(text3, sizeof(text3), "Result of RFI detection with chi=%.2f", timesOfSigma);
                 cpgmtxt("T", 3.5, 0.5, 0.5, text3);
-                // plotDataAndMask(&m, blocksPerRead, outDataT, freqArray, startTime, numiter, mask_ST);
-                // Plot data and mask overlay after SumThreshold detection algorithm
-                // Show flagged RFI pixel locations for evaluating detection algorithm performance
-                plotDataAndMaskStd(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, mask_ST);
+                plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, mask_ST);
             }
 
             if (m.doSumThreshold)
@@ -886,7 +878,8 @@ int main(int argc, char *argv[])
                 // plotDownsampSED(&m, blocksPerRead, outDataT, freqArray, startTime, numiter, NULL);
                 // Plot final dynamic spectrum after RFI pixel substitution processing
                 // Show clean radio data after RFI removal for subsequent astrophysical analysis
-                plotDownsampSEDStd(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL);
+                // 替换为新的plotTimeFreqSED函数: 顶部和右侧都显示标准差，无掩码
+                plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, NULL);
             }
         }
 

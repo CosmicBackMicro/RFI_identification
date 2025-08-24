@@ -9,26 +9,7 @@ void plotDownsampLongTimeAbs(
     float startTime, 
     int currentBlock);
 
-void plotDownsampSED(
-    Metadata *m, 
-    int numReads, 
-    float *dsDataT, 
-    float *dsFreqArray, 
-    float startTime, 
-    int currentBlock, 
-    float *baseline);
-
-void plotDownsampSEDStd(Metadata *m, int numReads, float *dsDataT, float *dsFreqArray, float startTime, int currentBlock, float *baseline);
-void plotDataAndMaskStd(Metadata *m, int numBuffs, float *dsDataT, float *dsFreqArray, float startTime, int currentBlock, int *mask);
-
-void plotDataAndMask(
-    Metadata *m, 
-    int numBuffs, 
-    float *dsDataT, 
-    float *dsFreqArray, 
-    float startTime, 
-    int currentBlock, 
-    int *mask);
+void plotTimeFreqSED(Metadata *m, int numReads, float *dsDataT, float *dsFreqArray, float startTime, int currentBlock, float *baseline, int topPanelMode, int rightPanelMode, int *mask);
 
 void plotIndexMask(
     float fmin, 

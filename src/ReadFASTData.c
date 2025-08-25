@@ -786,11 +786,12 @@ int main(int argc, char *argv[])
                 cpgpage(); // Create new graphics page
                 cpgmtxt("T", 3.0, 0.35, 0.5, "Raw Data");
                 plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, NULL);
+                cpgpage();
             }
 
 
 
-            float NSigma = 10.0f;
+            float NSigma = 2.0f;
             if (m.doSubstitution)
             {
                 identSubstNSigma_Experiment(outDataT, nsampBinned, nchanBinned, NSigma, ii, m.plot,

@@ -1157,8 +1157,8 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
         float global_fitted_sigma = fitted_sigma;
         
         // Plot 1: Draw fitted Gaussian curve with fixed amplitude
-        cpgsci(5); // Cyan color
-        cpgsls(2); // Dashed line
+        cpgsci(1); // Cyan color
+        cpgsls(1); // Dashed line
         
         int curve_points = 200;
         float curve_step = (plot_max - plot_min) / curve_points;
@@ -1174,7 +1174,25 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
             }
         }
         
-        cpgptxt(mad_median + global_fitted_sigma, max_count * 0.4f, 0.0, 0.0, "Gaussian Fit");
+        // Add detailed Gaussian fit parameters as text annotations in main histogram
+        cpgsci(1); // White color for text
+        
+        // Create formatted strings for the fit parameters
+        char fit_text1[100], fit_text2[100], fit_text3[100];
+        sprintf(fit_text1, "Gaussian Fit Parameters:");
+        sprintf(fit_text2, "\\gm = %.6f", global_fitted_mu);
+        sprintf(fit_text3, "\\gs = %.6f", global_fitted_sigma);
+        
+        // Position the text in the upper right area of the main histogram
+        float main_text_x = plot_min + (plot_max - plot_min) * 0.65f;
+        float main_text_y_base = max_count * 0.85f;
+        float main_line_spacing = max_count * 0.05f;
+        
+        // Draw the text annotations
+        cpgptxt(main_text_x, main_text_y_base, 0.0, 0.0, fit_text1);
+        cpgptxt(main_text_x, main_text_y_base - main_line_spacing, 0.0, 0.0, fit_text2);
+        cpgptxt(main_text_x, main_text_y_base - 2 * main_line_spacing, 0.0, 0.0, fit_text3);
+        
         cpgsls(1);
 
         free(x_data);
@@ -1261,8 +1279,8 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
                 float zoom_hist_amplitude = zoom_max_count;
                 printf("Zoomed histogram amplitude (max bin value): %.2f\n", zoom_hist_amplitude);
                 
-                cpgsci(5); // Cyan color for fit
-                cpgsls(2); // Dashed line style
+                cpgsci(1); // Cyan color for fit
+                cpgsls(1); // Dashed line style
                 
                 float zoom_curve_points = 200;
                 for (i = 0; i < zoom_curve_points; i++) {
@@ -1277,8 +1295,6 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
                 }
                 
                 cpgsls(1); // Back to solid line
-                cpgptxt(zoom_min + (zoom_max - zoom_min) * 0.7f, zoom_max_count * 0.85f, 
-                        0.0, 0.0, "Gaussian Fit");
                 
                 cpgsci(1); // Restore white color
                 printf("Zoomed MAD histogram completed! (%d channels in 0-0.25 range)\n", zoom_count);
@@ -1575,8 +1591,8 @@ void visualizeChannelStd(float *data, int nsamp, int nchan, int plot)
         float global_fitted_sigma = fitted_sigma;
         
         // Draw fitted Gaussian curve with fixed amplitude
-        cpgsci(5); // Cyan color
-        cpgsls(2); // Dashed line
+        cpgsci(1); // Cyan color
+        cpgsls(1); // Dashed line
         
         int curve_points = 200;
         float curve_step = (plot_max - plot_min) / curve_points;
@@ -1592,7 +1608,25 @@ void visualizeChannelStd(float *data, int nsamp, int nchan, int plot)
             }
         }
         
-        cpgptxt(global_fitted_mu + global_fitted_sigma, max_count * 0.4f, 0.0, 0.0, "Gaussian Fit");
+        // Add detailed Gaussian fit parameters as text annotations in STD main histogram
+        cpgsci(1); // White color for text
+        
+        // Create formatted strings for the fit parameters
+        char std_fit_text1[100], std_fit_text2[100], std_fit_text3[100];
+        sprintf(std_fit_text1, "Gaussian Fit Parameters:");
+        sprintf(std_fit_text2, "\\gm = %.6f", global_fitted_mu);
+        sprintf(std_fit_text3, "\\gs = %.6f", global_fitted_sigma);
+        
+        // Position the text in the upper right area of the main STD histogram
+        float std_text_x = plot_min + (plot_max - plot_min) * 0.65f;
+        float std_text_y_base = max_count * 0.85f;
+        float std_line_spacing = max_count * 0.05f;
+        
+        // Draw the text annotations
+        cpgptxt(std_text_x, std_text_y_base, 0.0, 0.0, std_fit_text1);
+        cpgptxt(std_text_x, std_text_y_base - std_line_spacing, 0.0, 0.0, std_fit_text2);
+        cpgptxt(std_text_x, std_text_y_base - 2 * std_line_spacing, 0.0, 0.0, std_fit_text3);
+        
         cpgsls(1);
 
         free(x_data);
@@ -1690,8 +1724,8 @@ void visualizeChannelStd(float *data, int nsamp, int nchan, int plot)
                 float zoom_hist_amplitude = zoom_max_count;
                 printf("Zoomed histogram amplitude (max bin value): %.2f\n", zoom_hist_amplitude);
                 
-                cpgsci(5); // Cyan color for fit
-                cpgsls(2); // Dashed line style
+                cpgsci(1); // Cyan color for fit
+                cpgsls(1); // Dashed line style
                 
                 float zoom_curve_points = 200;
                 for (i = 0; i < zoom_curve_points; i++) {
@@ -1706,8 +1740,6 @@ void visualizeChannelStd(float *data, int nsamp, int nchan, int plot)
                 }
                 
                 cpgsls(1); // Back to solid line
-                cpgptxt(zoom_min + (zoom_max - zoom_min) * 0.7f, zoom_max_count * 0.85f, 
-                        0.0, 0.0, "Gaussian Fit");
                 
                 cpgsci(1); // Restore white color
                 printf("Zoomed STD histogram completed! (%d channels in 0-0.25 range)\n", zoom_count);
@@ -2474,7 +2506,6 @@ void identSubstNSigma_Experiment(
     float killThresh = 0.2f;
     int i, j;
     
-    subtractChannelMedians(data, nsamp, nchan);
     
     // Visualize channel MAD statistics for threshold determination in first 20 iterations
     // Use iterationIndex as a proxy for iteration counter (passed from ReadFASTData.c)
@@ -2514,6 +2545,9 @@ void identSubstNSigma_Experiment(
     printf("Channel-level flagging: %d/%d channels fully flagged (%.2f%%), skipping pixel-level detection for these\n", 
            fully_flagged_channels, nchan, (float)fully_flagged_channels/nchan*100);
     
+
+    subtractChannelMedians(data, nsamp, nchan);
+
     // === 2. Channel-internal pixel flagging ===
     printf("=== Performing channel-level outlier detection ===\n");
     int channelOutliers = performChannelLevelDetection(data, nsamp, nchan, Nsigma, 
@@ -2524,49 +2558,24 @@ void identSubstNSigma_Experiment(
     free(random_indices);
     free(channel_fully_flagged);
 
-    // === 3. Time-sample level flagging ===
-    float *transposedData = (float *)malloc(nsamp * nchan * sizeof(float));
-    int *transposedMask = (int *)calloc(nsamp * nchan, sizeof(int));
-
-    // Transpose data and mask for time-sample processing
-    transpose(data, nsamp, nchan, transposedData);
-    transpose_int(horizontalMask, nsamp, nchan, transposedMask);
-
-    printf("=== Performing time-sample-level outlier detection ===\n");
-    int timeSampleOutliers = performTimeSampleLevelDetection(transposedData, nsamp, nchan, Nsigma, transposedMask);
-    printf("Time-sample-level detection: flagged %d outlier pixels\n", timeSampleOutliers);
-
-    // Transpose back to original layout
-    transpose(transposedData, nchan, nsamp, data);
-    transpose_int(transposedMask, nchan, nsamp, verticalMask);
-    free(transposedData);
-    free(transposedMask);
-    
-    int horizontalFlagged = 0, verticalFlagged = 0;
+    // === 3. Copy horizontal mask to global mask (vertical detection removed for efficiency) ===
+    int horizontalFlagged = 0;
     int idx;
     for (idx = 0; idx < nsamp * nchan; idx++) {
+        globalMask[idx] = horizontalMask[idx];  // Direct copy instead of logicalOR
         if (horizontalMask[idx] == 1) horizontalFlagged++;
-        if (verticalMask[idx] == 1) verticalFlagged++;
     }
+    
     printf("\n=== RFI Detection Statistics ===\n");
-    printf("Horizontal mask flagged: %d/%d pixels (%.4f%%)\n", 
+    printf("Channel-level mask flagged: %d/%d pixels (%.4f%%)\n", 
            horizontalFlagged, nsamp*nchan, (float)horizontalFlagged/(nsamp*nchan)*100);
-    printf("Vertical mask flagged: %d/%d pixels (%.4f%%)\n", 
-           verticalFlagged, nsamp*nchan, (float)verticalFlagged/(nsamp*nchan)*100);
-    
-    logicalOR(horizontalMask, verticalMask, globalMask, nsamp, nchan);
-    
-    int globalFlagged = 0;
-    for (idx = 0; idx < nsamp * nchan; idx++) {
-        if (globalMask[idx] == 1) globalFlagged++;
-    }
-    printf("Global mask flagged after logicalOR: %d/%d pixels (%.4f%%)\n", 
-           globalFlagged, nsamp*nchan, (float)globalFlagged/(nsamp*nchan)*100);
+    printf("Global mask flagged: %d/%d pixels (%.4f%%)\n", 
+           horizontalFlagged, nsamp*nchan, (float)horizontalFlagged/(nsamp*nchan)*100);
     printf("=== End RFI Detection Statistics ===\n");
 
     // Apply binarySIR before killThresh analysis to filter isolated pixels for better range calculation
     printf("\n=== Applying binarySIR filtering before killThresh analysis ===\n");
-    int flaggedBeforeSIR = globalFlagged;
+    int flaggedBeforeSIR = horizontalFlagged;
     
     // Use CUDA-accelerated binarySIR if available
     if (cudaReady) {
@@ -2598,7 +2607,7 @@ void identSubstNSigma_Experiment(
     findMeanStd(median_temp, nsamp * nchan, &finalMedian_temp, &finalStd_temp);
     float finalMedian_value = median(median_temp, nsamp * nchan);
 
-    float outlierRatio = (float)(channelOutliers + timeSampleOutliers) / (nsamp * nchan);
+    float outlierRatio = (float)channelOutliers / (nsamp * nchan);
     if (outlierRatio > killThresh)
     {
         printf("WARNING: High outlier ratio %.4f > %.2f detected - data may be corrupted\n",

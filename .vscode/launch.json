@@ -28,7 +28,7 @@
                 "--savePlot=1",
                 "--write=1",
                 "--doSubstitution=1",
-                "--doSumThreshold=0",
+                "--doSumThreshold=1",
                 "--blocksPerRead=1",
                 // "--blocksPerRead=1",
                 "--startTime=0.0",

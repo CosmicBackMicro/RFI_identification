@@ -17,9 +17,8 @@ void writeIndexMaskPNG(int *mask, int nsamp, int nchan, char *filename);
 
 void mergeMask2D(int *masks[], int nmasks, int nsamp, int nchan, int *result);
 
-void substitute_pixels(float *data, int nsamp, int nchan, int *mask);
-// void substitute_pixels_1d(float *data, int size, int *mask);
-void substitute_pixels_1d(float *data, int size, int *mask, int *goodSamps, int *randIdx);
+void substPixels2D(float *data, int nsamp, int nchan, int *mask);
+void substPixels(float *data, int size, int *mask, int *goodSamps, int *randIdx);
 void binarySIR(int *mask, int nsamp, int nchan, int win_samp, int win_chan, float thrup, float thrdown);
 
 void flagChannelsByMeanOutliers(float *data, int nsamp, int nchan, int *horizontalMask,
@@ -45,13 +44,12 @@ void drawUnifiedThresholdLines(const float *thresh_values, const char **threshol
                               const int *threshold_enabled, int num_thresholds,
                               float max_count, float x_min, float x_max);
 
-void identSubstNSigma(
-    float *data, int nsamp, int nchan, 
-    float Nsigma, int iterationIndex, int plot,
-    int *horizontalMask, int *verticalMask, int *globalMask,
-    float *finalMedian, float *finalStd, int cudaReady);
+void applyKillThreshAndSubstitution(float *data, int *globalMask, int nsamp, int nchan, 
+                                   float killThresh, int flaggedBefore,
+                                   int *killedChannels, int *localRFISkippedPtr, 
+                                   int *totalFlaggedAfter, int *pixelsSubstituted);
 
-void identSubstNSigma_Experiment(
+void identSubstNSigma(
     float *data, int nsamp, int nchan, 
     float Nsigma, int iterationIndex, int plot,
     int *horizontalMask, int *verticalMask, int *globalMask,

@@ -677,7 +677,7 @@ int main(int argc, char *argv[])
                  m.datasetPath, sourceName, 0.0, m.binFactorTime, m.binFactorFreq);
         // Initialize PGPLOT graphics system, set output device to PostScript file
         // Parameters: device count=1, filename with path and device type, subplot layout 2x3
-        cpgbeg(1, saveName, 2, 3);
+        cpgbeg(1, saveName, 2, 5);
         free(sourceName);
         free(saveName);
     }
@@ -806,6 +806,26 @@ int main(int argc, char *argv[])
 
 
 
+            float NSigma = 2.5f;
+            if (m.doSubstitution)
+            {
+                identSubstNSigma(outDataT, nsampBinned, nchanBinned, NSigma, ii, m.plot,
+                                 horizontalMask, verticalMask, globalMask, finalMedian, finalStd, m.cudaReady);
+            }
+            if (writeMasks)
+            {
+                char mask_Subst_filename[256];
+                sprintf(mask_Subst_filename, "%smask_Subst_%d.png", m.datasetPath, ii);
+                writeIndexMaskPNG(globalMask, nsampBinned, nchanBinned, mask_Subst_filename);
+            }
+            if (m.plot)
+            { // Plot result after NSigma substitution
+                cpgpage();
+                plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, globalMask);
+            }
+
+
+
             float timesOfSigma = 20.0f;
             // float timesOfSigma = 8.0f;
             int M_len = 6;
@@ -813,8 +833,8 @@ int main(int argc, char *argv[])
             float thrup = 0.5f, thrdown = 0.5f;
             if (m.doSumThreshold)
             {
-                sumthreshold_2d(outDataT, nsampBinned, nchanBinned,
-                                mask_chanRFI, mask_ST, timesOfSigma, M_len);
+                // sumthreshold_2d(outDataT, nsampBinned, nchanBinned,
+                //                 mask_chanRFI, mask_ST, timesOfSigma, M_len);
                 // if (m.cudaReady) {
                 //     printf("Using CUDA-accelerated binarySIR filtering...\n");
                 //     cuda_binarySIR(mask_ST, nsampBinned, nchanBinned, win_samp, win_chan, thrup, thrdown);
@@ -849,30 +869,6 @@ int main(int argc, char *argv[])
                 plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, NULL);
                 cpgpage();
             }            
-
-
-
-            float NSigma = 2.0f;
-            if (m.doSubstitution)
-            {
-                identSubstNSigma(outDataT, nsampBinned, nchanBinned, NSigma, ii, m.plot,
-                                 horizontalMask, verticalMask, globalMask, finalMedian, finalStd, m.cudaReady);
-            }
-            if (writeMasks)
-            {
-                char mask_Subst_filename[256];
-                sprintf(mask_Subst_filename, "%smask_Subst_%d.png", m.datasetPath, ii);
-                writeIndexMaskPNG(globalMask, nsampBinned, nchanBinned, mask_Subst_filename);
-            }
-            if (m.plot)
-            { // Plot result after NSigma substitution
-                cpgpage();
-                plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, globalMask);
-            }
-
-
-
-
         }
 
         if (m.write)
@@ -904,8 +900,9 @@ int main(int argc, char *argv[])
 
 
         numiter++;
-        if (numiter >= 20) {
+        if (numiter >= 2) {
             m.plot = 0; 
+            return 0;
         }
         // if (numiter >= 20)   
         // {

@@ -1316,88 +1316,8 @@ void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot)
     free(temp_data);
 }
 
-void visualizeChannelStd(float *data, int nsamp, int nchan, int plot)
-{
-    int i, j;
-    
-    // Allocate memory for channel statistics
-    float *channel_std = (float *)malloc(nchan * sizeof(float));
-    float *channel_median = (float *)malloc(nchan * sizeof(float));
-    float *temp_data = (float *)malloc(nsamp * sizeof(float));
-    
-    // Calculate standard deviation for each channel (using median instead of mean)
-    for (i = 0; i < nchan; i++)
-    {
-        // Copy channel data for processing
-        memcpy(temp_data, data + i * nsamp, nsamp * sizeof(float));
-        
-        // Calculate median of the channel
-        channel_median[i] = median(temp_data, nsamp);
-        
-        // Calculate squared deviations from median
-        if (nsamp > 1) {
-            float sum_squared_dev = 0.0f;
-            for (j = 0; j < nsamp; j++)
-            {
-                float deviation = data[i * nsamp + j] - channel_median[i];
-                float squared_dev = deviation * deviation;
-                temp_data[j] = squared_dev;
-                sum_squared_dev += squared_dev;
-            }
-            
-            // Calculate standard deviation as sqrt(mean of squared deviations from median)
-            float mean_squared_dev = sum_squared_dev / nsamp;
-            channel_std[i] = sqrtf(mean_squared_dev);
-            
-        } else {
-            // If only one sample, set STD to 0
-            channel_std[i] = 0.0f;
-        }
-    }
-    
-    // Calculate statistics of channel standard deviations (using median-based approach)
-    float std_min = channel_std[0], std_max = channel_std[0];
-    
-    // Find min and max values
-    for (i = 0; i < nchan; i++)
-    {
-        if (channel_std[i] < std_min) std_min = channel_std[i];
-        if (channel_std[i] > std_max) std_max = channel_std[i];
-    }
-    
-    // Calculate median of the STD values
-    memcpy(temp_data, channel_std, nchan * sizeof(float));
-    float std_median = median(temp_data, nchan);
-    
-    // Calculate STD of STD values (using median absolute deviation approach)
-    for (i = 0; i < nchan; i++)
-    {
-        temp_data[i] = fabsf(channel_std[i] - std_median);
-    }
-    float std_std = median(temp_data, nchan);
-    
-    printf("\n=== Channel STD σ_j Statistics ===\n");
-    printf("Total channels: %d\n", nchan);
-    printf("STD Median: %.6f\n", std_median);
-    printf("STD STD: %.6f\n", std_std);
-    printf("STD Min: %.6f\n", std_min);
-    printf("STD Max: %.6f\n", std_max);
-    
-    // Unified threshold calculation system
-    float multipliers[6] = {-1.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f};
-    float threshold_values[6];
-    const char* threshold_names[6] = {"-1*STD", "1*STD", "2*STD", "3*STD", "4*STD", "5*STD"};
-    
-    // Calculate all thresholds directly
-    for (i = 0; i < 6; i++) {
-        threshold_values[i] = std_median + multipliers[i] * std_std;
-    }
-    
-    // Print thresholds uniformly
-    printf("\n=== Suggested Thresholds ===\n");
-    for (i = 0; i < 6; i++) {
-        printf("%s threshold: %.6f\n", threshold_names[i], threshold_values[i]);
-    }
+void visualizeChannelStatistics(float *data, int nsamp, int nchan, int plot, int use_mad)
+
     
     printThresholdStatistics(channel_std, nchan, threshold_values, threshold_names, 6, "STD");
     
@@ -1757,6 +1677,462 @@ void visualizeChannelStd(float *data, int nsamp, int nchan, int plot)
     
     printf("=== STD Histogram Complete ===\n");
 }
+
+void visualizeChannelStatistics(float *data, int nsamp, int nchan, int plot, int use_mad)
+{
+    int i, j;
+    
+    // Select appropriate statistical method
+    const char* stat_name = use_mad ? "MAD" : "STD";
+    const char* stat_symbol = use_mad ? "M" : "\\gs";
+    const char* stat_label = use_mad ? "Channel MAD M\\dj\\u" : "Channel STD \\gs\\dj\\u";
+    
+    printf("\n=== %s Histogram Analysis ===\n", stat_name);
+    
+    // Allocate memory for channel statistics
+    float *channel_stat = (float *)malloc(nchan * sizeof(float));
+    float *channel_median = (float *)malloc(nchan * sizeof(float));
+    float *temp_data = (float *)malloc(nsamp * sizeof(float));
+    
+    // Calculate statistics for each channel
+    for (i = 0; i < nchan; i++)
+    {
+        // Copy channel data for processing
+        memcpy(temp_data, data + i * nsamp, nsamp * sizeof(float));
+        
+        // Calculate median of the channel
+        channel_median[i] = median(temp_data, nsamp);
+        
+        if (nsamp > 1) {
+            if (use_mad) {
+                // Calculate MAD (Mean Absolute Deviation from median)
+                float sum_abs_dev = 0.0f;
+                for (j = 0; j < nsamp; j++)
+                {
+                    float abs_dev = fabsf(data[i * nsamp + j] - channel_median[i]);
+                    temp_data[j] = abs_dev;
+                    sum_abs_dev += abs_dev;
+                }
+                channel_stat[i] = sum_abs_dev / nsamp;
+            } else {
+                // Calculate STD (Standard Deviation from median)
+                float sum_squared_dev = 0.0f;
+                for (j = 0; j < nsamp; j++)
+                {
+                    float deviation = data[i * nsamp + j] - channel_median[i];
+                    float squared_dev = deviation * deviation;
+                    temp_data[j] = squared_dev;
+                    sum_squared_dev += squared_dev;
+                }
+                float mean_squared_dev = sum_squared_dev / nsamp;
+                channel_stat[i] = sqrtf(mean_squared_dev);
+            }
+        } else {
+            channel_stat[i] = 0.0f;
+        }
+    }
+    
+    // Calculate global statistics
+    memcpy(temp_data, channel_stat, nchan * sizeof(float));
+    float stat_median = median(temp_data, nchan);
+    float stat_mad, stat_std;
+    findMeanStd(channel_stat, nchan, &stat_mad, &stat_std); // Note: stat_mad here is actually mean
+    
+    // Calculate dispersion based on method (to match original functions exactly)
+    float dispersion_value;
+    if (use_mad) {
+        // For MAD: use MAD function exactly like original visualizeChannelMAD
+        // This calculates median of absolute deviations * 1.4826
+        dispersion_value = mad(channel_stat, nchan);
+        stat_mad = dispersion_value; // Keep stat_mad for display
+    } else {
+        // For STD: use median of absolute deviations (like original visualizeChannelStd)
+        for (i = 0; i < nchan; i++) {
+            temp_data[i] = fabsf(channel_stat[i] - stat_median);
+        }
+        dispersion_value = median(temp_data, nchan);
+        stat_mad = dispersion_value; // Update stat_mad to show the correct dispersion
+    }
+    
+    // Print statistics in original format
+    if (use_mad) {
+        printf("=== Channel MAD M_j Statistics ===\n");
+        printf("Total channels: %d\n", nchan);
+        printf("MAD Mean: %.6f\n", stat_mad);   // stat_mad is actually the mean from findMeanStd
+        printf("MAD Std:  %.6f\n", stat_std);   // stat_std is the standard deviation from findMeanStd
+        printf("MAD Median: %.6f\n", stat_median);
+        printf("MAD MAD: %.6f\n", dispersion_value);
+    } else {
+        printf("\n=== Channel STD σ_j Statistics ===\n");
+        printf("Total channels: %d\n", nchan);
+        printf("STD Median: %.6f\n", stat_median);
+        printf("STD STD: %.6f\n", dispersion_value);
+    }
+    
+    if (!plot) {
+        printf("%s histogram plotting disabled, skipping visualization.\n", stat_name);
+        free(channel_stat);
+        free(channel_median);
+        free(temp_data);
+        return;
+    }
+    
+    // Find min and max for plotting
+    float stat_min = channel_stat[0], stat_max = channel_stat[0];
+    for (i = 1; i < nchan; i++) {
+        if (channel_stat[i] < stat_min) stat_min = channel_stat[i];
+        if (channel_stat[i] > stat_max) stat_max = channel_stat[i];
+    }
+    
+    // Print statistics in original format
+    if (use_mad) {
+        printf("=== Channel MAD M_j Statistics ===\n");
+        printf("Total channels: %d\n", nchan);
+        printf("MAD Mean: %.6f\n", stat_mad);   // stat_mad is actually the mean from findMeanStd
+        printf("MAD Std:  %.6f\n", stat_std);   // stat_std is the standard deviation from findMeanStd
+        printf("MAD Median: %.6f\n", stat_median);
+        printf("MAD MAD: %.6f\n", dispersion_value);
+        printf("MAD Min: %.6f\n", stat_min);
+        printf("MAD Max: %.6f\n", stat_max);
+    } else {
+        printf("\n=== Channel STD σ_j Statistics ===\n");
+        printf("Total channels: %d\n", nchan);
+        printf("STD Median: %.6f\n", stat_median);
+        printf("STD STD: %.6f\n", dispersion_value);
+        printf("STD Min: %.6f\n", stat_min);
+        printf("STD Max: %.6f\n", stat_max);
+    }
+    
+    // Unified 11-threshold line system
+    const int NUM_ALL_THRESHOLDS = 11;
+    float all_thresh_values[11];
+    const char* all_threshold_labels[11];
+    
+    // Set labels based on statistical method
+    if (use_mad) {
+        const char* mad_labels[11] = {
+            "-5*MAD", "-4*MAD", "-3*MAD", "-2*MAD", "-1*MAD", 
+            "Median", 
+            "+1*MAD", "+2*MAD", "+3*MAD", "+4*MAD", "+5*MAD"
+        };
+        for (i = 0; i < 11; i++) all_threshold_labels[i] = mad_labels[i];
+    } else {
+        const char* std_labels[11] = {
+            "-5*STD", "-4*STD", "-3*STD", "-2*STD", "-1*STD",
+            "Median",
+            "1*STD", "2*STD", "3*STD", "4*STD", "5*STD"
+        };
+        for (i = 0; i < 11; i++) all_threshold_labels[i] = std_labels[i];
+    }
+    
+    const int all_threshold_colors[11] = {4, 7, 3, 8, 6, 1, 6, 8, 3, 7, 4};
+    const float all_y_positions[11] = {0.15f, 0.25f, 0.35f, 0.45f, 0.75f, 0.65f, 0.85f, 0.90f, 1.05f, 1.00f, 0.95f};
+    
+    // Paired threshold control switches: 5 switches control ±1, ±2, ±3, ±4, ±5 and median line
+    const int show_median = 1;              
+    const int threshold_pair_enabled[5] = {0, 1, 0, 0, 0}; // Only ±2sigma enabled (as requested)
+    
+    // Generate enabled array for 11 positions based on paired switches
+    int threshold_enabled[11];
+    for (i = 0; i < 5; i++) {
+        // Negative thresholds
+        threshold_enabled[4-i] = threshold_pair_enabled[i];
+        // Positive thresholds
+        threshold_enabled[6+i] = threshold_pair_enabled[i];
+    }
+    threshold_enabled[5] = show_median; // Median line
+    
+    // Calculate all 11 threshold line values uniformly using correct dispersion
+    for (i = 0; i < NUM_ALL_THRESHOLDS; i++) {
+        if (i < 5) {
+            // Negative thresholds
+            float multiplier = (float)(5 - i);
+            all_thresh_values[i] = stat_median - multiplier * dispersion_value;
+        } else if (i == 5) {
+            // Median line
+            all_thresh_values[i] = stat_median;
+        } else {
+            // Positive thresholds
+            float multiplier = (float)(i - 5);
+            all_thresh_values[i] = stat_median + multiplier * dispersion_value;
+        }
+    }
+    
+    // Output enabled threshold line statistics
+    printf("\n=== Enabled Threshold Statistics ===\n");
+    for (i = 0; i < NUM_ALL_THRESHOLDS; i++) {
+        if (threshold_enabled[i]) {
+            printf("  %s: %.6f\n", all_threshold_labels[i], all_thresh_values[i]);
+        }
+    }
+    
+    // Create histogram
+    int nbins = 100;
+    float plot_min = stat_min;
+    float plot_max = stat_max;
+    float bin_width = (plot_max - plot_min) / nbins;
+    float *hist = (float *)calloc(nbins, sizeof(float));
+    
+    // Fill histogram
+    for (i = 0; i < nchan; i++) {
+        int bin = (int)((channel_stat[i] - plot_min) / bin_width);
+        if (bin < 0) bin = 0;
+        if (bin >= nbins) bin = nbins - 1;
+        hist[bin]++;
+    }
+    
+    // Find maximum count for scaling
+    float max_count = 0;
+    for (i = 0; i < nbins; i++) {
+        if (hist[i] > max_count) max_count = hist[i];
+    }
+    
+    // Draw histogram
+    printf("Creating %s histogram plot...\n", stat_name);
+    cpgpage();
+    cpgvstd();
+    cpgsch(1.2);
+    cpgswin(plot_min, plot_max, 0, max_count * 1.1f);
+    cpgbox("BCNST", 0.0, 0, "BCNST", 0.0, 0);
+    cpglab(stat_label, "Number of Channels", 
+           use_mad ? "Channel MAD M\\dj\\u Distribution" : "Channel STD \\gs\\dj\\u Distribution");
+    printf("%s histogram axes set up complete\n", stat_name);
+
+    // Draw solid histogram bars
+    cpgsci(2); // Red color
+    for (i = 0; i < nbins; i++)
+    {
+        float x1 = plot_min + i * bin_width;
+        float x2 = plot_min + (i + 1) * bin_width;
+        cpgrect(x1, x2, 0, hist[i]);
+    }
+
+    // Draw threshold lines
+    for (i = 0; i < NUM_ALL_THRESHOLDS; i++) {
+        if (threshold_enabled[i]) {
+            cpgsci(all_threshold_colors[i]);
+            cpgmove(all_thresh_values[i], 0);
+            cpgdraw(all_thresh_values[i], max_count * 1.1f);
+            cpgptxt(all_thresh_values[i], max_count * all_y_positions[i], 0.0, 0.0, all_threshold_labels[i]);
+        }
+    }
+
+    cpgsci(1); // Restore white color
+
+    // Add Gaussian fitting curve with fixed amplitude
+    printf("Fitting Gaussian curve to %s histogram (fixed amplitude method)...\n", stat_name);
+    
+    const float gaussian_fit_sigma_threshold = 5.0f;
+    float fit_range_min = stat_median - gaussian_fit_sigma_threshold * dispersion_value;
+    float fit_range_max = stat_median + gaussian_fit_sigma_threshold * dispersion_value;
+    printf("Gaussian fitting range: [%.6f, %.6f] (median ± %.1fσ)\n", fit_range_min, fit_range_max, gaussian_fit_sigma_threshold);
+    
+    // Count non-zero bins for debugging
+    int non_zero_bins = 0;
+    for (i = 0; i < nbins; i++) {
+        if (hist[i] > 0) non_zero_bins++;
+    }
+    
+    // Prepare fitting data
+    float *x_data = (float *)malloc(nbins * sizeof(float));
+    float *y_data = (float *)malloc(nbins * sizeof(float));
+    int fit_points = 0;
+    
+    for (i = 0; i < nbins; i++) {
+        if (hist[i] > 0) {
+            float bin_center = plot_min + (i + 0.5f) * bin_width;
+            if (bin_center >= fit_range_min && bin_center <= fit_range_max) {
+                x_data[fit_points] = bin_center;
+                y_data[fit_points] = hist[i];
+                fit_points++;
+            }
+        }
+    }
+    printf("Using %d out of %d bins for Gaussian fitting (within %.1fσ range)\n", fit_points, non_zero_bins, gaussian_fit_sigma_threshold);
+    
+    // Simple zero-bin removal
+    if (fit_points > 0) {
+        printf("Removing potential instrument artifact: y_data[0] = %.1f -> 0.0\n", y_data[0]);
+        y_data[0] = 0.0f;
+    }
+    
+    // Calculate fixed amplitude from main histogram max bin value
+    float main_hist_amplitude = max_count;
+    printf("Main histogram amplitude (max bin value): %.2f\n", main_hist_amplitude);
+    
+    // Use GSL two-parameter Gaussian fitting with fixed amplitude
+    float fitted_mu, fitted_sigma;
+    int gsl_success = gsl_gaussian_fit(x_data, y_data, fit_points, main_hist_amplitude, &fitted_mu, &fitted_sigma);
+    
+    if (gsl_success) {
+        printf("Gaussian fit (fixed amp=%.2f): center=%.6f, sigma=%.6f\n", 
+               main_hist_amplitude, fitted_mu, fitted_sigma);
+    } else {
+        printf("Gaussian fit failed, falling back to simple fit\n");
+        fitted_sigma = simple_curve_fit(x_data, y_data, fit_points, stat_median);
+        fitted_mu = stat_median;
+        printf("Fallback Gaussian fit: center=%.6f, sigma=%.6f\n", fitted_mu, fitted_sigma);
+    }
+    
+    // Store fitted parameters for use in zoomed histogram
+    float global_fitted_mu = fitted_mu;
+    float global_fitted_sigma = fitted_sigma;
+    
+    // Draw fitted Gaussian curve with fixed amplitude
+    cpgsci(1); // Cyan color
+    cpgsls(1); // Dashed line
+    
+    int curve_points = 200;
+    float curve_step = (plot_max - plot_min) / curve_points;
+    
+    for (i = 0; i < curve_points; i++) {
+        float x = plot_min + i * curve_step;
+        float y = gaus_with_amplitude(x, main_hist_amplitude, global_fitted_mu, global_fitted_sigma);
+        
+        if (i == 0) {
+            cpgmove(x, y);
+        } else {
+            cpgdraw(x, y);
+        }
+    }
+    
+    // Add detailed Gaussian fit parameters as text annotations
+    cpgsci(1); // White color for text
+    
+    char fit_text1[100], fit_text2[100], fit_text3[100];
+    sprintf(fit_text1, "Gaussian Fit Parameters:");
+    sprintf(fit_text2, "\\gm = %.6f", global_fitted_mu);
+    sprintf(fit_text3, "\\gs = %.6f", global_fitted_sigma);
+    
+    float text_x = plot_min + (plot_max - plot_min) * 0.65f;
+    float text_y_base = max_count * 0.85f;
+    float line_spacing = max_count * 0.05f;
+    
+    cpgptxt(text_x, text_y_base, 0.0, 0.0, fit_text1);
+    cpgptxt(text_x, text_y_base - line_spacing, 0.0, 0.0, fit_text2);
+    cpgptxt(text_x, text_y_base - 2 * line_spacing, 0.0, 0.0, fit_text3);
+    
+    cpgsls(1);
+    free(x_data);
+    free(y_data);
+    cpgsci(1);
+
+    // =====================================================================
+    // Second part: Draw zoomed histogram for 0-0.25 range (detailed view)
+    // =====================================================================
+    printf("Creating zoomed %s histogram for range 0-0.25...\n", stat_name);
+    
+    // Check if there is data in the 0-0.25 range
+    int has_data_in_range = 0;
+    for (i = 0; i < nchan; i++) {
+        if (channel_stat[i] >= 0.0f && channel_stat[i] <= 0.25f) {
+            has_data_in_range = 1;
+            break;
+        }
+    }
+    
+    if (has_data_in_range) {
+        // Create new page for zoomed histogram
+        cpgpage();
+        cpgvstd();
+        cpgsch(1.2);
+        
+        // Create subdivided histogram for 0-0.25 range
+        int zoom_nbins = 50;
+        float zoom_min = 0.0f;
+        float zoom_max = 0.25f;
+        float zoom_bin_width = (zoom_max - zoom_min) / zoom_nbins;
+        float *zoom_hist = (float *)calloc(zoom_nbins, sizeof(float));
+        
+        // Fill zoomed histogram
+        int zoom_count = 0;
+        for (i = 0; i < nchan; i++) {
+            if (channel_stat[i] >= zoom_min && channel_stat[i] <= zoom_max) {
+                int bin = (int)((channel_stat[i] - zoom_min) / zoom_bin_width);
+                if (bin < 0) bin = 0;
+                if (bin >= zoom_nbins) bin = zoom_nbins - 1;
+                zoom_hist[bin]++;
+                zoom_count++;
+            }
+        }
+        
+        // Calculate maximum count in zoomed range
+        float zoom_max_count = 0;
+        for (i = 0; i < zoom_nbins; i++) {
+            if (zoom_hist[i] > zoom_max_count) zoom_max_count = zoom_hist[i];
+        }
+        
+        if (zoom_max_count > 0) {
+            // Set up coordinate system
+            cpgswin(zoom_min, zoom_max, 0, zoom_max_count * 1.1f);
+            cpgbox("BCNST", 0.0, 0, "BCNST", 0.0, 0);
+            char zoom_title[200];
+            sprintf(zoom_title, "Channel %s %s Distribution (Zoomed: 0-0.25)", stat_name, stat_symbol);
+            cpglab(stat_label, "Number of Channels", zoom_title);
+            
+            // Draw zoomed histogram bars
+            cpgsci(2); // Red color
+            for (i = 0; i < zoom_nbins; i++) {
+                if (zoom_hist[i] > 0) {
+                    float x1 = zoom_min + i * zoom_bin_width;
+                    float x2 = zoom_min + (i + 1) * zoom_bin_width;
+                    cpgrect(x1, x2, 0, zoom_hist[i]);
+                }
+            }
+            
+            // Use unified system to draw threshold lines in zoomed plot
+            for (i = 0; i < NUM_ALL_THRESHOLDS; i++) {
+                if (threshold_enabled[i] && all_thresh_values[i] >= zoom_min && all_thresh_values[i] <= zoom_max) {
+                    cpgsci(all_threshold_colors[i]);
+                    cpgmove(all_thresh_values[i], 0);
+                    cpgdraw(all_thresh_values[i], zoom_max_count * 1.1f);
+                    float zoom_y_pos = 0.1f + (i * 0.08f);
+                    if (zoom_y_pos > 0.9f) zoom_y_pos = 0.9f;
+                    cpgptxt(all_thresh_values[i], zoom_max_count * zoom_y_pos, 
+                           0.0, 0.0, all_threshold_labels[i]);
+                }
+            }
+            
+            // Draw the Gaussian curve with zoomed histogram specific amplitude
+            float zoom_hist_amplitude = zoom_max_count;
+            printf("Zoomed histogram amplitude (max bin value): %.2f\n", zoom_hist_amplitude);
+            
+            cpgsci(1);
+            cpgsls(1);
+            
+            float zoom_curve_points = 200;
+            for (i = 0; i < zoom_curve_points; i++) {
+                float x = zoom_min + i * (zoom_max - zoom_min) / (zoom_curve_points - 1);
+                float y = gaus_with_amplitude(x, zoom_hist_amplitude, global_fitted_mu, global_fitted_sigma);
+                
+                if (i == 0) {
+                    cpgmove(x, y);
+                } else {
+                    cpgdraw(x, y);
+                }
+            }
+            
+            cpgsls(1);
+            cpgsci(1);
+            printf("Zoomed %s histogram completed! (%d channels in 0-0.25 range)\n", stat_name, zoom_count);
+        } else {
+            printf("No data found in 0-0.25 range for %s histogram\n", stat_name);
+        }
+        
+        free(zoom_hist);
+    } else {
+        printf("No %s data in 0-0.25 range, skipping zoomed histogram\n", stat_name);
+    }
+
+    printf("%s histogram plot completed!\n", stat_name);
+    free(hist);
+    free(channel_stat);
+    free(channel_median);
+    free(temp_data);
+    
+    printf("=== %s Histogram Complete ===\n", stat_name);
+}
+
 
 void logicalOR(int *mask1, int *mask2, int *outmask, int nsamp, int nchan)
 {
@@ -2257,9 +2633,9 @@ void applyKillThreshAndSubstitution(float *data, int *globalMask, int nsamp, int
                 int idx = samp + chan * nsamp;
                 globalMask[idx] = 1;
             }
-            printf("Channel %d: killed entire channel (%d/%d pixels, %.2f%%)\n", 
-                   chan, channelMaskedCounts[chan], nsamp, 
-                   (float)channelMaskedCounts[chan]/nsamp*100);
+            // printf("Channel %d: killed entire channel (%d/%d pixels, %.2f%%)\n", 
+            //        chan, channelMaskedCounts[chan], nsamp, 
+            //        (float)channelMaskedCounts[chan]/nsamp*100);
         } else if (channelActions[chan] == 0 && channelMaskedCounts[chan] > 0) {
             // Substitute pixels in this channel only
             float *channelData = data + chan * nsamp;
@@ -2272,9 +2648,9 @@ void applyKillThreshAndSubstitution(float *data, int *globalMask, int nsamp, int
             if (goodSamples && randomIndices) {
                 substPixels(channelData, nsamp, channelMask, goodSamples, randomIndices);
                 localPixelsSubstituted += channelMaskedCounts[chan];
-                printf("Channel %d: substituted %d pixels (%.2f%%)\n", 
-                       chan, channelMaskedCounts[chan], 
-                       (float)channelMaskedCounts[chan]/nsamp*100);
+                // printf("Channel %d: substituted %d pixels (%.2f%%)\n", 
+                //        chan, channelMaskedCounts[chan], 
+                //        (float)channelMaskedCounts[chan]/nsamp*100);
             } else {
                 printf("Warning: Memory allocation failed for channel %d substitution\n", chan);
             }
@@ -2283,9 +2659,9 @@ void applyKillThreshAndSubstitution(float *data, int *globalMask, int nsamp, int
             free(randomIndices);
         } else if (channelActions[chan] == 2) {
             // Skipped due to localized RFI
-            printf("Channel %d: skipped substitution (localized RFI, %d/%d pixels, %.2f%%)\n", 
-                   chan, channelMaskedCounts[chan], nsamp, 
-                   (float)channelMaskedCounts[chan]/nsamp*100);
+            // printf("Channel %d: skipped substitution (localized RFI, %d/%d pixels, %.2f%%)\n", 
+            //        chan, channelMaskedCounts[chan], nsamp, 
+            //        (float)channelMaskedCounts[chan]/nsamp*100);
         }
     }
     
@@ -2344,12 +2720,16 @@ void identSubstNSigma(
     if (plot)
     {
         printf("=== Generating Channel MAD M_j Histogram (Iteration %d) ===\n", iterationIndex);
-        visualizeChannelMAD(data, nsamp, nchan, 1);
+        // visualizeChannelMAD(data, nsamp, nchan, 1);
+        visualizeChannelStatistics(data, nsamp, nchan, 1, 1);
         printf("=== MAD M_j Histogram Complete ===\n");
         
         printf("=== Generating Channel STD σ_j Histogram (Iteration %d) ===\n", iterationIndex);
-        visualizeChannelStd(data, nsamp, nchan, 1);
+        // visualizeChannelStd(data, nsamp, nchan, 1);
+        visualizeChannelStatistics(data, nsamp, nchan, 1, 0);
         printf("=== STD σ_j Histogram Complete ===\n");
+
+        
     }
     
     // === 1. Channel level flagging first ===

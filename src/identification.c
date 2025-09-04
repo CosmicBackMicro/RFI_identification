@@ -1910,14 +1910,23 @@ void identSubstNSigma(
         
     }
     
-    // === 1. Channel level flagging first ===
+    // === 1. Point interference detection first ===
+    printf("=== Performing point-level (pixel) outlier detection ===\n");
+    int pixelOutliers = 0;
+    int *channel_fully_flagged_temp = (int *)calloc(nchan, sizeof(int)); // Temporary array, all zeros initially
+    pixelOutliers = performChannelLevelDetection(data, nsamp, nchan, Nsigma, 
+                                                horizontalMask, channel_fully_flagged_temp);
+    free(channel_fully_flagged_temp);
+    printf("Point-level detection: flagged %d outlier pixels\n", pixelOutliers);
+    
+    // === 2. Channel level flagging second ===
     float *channel_stds = (float *)malloc(nchan * sizeof(float));
     float *channel_stds_temp = (float *)malloc(nchan * sizeof(float));
     flagChannelsByStdOutliers(data, nsamp, nchan, horizontalMask, channel_stds, channel_stds_temp, channel_std_threshold);
     free(channel_stds);
     free(channel_stds_temp);
     
-    // Check which channels are fully flagged after channel-level detection
+    // Check which channels are fully flagged after both detections
     int fully_flagged_channels = 0;
     int *channel_fully_flagged = (int *)calloc(nchan, sizeof(int));
     for (i = 0; i < nchan; i++) {
@@ -1932,21 +1941,11 @@ void identSubstNSigma(
             fully_flagged_channels++;
         }
     }
-    printf("Channel-level flagging: %d/%d channels fully flagged (%.2f%%), skipping pixel-level detection for these\n", 
+    printf("Combined detection: %d/%d channels fully flagged (%.2f%%)\n", 
            fully_flagged_channels, nchan, (float)fully_flagged_channels/nchan*100);
     
 
     // subtractChannelMedians(data, nsamp, nchan);
-
-    // === 2. Channel-internal pixel flagging ===
-    printf("=== Performing channel-level outlier detection ===\n");
-    int channelOutliers = performChannelLevelDetection(data, nsamp, nchan, Nsigma, 
-                                                     horizontalMask, channel_fully_flagged);
-    printf("Channel-level detection: flagged %d outlier pixels\n", channelOutliers);
-    
-    free(good_samples);
-    free(random_indices);
-    free(channel_fully_flagged);
 
     // === 3. Copy horizontal mask to global mask (vertical detection removed for efficiency) ===
     int horizontalFlagged = 0;
@@ -1957,7 +1956,7 @@ void identSubstNSigma(
     }
     
     printf("\n=== RFI Detection Statistics ===\n");
-    printf("Channel-level mask flagged: %d/%d pixels (%.4f%%)\n", 
+    printf("Combined (point+channel) mask flagged: %d/%d pixels (%.4f%%)\n", 
            horizontalFlagged, nsamp*nchan, (float)horizontalFlagged/(nsamp*nchan)*100);
     printf("Global mask flagged: %d/%d pixels (%.4f%%)\n", 
            horizontalFlagged, nsamp*nchan, (float)horizontalFlagged/(nsamp*nchan)*100);
@@ -1983,7 +1982,7 @@ void identSubstNSigma(
     printf("binarySIR filtering: %d -> %d flagged pixels (removed %d isolated pixels)\n", 
            flaggedBeforeSIR, flaggedAfterSIR, flaggedBeforeSIR - flaggedAfterSIR);
 
-    // === 3. Combined killThresh Analysis and Pixel Substitution ===
+    // === 4. Combined killThresh Analysis and Pixel Substitution ===
     int killedChannels, localRFISkipped, totalFlaggedAfter, pixelsSubstituted;
     applyKillThreshAndSubstitution(data, globalMask, nsamp, nchan, killThresh, flaggedAfterSIR,
                                   &killedChannels, &localRFISkipped, &totalFlaggedAfter, 
@@ -1994,7 +1993,7 @@ void identSubstNSigma(
     findMeanStd(median_temp, nsamp * nchan, &finalMedian_temp, &finalStd_temp);
     float finalMedian_value = median(median_temp, nsamp * nchan);
 
-    float outlierRatio = (float)channelOutliers / (nsamp * nchan);
+    float outlierRatio = (float)pixelOutliers / (nsamp * nchan);
     if (outlierRatio > killThresh)
     {
         printf("WARNING: High outlier ratio %.4f > %.2f detected - data may be corrupted\n",
@@ -2004,6 +2003,10 @@ void identSubstNSigma(
     *finalMedian = finalMedian_value;
     *finalStd = finalStd_temp;
 
+    // Clean up allocated memory
+    free(good_samples);
+    free(random_indices);
+    free(channel_fully_flagged);
     free(median_temp);
 
     printf("### DEBUG: identSubstNSigma exiting with finalMedian=%.6f, finalStd=%.6f ###\n", *finalMedian, *finalStd);

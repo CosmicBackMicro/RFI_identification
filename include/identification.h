@@ -24,16 +24,12 @@ void binarySIR(int *mask, int nsamp, int nchan, int win_samp, int win_chan, floa
 void flagChannelsByMeanOutliers(float *data, int nsamp, int nchan, int *horizontalMask,
                                float *channel_means, float *channel_means_temp);
 void flagChannelsByStdOutliers(float *data, int nsamp, int nchan, int *horizontalMask,
-                              float *channel_stds, float *channel_stds_temp);
+                              float *channel_stds, float *channel_stds_temp, float channel_std_threshold);
 
 void normalizeChannelData(float *data, int nsamp, int nchan, 
                          float *finalMedian, float *finalStd, float *median_temp);
 
 void subtractChannelMedians(float *data, int nsamp, int nchan);
-
-void visualizeChannelMAD(float *data, int nsamp, int nchan, int plot);
-
-void visualizeChannelStd(float *data, int nsamp, int nchan, int plot);
 
 void printThresholdStatistics(const float *channel_values, int nchan, 
                              const float *thresh_values, const char **threshold_names, 
@@ -51,6 +47,6 @@ void applyKillThreshAndSubstitution(float *data, int *globalMask, int nsamp, int
 
 void identSubstNSigma(
     float *data, int nsamp, int nchan, 
-    float Nsigma, int iterationIndex, int plot,
+    float Nsigma, float channel_std_threshold, int iterationIndex, int plot,
     int *horizontalMask, int *verticalMask, int *globalMask,
     float *finalMedian, float *finalStd, int cudaReady);

@@ -806,10 +806,11 @@ int main(int argc, char *argv[])
 
 
 
-            float NSigma = 2.5f;
+            float NSigmaInChan = 2.0f;
+            float NSigmaOutChan = 3.0f;
             if (m.doSubstitution)
             {
-                identSubstNSigma(outDataT, nsampBinned, nchanBinned, NSigma, ii, m.plot,
+                identSubstNSigma(outDataT, nsampBinned, nchanBinned, NSigmaInChan, NSigmaOutChan, ii, m.plot,
                                  horizontalMask, verticalMask, globalMask, finalMedian, finalStd, m.cudaReady);
             }
             if (writeMasks)

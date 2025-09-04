@@ -74,7 +74,7 @@ int parseCommandLineArguments(int argc, char *argv[], Metadata *m) {
     m->enableCuda = 1;  // Default: enable CUDA if available
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "i:S:d:s:t:f:r:e:M:p:n:P:W:c:h", long_options, NULL))) {
+    while ((opt = getopt_long(argc, argv, "i:S:d:s:t:f:r:e:M:p:n:P:W:c:T:h", long_options, NULL))) {
         if (opt == -1) break;
 
         switch (opt) {

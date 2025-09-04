@@ -736,7 +736,7 @@ void flagChannelsByMeanOutliers(float *data, int nsamp, int nchan, int *horizont
 /// @param horizontalMask Output mask to mark flagged channels
 /// @param channel_stds Pre-allocated array to store channel standard deviations
 /// @param channel_stds_temp Pre-allocated temporary array for median calculation
-void flagChannelsByStdOutliers(float *data, int nsamp, int nchan, int *horizontalMask,
+void outChannelDetection(float *data, int nsamp, int nchan, int *horizontalMask,
                               float *channel_stds, float *channel_stds_temp, float channel_std_threshold)
 {
     int i, j;
@@ -1367,7 +1367,7 @@ void flagChannelsByDualSumThreshold(
  * @param random_indices Temporary array for random indices (nsamp length)
  * @return Total number of outliers detected
  */
-int iterativeChannelOutlierDetection(float *data, int nsamp, float Nsigma, 
+int inChanOutlierIter(float *data, int nsamp, float Nsigma, 
                                    int *mask, float *median_temp,
                                    int *good_samples, int *random_indices)
 {
@@ -1513,7 +1513,7 @@ int iterativeTimeSampleOutlierDetection(float *data, int nchan, float Nsigma,
  * @param channel_fully_flagged Array indicating which channels are fully flagged
  * @return Total number of outliers detected across all channels
  */
-int performChannelLevelDetection(float *data, int nsamp, int nchan, float Nsigma,
+int inChanDetection(float *data, int nsamp, int nchan, float Nsigma,
                                int *horizontalMask, int *channel_fully_flagged)
 {
     int totalOutliers = 0;
@@ -1529,13 +1529,8 @@ int performChannelLevelDetection(float *data, int nsamp, int nchan, float Nsigma
         #pragma omp for
         for (i = 0; i < nchan; i++)
         {
-            // Skip this channel if it's already fully flagged
-            if (channel_fully_flagged[i]) {
-                continue;
-            }
-            
             // Perform iterative outlier detection for this channel
-            int channelOutliers = iterativeChannelOutlierDetection(
+            int channelOutliers = inChanOutlierIter(
                 data + i * nsamp, nsamp, Nsigma,
                 horizontalMask + i * nsamp, median_temp,
                 good_samples, random_indices
@@ -1914,7 +1909,7 @@ void identSubstNSigma(
     printf("=== Performing point-level (pixel) outlier detection ===\n");
     int pixelOutliers = 0;
     int *channel_fully_flagged_temp = (int *)calloc(nchan, sizeof(int)); // Temporary array, all zeros initially
-    pixelOutliers = performChannelLevelDetection(data, nsamp, nchan, Nsigma, 
+    pixelOutliers = inChanDetection(data, nsamp, nchan, Nsigma, 
                                                 horizontalMask, channel_fully_flagged_temp);
     free(channel_fully_flagged_temp);
     printf("Point-level detection: flagged %d outlier pixels\n", pixelOutliers);
@@ -1922,7 +1917,7 @@ void identSubstNSigma(
     // === 2. Channel level flagging second ===
     float *channel_stds = (float *)malloc(nchan * sizeof(float));
     float *channel_stds_temp = (float *)malloc(nchan * sizeof(float));
-    flagChannelsByStdOutliers(data, nsamp, nchan, horizontalMask, channel_stds, channel_stds_temp, channel_std_threshold);
+    outChannelDetection(data, nsamp, nchan, horizontalMask, channel_stds, channel_stds_temp, channel_std_threshold);
     free(channel_stds);
     free(channel_stds_temp);
     

@@ -23,7 +23,7 @@ void binarySIR(int *mask, int nsamp, int nchan, int win_samp, int win_chan, floa
 
 void flagChannelsByMeanOutliers(float *data, int nsamp, int nchan, int *horizontalMask,
                                float *channel_means, float *channel_means_temp);
-void outChannelDetection(float *data, int nsamp, int nchan, int *horizontalMask,
+void outChanDetection(float *data, int nsamp, int nchan, int *horizontalMask,
                               float *channel_stds, float *channel_stds_temp, float channel_std_threshold);
 
 void normalizeChannelData(float *data, int nsamp, int nchan, 
@@ -39,11 +39,6 @@ void drawUnifiedThresholdLines(const float *thresh_values, const char **threshol
                               const int *threshold_colors, const float *threshold_y_positions,
                               const int *threshold_enabled, int num_thresholds,
                               float max_count, float x_min, float x_max);
-
-void applyKillThreshAndSubstitution(float *data, int *globalMask, int nsamp, int nchan, 
-                                   float killThresh, int flaggedBefore,
-                                   int *killedChannels, int *localRFISkippedPtr, 
-                                   int *totalFlaggedAfter, int *pixelsSubstituted);
 
 void identSubstNSigma(
     float *data, int nsamp, int nchan, 

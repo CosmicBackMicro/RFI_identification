@@ -364,11 +364,12 @@ void sumthreshold_1d(
     const int eta_len = 1;
     const float eta_i[] = {1.0f};
 
-    // Pre-compute M and chi_i values
+    // Pre-compute M and chi_i values (corrected formula)
     int i, j, e, m;
     for (i = 0; i < M_len; i++) {
-        M[i] = powf(2.0f, (float)i);
-        chi_i[i] = chi_1 / powf(p, log2f(M[i]));
+        int m_val = i + 1;  // m starts from 1
+        M[i] = powf(2.0f, (float)(m_val - 1));  // M = 2^(m-1): 1, 2, 4, 8, 16, 32
+        chi_i[i] = chi_1 / powf(p, log2f((float)m_val));  // Use m_val instead of M[i]
     }
 
     memcpy(temp_data, data, length * sizeof(float));
@@ -381,23 +382,32 @@ void sumthreshold_1d(
             int window = (int)M[m];
             float threshold = chi_i[m] / current_eta;
 
-            // Window processing
-            for (i = 0; i <= length - window; i++) {
-                float sum = 0.0f;
-                int count = 0;
-
-                // Calculate sum and count
-                for (j = 0; j < window; j++) {
-                    if (!mask[i + j]) {
-                        sum += fabsf(temp_data[i + j]);
-                        count++;
+            if (window == 1) {
+                // Special case for m=1: direct threshold comparison
+                for (i = 0; i < length; i++) {
+                    if (!mask[i] && fabsf(temp_data[i]) > threshold) {
+                        local_mask[i] = 1;
                     }
                 }
+            } else {
+                // Window processing for m > 1
+                for (i = 0; i <= length - window; i++) {
+                    float sum = 0.0f;
+                    int count = 0;
 
-                // Apply threshold
-                if (count > 0 && (sum / count) > threshold) {
+                    // Calculate sum and count
                     for (j = 0; j < window; j++) {
-                        local_mask[i + j] = 1;
+                        if (!mask[i + j]) {
+                            sum += fabsf(temp_data[i + j]);
+                            count++;
+                        }
+                    }
+
+                    // Apply threshold
+                    if (count > 0 && (sum / count) > threshold) {
+                        for (j = 0; j < window; j++) {
+                            local_mask[i + j] = 1;
+                        }
                     }
                 }
             }
@@ -445,18 +455,65 @@ void sumthreshold_2d(
         findMeanStd(&temp_dataT[i * nsamp], nsamp, &means[i], &stds[i]);
     }
 
-    // Global normalization
+    // Global normalization and background removal
     float global_mean, global_std;
     findMeanStd(temp_dataT, nsamp * nchan, &global_mean, &global_std);
-    float chi_1 = timesOfSigma * ksigma_2d(temp_dataT, mask_chanRFI, nsamp, nchan);
-
-    // Normalize data
+    
+    // Background removal using Gaussian smoothing (parameters from Python reference)
+    float *smoothed_data = (float *)malloc(nsamp * nchan * sizeof(float));
+    
+    // Gaussian smoothing parameters (matching sum_threshold.py)
+    float sigma_m = 7.5f;   // SIGMA_M: time axis (samples)
+    float sigma_n = 15.0f;  // SIGMA_N: frequency axis (channels)
+    int kernel_m = 40;      // KERNEL_M: time axis kernel size
+    int kernel_n = 20;      // KERNEL_N: frequency axis kernel size
+    
+    // Pre-compute Gaussian kernel for time axis (sigma_m)
+    int half_kernel_m = kernel_m / 2;
+    float *gaussian_kernel_m = (float *)malloc(kernel_m * sizeof(float));
+    float kernel_sum_m = 0.0f;
+    for (int k = 0; k < kernel_m; k++) {
+        int offset = k - half_kernel_m;
+        gaussian_kernel_m[k] = expf(-(offset * offset) / (2.0f * sigma_m * sigma_m));
+        kernel_sum_m += gaussian_kernel_m[k];
+    }
+    // Normalize kernel
+    for (int k = 0; k < kernel_m; k++) {
+        gaussian_kernel_m[k] /= kernel_sum_m;
+    }
+    
+    // Apply Gaussian smoothing along time axis (for each channel)
+    #pragma omp parallel for
+    for (j = 0; j < nchan; j++) {
+        for (i = 0; i < nsamp; i++) {
+            float weighted_sum = 0.0f;
+            float weight_sum = 0.0f;
+            
+            for (int k = 0; k < kernel_m; k++) {
+                int sample_idx = i + k - half_kernel_m;
+                if (sample_idx >= 0 && sample_idx < nsamp && !mask_chanRFI[j * nsamp + sample_idx]) {
+                    weighted_sum += temp_dataT[j * nsamp + sample_idx] * gaussian_kernel_m[k];
+                    weight_sum += gaussian_kernel_m[k];
+                }
+            }
+            smoothed_data[j * nsamp + i] = (weight_sum > 0) ? weighted_sum / weight_sum : temp_dataT[j * nsamp + i];
+        }
+    }
+    
+    free(gaussian_kernel_m);
+    
+    // Use residual data for thresholding
     #pragma omp parallel for collapse(2)
     for (j = 0; j < nchan; j++) {
         for (i = 0; i < nsamp; i++) {
-            temp_dataT[j * nsamp + i] = (temp_dataT[j * nsamp + i] - global_mean) / (global_std + 1e-6f);
+            temp_dataT[j * nsamp + i] = (temp_dataT[j * nsamp + i] - smoothed_data[j * nsamp + i]) / (global_std + 1e-6f);
         }
     }
+    
+    free(smoothed_data);
+    
+    // Calculate chi_1 after background removal
+    float chi_1 = timesOfSigma * ksigma_2d(temp_dataT, mask_chanRFI, nsamp, nchan);
 
     // Time-axis processing with optimized 1D
     #pragma omp parallel for
@@ -736,7 +793,7 @@ void flagChannelsByMeanOutliers(float *data, int nsamp, int nchan, int *horizont
 /// @param horizontalMask Output mask to mark flagged channels
 /// @param channel_stds Pre-allocated array to store channel standard deviations
 /// @param channel_stds_temp Pre-allocated temporary array for median calculation
-void outChannelDetection(float *data, int nsamp, int nchan, int *horizontalMask,
+void outChanDetection(float *data, int nsamp, int nchan, int *horizontalMask,
                               float *channel_stds, float *channel_stds_temp, float channel_std_threshold)
 {
     int i, j;
@@ -1430,80 +1487,6 @@ int inChanOutlierIter(float *data, int nsamp, float Nsigma,
 }
 
 /**
- * @brief Perform iterative outlier detection and flagging for a single time sample
- * @param data Time sample data array (nchan length) 
- * @param nchan Number of channels in the time sample
- * @param Nsigma Sigma threshold for outlier detection
- * @param mask Output mask for this time sample (nchan length)
- * @param median_temp Temporary array for median calculation (nchan length)
- * @param good_samples Temporary array for good sample indices (nchan length)
- * @param random_indices Temporary array for random indices (nchan length)
- * @return Total number of outliers detected
- */
-int iterativeTimeSampleOutlierDetection(float *data, int nchan, float Nsigma,
-                                       int *mask, float *median_temp,
-                                       int *good_samples, int *random_indices)
-{
-    float lastMean = 0.0f, lastStd = 0.0f;
-    float mean = 0.0f, std = 0.0f, med = 0.0f;
-    float meanDiff = 0.0f, stdDiff = 0.0f;
-    float upperBound, lowerBound;
-    
-    int totReplaceCnt = 0;
-    int iter = 0;
-    const int maxIterations = 3;
-    
-    // Copy data for median calculation
-    memcpy(median_temp, data, nchan * sizeof(float));
-    
-    while (iter < maxIterations)
-    {
-        lastMean = mean;
-        lastStd = std;
-        
-        // Calculate statistics
-        findMeanStd(data, nchan, &mean, &std);
-        med = median(median_temp, nchan);
-        
-        // Calculate convergence metrics
-        if (iter > 0) {
-            meanDiff = (lastMean != 0.0f) ? fabsf(mean - lastMean) / fabsf(lastMean) : 0.0f;
-            stdDiff = (lastStd != 0.0f) ? fabsf(std - lastStd) / fabsf(lastStd) : 0.0f;
-            // medianDiff removed (not used in convergence condition)
-        }
-        
-        // Calculate bounds (using scale factor of 1.0 for time samples)
-        float scale_col = 1.0f;
-        upperBound = med + Nsigma * scale_col * std;
-        lowerBound = med - Nsigma * scale_col * std;
-        
-        // Flag outliers
-    int newOutliers = 0;
-    int j;
-    for (j = 0; j < nchan; j++)
-        {
-            if (data[j] > upperBound || data[j] < lowerBound)
-            {
-                if (mask[j] == 0) {
-                    newOutliers++;
-                    totReplaceCnt++;
-                }
-                mask[j] = 1;
-            }
-        }
-        
-        // Check for convergence
-        if (newOutliers == 0 || (iter > 0 && meanDiff < 0.001f && stdDiff < 0.001f)) {
-            break;
-        }
-        
-        iter++;
-    }
-    
-    return totReplaceCnt;
-}
-
-/**
  * @brief Perform channel-level outlier detection using extracted iterative functions
  * @param data Input data array (nsamp * nchan)
  * @param nsamp Number of samples per channel
@@ -1537,49 +1520,6 @@ int inChanDetection(float *data, int nsamp, int nchan, float Nsigma,
             );
             
             totalOutliers += channelOutliers;
-        }
-        
-        free(median_temp);
-        free(good_samples);
-        free(random_indices);
-    }
-    
-    return totalOutliers;
-}
-
-/**
- * @brief Perform time-sample-level outlier detection using extracted iterative functions
- * @param data Input transposed data array (nsamp * nchan, but accessed as nchan * nsamp)
- * @param nsamp Number of time samples
- * @param nchan Number of channels per time sample
- * @param Nsigma Sigma threshold for outlier detection
- * @param verticalMask Output vertical mask array (transposed layout)
- * @return Total number of outliers detected across all time samples
- */
-int performTimeSampleLevelDetection(float *data, int nsamp, int nchan, float Nsigma,
-                                  int *verticalMask)
-{
-    int totalOutliers = 0;
-    
-    // Allocate temporary arrays for each thread
-    #pragma omp parallel reduction(+:totalOutliers)
-    {
-        float *median_temp = (float *)malloc(nchan * sizeof(float));
-        int *good_samples = (int *)malloc(nchan * sizeof(int));
-        int *random_indices = (int *)malloc(nchan * sizeof(int));
-        int i;
-        
-        #pragma omp for
-        for (i = 0; i < nsamp; i++)
-        {
-            // Perform iterative outlier detection for this time sample
-            int sampleOutliers = iterativeTimeSampleOutlierDetection(
-                data + i * nchan, nchan, Nsigma,
-                verticalMask + i * nchan, median_temp,
-                good_samples, random_indices
-            );
-            
-            totalOutliers += sampleOutliers;
         }
         
         free(median_temp);
@@ -1719,155 +1659,61 @@ void printKillThreshSummary(int killedChannels, int localRFISkipped, int totalFl
 }
 
 /**
- * @brief Apply combined killThresh analysis and pixel substitution
- * For channels exceeding killThresh: mark entire channel if range criteria met
- * For channels below killThresh: perform pixel-level substitution
+ * @brief Apply pixel substitution for flagged pixels in channels not killed by killThresh
  * @param data Data array (will be modified for pixel substitution)
- * @param globalMask RFI mask array (will be modified for killed channels)
+ * @param globalMask RFI mask array (input only, not modified)
  * @param nsamp Number of time samples
  * @param nchan Number of channels
- * @param killThresh Threshold ratio for considering channel killing
- * @param flaggedBefore Number of flagged pixels before processing
- * @param killedChannels Output: number of channels killed
- * @param localRFISkipped Output: number of channels skipped due to localized RFI
- * @param totalFlaggedAfter Output: total flagged pixels after processing
- * @param pixelsSubstituted Output: number of pixels substituted (not including killed channels)
+ * @param pixelsSubstituted Output: number of pixels substituted
  */
-void applyKillThreshAndSubstitution(float *data, int *globalMask, int nsamp, int nchan, 
-                                   float killThresh, int flaggedBefore,
-                                   int *killedChannels, int *localRFISkippedPtr, 
-                                   int *totalFlaggedAfter, int *pixelsSubstituted)
+void applySubstitution(float *data, int *globalMask, int nsamp, int nchan, int *pixelsSubstituted)
 {
-    *killedChannels = 0;
-    *localRFISkippedPtr = 0;
-    *totalFlaggedAfter = 0;
     *pixelsSubstituted = 0;
-    float rangeThreshold = 0.5f;  // If flagged pixels span <50% of channel, don't kill entire channel
+    printf("\n=== Pixel Substitution ===\n");
     
-    printf("\n=== Combined killThresh Analysis and Pixel Substitution (threshold=%.3f) ===\n", killThresh);
-    
-    // Allocate arrays for per-channel processing
-    int *channelActions = (int *)calloc(nchan, sizeof(int)); // 0=substitute, 1=kill, 2=skip
-    int *channelMaskedCounts = (int *)malloc(nchan * sizeof(int));
-    
-    // Use local variables for OpenMP reduction
-    int localKilledChannels = 0;
-    int localRFISkipped = 0;
-    
-    // First pass: analyze each channel and decide action
-    int chan;
-    #pragma omp parallel for reduction(+:localKilledChannels,localRFISkipped)
-    for (chan = 0; chan < nchan; chan++) {
-        int maskedCount = 0;
-        int firstFlagged = -1, lastFlagged = -1;
-        int samp;
-        
-        // Count flagged pixels and find range
-        for (samp = 0; samp < nsamp; samp++) {
-            int idx = samp + chan * nsamp;
-            if (globalMask[idx]) {
-                maskedCount++;
-                if (firstFlagged == -1) firstFlagged = samp;
-                lastFlagged = samp;
-            }
-        }
-        
-        channelMaskedCounts[chan] = maskedCount;
-        float maskedRatio = (float)maskedCount / nsamp;
-        
-        if (maskedRatio > killThresh) {
-            if (firstFlagged != -1 && lastFlagged != -1) {
-                int flaggedRange = lastFlagged - firstFlagged + 1;
-                float rangeRatio = (float)flaggedRange / nsamp;
-                
-                if (rangeRatio >= rangeThreshold) {
-                    channelActions[chan] = 1; // Kill entire channel
-                    localKilledChannels++;
-                } else {
-                    channelActions[chan] = 2; // Skip (localized RFI)
-                    localRFISkipped++;
-                }
-            } else {
-                channelActions[chan] = 1; // Kill entire channel
-                localKilledChannels++;
-            }
-        } else {
-            channelActions[chan] = 0; // Substitute pixels
-        }
-    }
-    
-    // Second pass: apply actions
     int localPixelsSubstituted = 0;
     
-    for (chan = 0; chan < nchan; chan++) {
-        if (channelActions[chan] == 1) {
-            // Kill entire channel
-            for (int samp = 0; samp < nsamp; samp++) {
-                int idx = samp + chan * nsamp;
-                globalMask[idx] = 1;
+    #pragma omp parallel for reduction(+:localPixelsSubstituted)
+    for (int chan = 0; chan < nchan; chan++) {
+        // Count masked pixels in this channel
+        int channelMaskedCount = 0;
+        for (int samp = 0; samp < nsamp; samp++) {
+            int idx = samp + chan * nsamp;
+            if (globalMask[idx] == 1) {
+                channelMaskedCount++;
             }
-            // printf("Channel %d: killed entire channel (%d/%d pixels, %.2f%%)\n", 
-            //        chan, channelMaskedCounts[chan], nsamp, 
-            //        (float)channelMaskedCounts[chan]/nsamp*100);
-        } else if (channelActions[chan] == 0 && channelMaskedCounts[chan] > 0) {
-            // Substitute pixels in this channel only
-            float *channelData = data + chan * nsamp;
-            int *channelMask = globalMask + chan * nsamp;
-            
-            // Allocate temporary arrays for this channel
-            int *goodSamples = (int *)malloc(nsamp * sizeof(int));
-            int *randomIndices = (int *)malloc(nsamp * sizeof(int));
-            
-            if (goodSamples && randomIndices) {
-                substPixels(channelData, nsamp, channelMask, goodSamples, randomIndices);
-                localPixelsSubstituted += channelMaskedCounts[chan];
-                // printf("Channel %d: substituted %d pixels (%.2f%%)\n", 
-                //        chan, channelMaskedCounts[chan], 
-                //        (float)channelMaskedCounts[chan]/nsamp*100);
-            } else {
-                printf("Warning: Memory allocation failed for channel %d substitution\n", chan);
-            }
-            
-            free(goodSamples);
-            free(randomIndices);
-        } else if (channelActions[chan] == 2) {
-            // Skipped due to localized RFI
-            // printf("Channel %d: skipped substitution (localized RFI, %d/%d pixels, %.2f%%)\n", 
-            //        chan, channelMaskedCounts[chan], nsamp, 
-            //        (float)channelMaskedCounts[chan]/nsamp*100);
         }
+        
+        // Skip channels with no flagged pixels
+        if (channelMaskedCount == 0) continue;
+        
+        // Skip channels that are fully flagged (killed by killThresh)
+        if (channelMaskedCount == nsamp) continue;
+        
+        // Substitute pixels in this channel
+        float *channelData = data + chan * nsamp;
+        int *channelMask = globalMask + chan * nsamp;
+        
+        // Allocate temporary arrays for this channel
+        int *goodSamples = (int *)malloc(nsamp * sizeof(int));
+        int *randomIndices = (int *)malloc(nsamp * sizeof(int));
+        
+        if (goodSamples && randomIndices) {
+            substPixels(channelData, nsamp, channelMask, goodSamples, randomIndices);
+            localPixelsSubstituted += channelMaskedCount;
+        } else {
+            printf("Warning: Memory allocation failed for channel %d substitution\n", chan);
+        }
+        
+        free(goodSamples);
+        free(randomIndices);
     }
     
-    // Assign local variables to output parameters
-    *killedChannels = localKilledChannels;
-    *localRFISkippedPtr = localRFISkipped;
     *pixelsSubstituted = localPixelsSubstituted;
     
-    // Count total flagged pixels after processing
-    int idx;
-    for (idx = 0; idx < nsamp * nchan; idx++) {
-        if (globalMask[idx] == 1) (*totalFlaggedAfter)++;
-    }
-    
-    // Print summary
-    printf("\nCombined Processing Summary:\n");
-    printf("  - Channels killed: %d/%d (%.2f%%)\n", *killedChannels, nchan, 
-           (float)(*killedChannels)/nchan*100);
-    printf("  - Channels with pixel substitution: %d/%d\n", 
-           nchan - *killedChannels - *localRFISkippedPtr, nchan);
-    printf("  - Channels skipped (localized RFI): %d/%d (%.2f%%)\n", 
-           *localRFISkippedPtr, nchan, (float)(*localRFISkippedPtr)/nchan*100);
+    printf("Substitution Summary:\n");
     printf("  - Pixels substituted: %d\n", *pixelsSubstituted);
-    printf("  - Flagged pixels before: %d/%d (%.2f%%)\n", flaggedBefore, nsamp*nchan, 
-           (float)flaggedBefore/(nsamp*nchan)*100);
-    printf("  - Flagged pixels after: %d/%d (%.2f%%)\n", *totalFlaggedAfter, nsamp*nchan, 
-           (float)(*totalFlaggedAfter)/(nsamp*nchan)*100);
-    printf("  - Additional pixels flagged: %d\n", *totalFlaggedAfter - flaggedBefore);
-    printf("=== End Combined Processing ===\n\n");
-    
-    // Clean up
-    free(channelActions);
-    free(channelMaskedCounts);
+    printf("=== End Pixel Substitution ===\n\n");
 }
 
 void identSubstNSigma(
@@ -1905,7 +1751,7 @@ void identSubstNSigma(
         
     }
     
-    // === 1. Point interference detection first ===
+    // === 1. inChannel Detection ===
     printf("=== Performing point-level (pixel) outlier detection ===\n");
     int pixelOutliers = 0;
     int *channel_fully_flagged_temp = (int *)calloc(nchan, sizeof(int)); // Temporary array, all zeros initially
@@ -1914,14 +1760,36 @@ void identSubstNSigma(
     free(channel_fully_flagged_temp);
     printf("Point-level detection: flagged %d outlier pixels\n", pixelOutliers);
     
-    // === 2. Channel level flagging second ===
+    // === 2. inChannel Pixel Substitution ===
+    int inChanPixelsSubstituted;
+    applySubstitution(data, horizontalMask, nsamp, nchan, &inChanPixelsSubstituted);
+    printf("inChannel substitution: replaced %d pixels\n", inChanPixelsSubstituted);
+    
+    // === 3. killThresh Analysis ===
+    // Count flagged pixels before killThresh
+    int flaggedBeforeKillThresh = 0;
+    for (int idx_local = 0; idx_local < nsamp * nchan; idx_local++) {
+        if (horizontalMask[idx_local] == 1) flaggedBeforeKillThresh++;
+    }
+    
+    int killedChannels, localRFISkipped, totalFlaggedAfter;
+    applyKillThresh(horizontalMask, nsamp, nchan, killThresh, flaggedBeforeKillThresh,
+                   &killedChannels, &localRFISkipped, &totalFlaggedAfter);
+    
+    // === 4. outChannel Detection ===
+    printf("=== Performing channel-level outlier detection ===\n");
     float *channel_stds = (float *)malloc(nchan * sizeof(float));
     float *channel_stds_temp = (float *)malloc(nchan * sizeof(float));
-    outChannelDetection(data, nsamp, nchan, horizontalMask, channel_stds, channel_stds_temp, channel_std_threshold);
+    outChanDetection(data, nsamp, nchan, horizontalMask, channel_stds, channel_stds_temp, channel_std_threshold);
     free(channel_stds);
     free(channel_stds_temp);
     
-    // Check which channels are fully flagged after both detections
+    // === 5. outChannel Pixel Substitution ===
+    int outChanPixelsSubstituted;
+    applySubstitution(data, horizontalMask, nsamp, nchan, &outChanPixelsSubstituted);
+    printf("outChannel substitution: replaced %d pixels\n", outChanPixelsSubstituted);
+    
+    // Check which channels are fully flagged after all detections
     int fully_flagged_channels = 0;
     int *channel_fully_flagged = (int *)calloc(nchan, sizeof(int));
     for (i = 0; i < nchan; i++) {
@@ -1936,7 +1804,7 @@ void identSubstNSigma(
             fully_flagged_channels++;
         }
     }
-    printf("Combined detection: %d/%d channels fully flagged (%.2f%%)\n", 
+    printf("Final status: %d/%d channels fully flagged (%.2f%%)\n", 
            fully_flagged_channels, nchan, (float)fully_flagged_channels/nchan*100);
     
 
@@ -1957,36 +1825,21 @@ void identSubstNSigma(
            horizontalFlagged, nsamp*nchan, (float)horizontalFlagged/(nsamp*nchan)*100);
     printf("=== End RFI Detection Statistics ===\n");
 
-    // Apply binarySIR before killThresh analysis to filter isolated pixels for better range calculation
-    printf("\n=== Applying binarySIR filtering before killThresh analysis ===\n");
-    int flaggedBeforeSIR = horizontalFlagged;
-    
-    // Use CUDA-accelerated binarySIR if available
-    if (cudaReady) {
-        printf("Using CUDA-accelerated binarySIR filtering for killThresh analysis...\n");
-        cuda_binarySIR(globalMask, nsamp, nchan, 3, 3, 1.0f, 0.2f);
-    } else {
-        binarySIR(globalMask, nsamp, nchan, 3, 3, 1.0f, 0.2f); // Filter out isolated pixels
-    }
-    
-    // Recount flagged pixels after binarySIR
-    int flaggedAfterSIR = 0;
-    for (idx = 0; idx < nsamp * nchan; idx++) {
-        if (globalMask[idx] == 1) flaggedAfterSIR++;
-    }
-    printf("binarySIR filtering: %d -> %d flagged pixels (removed %d isolated pixels)\n", 
-           flaggedBeforeSIR, flaggedAfterSIR, flaggedBeforeSIR - flaggedAfterSIR);
-
-    // === 4. Combined killThresh Analysis and Pixel Substitution ===
-    int killedChannels, localRFISkipped, totalFlaggedAfter, pixelsSubstituted;
-    applyKillThreshAndSubstitution(data, globalMask, nsamp, nchan, killThresh, flaggedAfterSIR,
-                                  &killedChannels, &localRFISkipped, &totalFlaggedAfter, 
-                                  &pixelsSubstituted);
+    // Copy horizontalMask to globalMask for final output
+    memcpy(globalMask, horizontalMask, nsamp * nchan * sizeof(int));
 
     // Calculate final statistics for experimental function output
     float finalMedian_temp, finalStd_temp;
     findMeanStd(median_temp, nsamp * nchan, &finalMedian_temp, &finalStd_temp);
     float finalMedian_value = median(median_temp, nsamp * nchan);
+
+    // Calculate total pixels substituted
+    int totalPixelsSubstituted = inChanPixelsSubstituted + outChanPixelsSubstituted;
+    printf("\n=== Final Processing Summary ===\n");
+    printf("  - inChannel pixels substituted: %d\n", inChanPixelsSubstituted);
+    printf("  - outChannel pixels substituted: %d\n", outChanPixelsSubstituted);
+    printf("  - Total pixels substituted: %d\n", totalPixelsSubstituted);
+    printf("  - Channels killed by killThresh: %d\n", killedChannels);
 
     float outlierRatio = (float)pixelOutliers / (nsamp * nchan);
     if (outlierRatio > killThresh)

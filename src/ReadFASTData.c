@@ -827,15 +827,15 @@ int main(int argc, char *argv[])
 
 
 
-            float timesOfSigma = 20.0f;
+            float timesOfSigma = 8.0f;
             // float timesOfSigma = 8.0f;
             int M_len = 6;
             int win_samp = 3, win_chan = 3;
             float thrup = 0.5f, thrdown = 0.5f;
             if (m.doSumThreshold)
             {
-                // sumthreshold_2d(outDataT, nsampBinned, nchanBinned,
-                //                 mask_chanRFI, mask_ST, timesOfSigma, M_len);
+                sumthreshold_2d(outDataT, nsampBinned, nchanBinned,
+                                mask_chanRFI, mask_ST, timesOfSigma, M_len);
                 // if (m.cudaReady) {
                 //     printf("Using CUDA-accelerated binarySIR filtering...\n");
                 //     cuda_binarySIR(mask_ST, nsampBinned, nchanBinned, win_samp, win_chan, thrup, thrdown);

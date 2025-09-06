@@ -551,6 +551,52 @@ void sumthreshold_2d(
     free(chi_i);
 }
 
+// Function to randomly replace flagged pixels with unflagged pixels from the same time sample
+void randomReplaceRFIPixels(float *data, const int *mask, int nsamp, int nchan)
+{
+    int i, j;
+    
+    // Initialize random seed once
+    srand((unsigned int)time(NULL));
+    
+    #pragma omp parallel for private(j)
+    for (i = 0; i < nsamp; i++) {
+        // For each time sample (column), collect unflagged pixel values
+        float *unflagged_values = (float*)malloc(nchan * sizeof(float));
+        int unflagged_count = 0;
+        
+        // Collect unflagged values in this time sample
+        for (j = 0; j < nchan; j++) {
+            if (!mask[j * nsamp + i]) {
+                unflagged_values[unflagged_count++] = data[j * nsamp + i];
+            }
+        }
+        
+        // If we have unflagged values, use them to replace flagged pixels
+        if (unflagged_count > 0) {
+            // Create thread-local random state for thread safety
+            unsigned int seed = (unsigned int)(i + time(NULL) + omp_get_thread_num());
+            
+            for (j = 0; j < nchan; j++) {
+                if (mask[j * nsamp + i]) {
+                    // Randomly select from unflagged values in this time sample
+                    int random_idx = rand_r(&seed) % unflagged_count;
+                    data[j * nsamp + i] = unflagged_values[random_idx];
+                }
+            }
+        } else {
+            // If no unflagged values in this time sample, set flagged values to 0
+            for (j = 0; j < nchan; j++) {
+                if (mask[j * nsamp + i]) {
+                    data[j * nsamp + i] = 0.0f;
+                }
+            }
+        }
+        
+        free(unflagged_values);
+    }
+}
+
 void writeIndexMaskPNG(int *mask, int nsamp, int nchan, char *filename)
 {
     FILE *fp = fopen(filename, "wb");
@@ -1783,6 +1829,11 @@ void identSubstNSigma(
     outChanDetection(data, nsamp, nchan, horizontalMask, channel_stds, channel_stds_temp, channel_std_threshold);
     free(channel_stds);
     free(channel_stds_temp);
+    
+    // === Random Replacement of flagged pixels ===
+    printf("=== Applying random replacement to flagged pixels ===\n");
+    randomReplaceRFIPixels(data, horizontalMask, nsamp, nchan);
+    printf("Random replacement completed\n");
     
     // === 5. outChannel Pixel Substitution ===
     int outChanPixelsSubstituted;

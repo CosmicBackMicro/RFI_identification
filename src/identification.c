@@ -803,19 +803,25 @@ void binarySIR(
 
 
 
-/// @brief Flag channels based on their standard deviation statistics using MAD-based outlier detection
+/// @brief Flag channels based on their standard deviation statistics using iterative 3-sigma outlier detection
 /// @param data Input data array (nsamp * nchan)
 /// @param nsamp Number of time samples
 /// @param nchan Number of frequency channels
 /// @param horizontalMask Output mask to mark flagged channels
 /// @param channel_stds Pre-allocated array to store channel standard deviations
 /// @param channel_stds_temp Pre-allocated temporary array for median calculation
+/// @param channel_std_threshold Sigma threshold for outlier detection
 void outChanDetection(float *data, int nsamp, int nchan, int *horizontalMask,
                               float *channel_stds, float *channel_stds_temp, float channel_std_threshold)
 {
+    const int MAX_ITERATIONS = 100;   // Maximum iterations for convergence
+    const float STD_CHANGE_THRESHOLD = 0.001f;  // Standard deviation change rate threshold
+    const float MEDIAN_CHANGE_THRESHOLD = 1e-8f;  // Median change threshold
+    
     int i, j;
     
     // Calculate standard deviation for each channel
+    printf("    [DEBUG] outChannel: Calculating channel standard deviations\n");
     for (i = 0; i < nchan; i++)
     {
         float channel_mean, channel_std;
@@ -823,33 +829,122 @@ void outChanDetection(float *data, int nsamp, int nchan, int *horizontalMask,
         channel_stds[i] = channel_std;
     }
     
-    // Calculate statistics of channel standard deviations
-    float std_mean, std_std;
-    findMeanStd(channel_stds, nchan, &std_mean, &std_std);
-    memcpy(channel_stds_temp, channel_stds, nchan * sizeof(float));
-    float std_median = median(channel_stds_temp, nchan);
-    float std_mad = mad(channel_stds, nchan);
-
-
+    // Create a mask for channels (0 = valid, 1 = flagged)
+    int *channel_mask = (int *)calloc(nchan, sizeof(int));
+    float *valid_stds = (float *)malloc(nchan * sizeof(float));
     
-    // Define bounds for acceptable channel std values (20 * MAD threshold)
-    // float std_lower_bound = std_median - 2.5f * std_mad;
-    // float std_upper_bound = std_median + 2.5f * std_mad;
-    float std_lower_bound = std_median - channel_std_threshold * std_mad;
-    float std_upper_bound = std_median + channel_std_threshold * std_mad;
+    float last_median = 0.0f, last_std = 0.0f;
+    float current_median, current_std;
+    float median_change, std_change_rate;
+    int total_flagged = 0;
+    int iter = 0;
     
-    // Flag channels whose std is outside acceptable range
-    for (i = 0; i < nchan; i++)
-    {
-        if (channel_stds[i] < std_lower_bound || channel_stds[i] > std_upper_bound)
-        {
-            // Mark entire channel as bad
-            for (j = 0; j < nsamp; j++)
-            {
-                horizontalMask[i * nsamp + j] = 1;
-            }
+    // Extract valid channels for initial statistics
+    int valid_count = 0;
+    for (i = 0; i < nchan; i++) {
+        if (channel_mask[i] == 0) {  // Valid channel
+            valid_stds[valid_count] = channel_stds[i];
+            valid_count++;
         }
     }
+    
+    if (valid_count < 3) {
+        printf("    [DEBUG] outChannel: Too few valid channels (%d < 3), skipping\n", valid_count);
+        free(channel_mask);
+        free(valid_stds);
+        return;
+    }
+    
+    printf("    [DEBUG] outChannel: Starting iterative outlier detection: initial_channels=%d/%d (%.1f%%)\n", 
+           valid_count, nchan, (float)valid_count/nchan*100);
+    
+    while (iter < MAX_ITERATIONS && valid_count >= 3)
+    {
+        // Calculate current median of channel standard deviations
+        current_median = median(valid_stds, valid_count);
+        
+        // Calculate standard deviation of channel standard deviations
+        float sum_sq_dev = 0.0f;
+        for (i = 0; i < valid_count; i++) {
+            float dev = valid_stds[i] - current_median;
+            sum_sq_dev += dev * dev;
+        }
+        current_std = sqrtf(sum_sq_dev / valid_count);
+        
+        // Check convergence conditions after first iteration
+        int converged = 0;
+        if (iter > 0) {
+            median_change = fabsf(current_median - last_median);
+            std_change_rate = (last_std > 0) ? fabsf(current_std - last_std) / last_std : 0.0f;
+            
+            if (median_change < MEDIAN_CHANGE_THRESHOLD && std_change_rate < STD_CHANGE_THRESHOLD) {
+                converged = 1;
+            }
+        }
+        
+        // Calculate 3-sigma bounds (use fixed 3.0 instead of channel_std_threshold)
+        float upper_bound = current_median + 3.0f * current_std;
+        float lower_bound = current_median - 3.0f * current_std;
+        
+        // Flag new outlier channels and rebuild valid data array
+        int new_outliers = 0;
+        valid_count = 0;  // Reset and rebuild
+        
+        for (i = 0; i < nchan; i++) {
+            if (channel_mask[i] == 0) {  // Currently valid
+                if (channel_stds[i] > upper_bound || channel_stds[i] < lower_bound) {
+                    channel_mask[i] = 1;  // Flag as outlier
+                    new_outliers++;
+                    total_flagged++;
+                    
+                    // Mark entire channel as bad in horizontalMask
+                    for (j = 0; j < nsamp; j++) {
+                        horizontalMask[i * nsamp + j] = 1;
+                    }
+                } else {
+                    valid_stds[valid_count] = channel_stds[i];  // Keep in valid data
+                    valid_count++;
+                }
+            }
+        }
+        
+        // === Centralized Debug Output ===
+        printf("    [DEBUG] outChannel Iter %d: valid=%d, median=%.6f, std=%.6f", 
+               iter + 1, valid_count + new_outliers, current_median, current_std);
+        if (iter > 0) {
+            printf(", med_change=%.8f, std_change_rate=%.6f", median_change, std_change_rate);
+        }
+        printf("\n    [DEBUG]      bounds=[%.6f, %.6f], flagged=%d, remaining=%d/%d (%.1f%%)", 
+               lower_bound, upper_bound, new_outliers, valid_count, nchan, (float)valid_count/nchan*100);
+        
+        if (converged) {
+            printf(" -> CONVERGED (median stable & std rate < %.3f)\n", STD_CHANGE_THRESHOLD);
+            break;
+        } else if (new_outliers == 0) {
+            printf(" -> CONVERGED (no new outliers)\n");
+            break;
+        } else {
+            printf("\n");
+        }
+        
+        // Update for next iteration
+        last_median = current_median;
+        last_std = current_std;
+        iter++;
+    }
+    
+    // Final summary
+    if (iter >= MAX_ITERATIONS) {
+        printf("    [DEBUG] outChannel -> STOPPED (max iterations %d reached)\n", MAX_ITERATIONS);
+    } else if (valid_count < 3) {
+        printf("    [DEBUG] outChannel -> STOPPED (too few valid channels: %d < 3)\n", valid_count);
+    }
+    
+    printf("    [DEBUG] outChannel Final result: flagged %d channels in %d iterations, remaining_valid=%d/%d (%.1f%%)\n",
+           total_flagged, iter, valid_count, nchan, (float)valid_count/nchan*100);
+    
+    free(channel_mask);
+    free(valid_stds);
 }
 
 

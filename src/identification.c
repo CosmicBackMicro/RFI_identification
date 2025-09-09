@@ -1356,6 +1356,7 @@ void flagChannelsByDualSumThreshold(
 
 /**
  * @brief Perform iterative outlier detection and flagging for a single frequency channel
+ * Uses configurable N-sigma threshold with median-based robust statistics
  * @param data Channel data array (nsamp length)
  * @param nsamp Number of samples in the channel
  * @param Nsigma Sigma threshold for outlier detection
@@ -1369,62 +1370,115 @@ int inChanOutlierIter(float *data, int nsamp, float Nsigma,
                                    int *mask, float *median_temp,
                                    int *good_samples, int *random_indices)
 {
-    float lastMean = 0.0f, lastStd = 0.0f;
-    float mean = 0.0f, std = 0.0f, med = 0.0f;
-    float meanDiff = 0.0f, stdDiff = 0.0f;
-    float upperBound, lowerBound;
-    int totReplaceCnt = 0;
+    const int MAX_ITERATIONS = 15;   // Increased maximum iterations
+    const float STD_CHANGE_THRESHOLD = 0.001f;  // Standard deviation change rate threshold
+    const float MEDIAN_CHANGE_THRESHOLD = 1e-8f;  // Median change threshold (essentially no change)
+    
+    float last_median = 0.0f, last_std = 0.0f;
+    float current_median, current_std;
+    float median_change, std_change_rate;
+    int total_outliers = 0;
     int iter = 0;
-    const int maxIterations = 3;
     
-    // Copy data for median calculation
-    memcpy(median_temp, data, nsamp * sizeof(float));
-    
-    while (iter < maxIterations)
-    {
-        lastMean = mean;
-        lastStd = std;
-        
-        // Calculate statistics
-        findMeanStd(data, nsamp, &mean, &std);
-        med = median(median_temp, nsamp);
-        
-        // Calculate convergence metrics
-        if (iter > 0) {
-            meanDiff = (lastMean != 0.0f) ? fabsf(mean - lastMean) / fabsf(lastMean) : 0.0f;
-            stdDiff = (lastStd != 0.0f) ? fabsf(std - lastStd) / fabsf(lastStd) : 0.0f;
-            // medianDiff removed (not used in convergence condition)
+    // Extract valid (unmasked) data for initial statistics
+    int valid_count = 0;
+    for (int i = 0; i < nsamp; i++) {
+        if (mask[i] == 0) {  // Unmasked data
+            median_temp[valid_count] = data[i];
+            valid_count++;
         }
+    }
+    
+    if (valid_count < 3) {
+        // Too few samples for meaningful statistics
+        printf("    [DEBUG] Channel has too few valid samples (%d < 3), skipping\n", valid_count);
+        return 0;
+    }
+    
+    printf("    [DEBUG] Starting iterative outlier detection: initial_samples=%d/%d (%.1f%%)\n", 
+           valid_count, nsamp, (float)valid_count/nsamp*100);
+    
+    while (iter < MAX_ITERATIONS && valid_count >= 3)
+    {
+        // Calculate current median
+        current_median = median(median_temp, valid_count);
         
-        // Calculate bounds
-        float scale_row = 1.0f; // sqrtf(nsamp/nsamp)
-        upperBound = med + Nsigma * scale_row * std;
-        lowerBound = med - Nsigma * scale_row * std;
+        // Calculate standard deviation from median (robust approach)
+        float sum_sq_dev = 0.0f;
+        for (int i = 0; i < valid_count; i++) {
+            float dev = median_temp[i] - current_median;
+            sum_sq_dev += dev * dev;
+        }
+        current_std = sqrtf(sum_sq_dev / valid_count);
         
-        // Flag outliers
-    int newOutliers = 0;
-    int j;
-    for (j = 0; j < nsamp; j++)
-        {
-            if (data[j] > upperBound || data[j] < lowerBound)
-            {
-                if (mask[j] == 0) {
-                    newOutliers++;
-                    totReplaceCnt++;
-                }
-                mask[j] = 1;
+        // Check convergence conditions after first iteration
+        int converged = 0;
+        if (iter > 0) {
+            median_change = fabsf(current_median - last_median);
+            std_change_rate = (last_std > 0) ? fabsf(current_std - last_std) / last_std : 0.0f;
+            
+            if (median_change < MEDIAN_CHANGE_THRESHOLD && std_change_rate < STD_CHANGE_THRESHOLD) {
+                converged = 1;
             }
         }
         
-        // Check for convergence
-        if (newOutliers == 0 || (iter > 0 && meanDiff < 0.001f && stdDiff < 0.001f)) {
-            break;
+        // Calculate N-sigma bounds
+        float upper_bound = current_median + Nsigma * current_std;
+        float lower_bound = current_median - Nsigma * current_std;
+        
+        // Flag new outliers and rebuild valid data array
+        int new_outliers = 0;
+        valid_count = 0;  // Reset and rebuild
+        
+        for (int i = 0; i < nsamp; i++) {
+            if (mask[i] == 0) {  // Currently unmasked
+                if (data[i] > upper_bound || data[i] < lower_bound) {
+                    mask[i] = 1;  // Flag as outlier
+                    new_outliers++;
+                    total_outliers++;
+                } else {
+                    median_temp[valid_count] = data[i];  // Keep in valid data
+                    valid_count++;
+                }
+            }
         }
         
+        // === Centralized Debug Output ===
+        printf("    [DEBUG] Iter %d: valid=%d, median=%.6f, std=%.6f", 
+               iter + 1, valid_count + new_outliers, current_median, current_std);
+        if (iter > 0) {
+            printf(", med_change=%.8f, std_change_rate=%.6f", median_change, std_change_rate);
+        }
+        printf("\n    [DEBUG]      bounds=[%.6f, %.6f], flagged=%d, remaining=%d/%d (%.1f%%)", 
+               lower_bound, upper_bound, new_outliers, valid_count, nsamp, (float)valid_count/nsamp*100);
+        
+        if (converged) {
+            printf(" -> CONVERGED (median stable & std rate < %.3f)\n", STD_CHANGE_THRESHOLD);
+            break;
+        } else if (new_outliers == 0) {
+            printf(" -> CONVERGED (no new outliers)\n");
+            break;
+        } else {
+            printf("\n");
+        }
+        
+        // Update for next iteration
+        last_median = current_median;
+        last_std = current_std;
         iter++;
     }
     
-    return totReplaceCnt;
+    // Final summary
+    if (iter >= MAX_ITERATIONS) {
+        printf("    [DEBUG] -> STOPPED (max iterations %d reached)\n", MAX_ITERATIONS);
+    } else if (valid_count < 3) {
+        printf("    [DEBUG] -> STOPPED (too few valid samples: %d < 3)\n", valid_count);
+    }
+    
+    printf("    [DEBUG] Final result: removed %d outliers in %d iterations, final_valid=%d/%d (%.1f%%)\n",
+           total_outliers, iter, valid_count, nsamp, (float)valid_count/nsamp*100);
+    
+    return total_outliers;
 }
 
 /**

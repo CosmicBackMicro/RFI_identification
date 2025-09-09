@@ -883,7 +883,7 @@ int main(int argc, char *argv[])
 
 
 
-            float NSigmaInChan = 2.3f; // Actually can go down to 2.0, but that will remove too many good pixels
+            float NSigmaInChan = 3.0f; // Updated to use 3-sigma threshold for iterative outlier detection
             float NSigmaOutChan = 1.9f;
             if (m.doSubstitution)
             {

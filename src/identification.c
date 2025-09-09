@@ -255,9 +255,7 @@ float ksigma_1d(float *data, int n, int bins, float *hist, float *x_val, float *
     }
 
     int i;
-    memcpy(median_temp, data, n * sizeof(float));
-    float med = median(median_temp, n);
-
+    
     // find range of data
     float min_val = data[0], max_val = data[0];
     for (i = 1; i < n; i++) {
@@ -313,10 +311,25 @@ float ksigma_1d(float *data, int n, int bins, float *hist, float *x_val, float *
         x_val[i] = min_val + (i + 0.5f) * bin_width;
     }
 
-    // fit gaussian
-    float sigma = simple_curve_fit(x_val, hist, bins, med);
+    // Find histogram amplitude (max value)
+    float max_amplitude = hist[0];
+    for (i = 1; i < bins; i++) {
+        if (hist[i] > max_amplitude) {
+            max_amplitude = hist[i];
+        }
+    }
 
-    return sigma;
+    // Use GSL to jointly fit mean and sigma
+    float fitted_mu, fitted_sigma;
+    int gsl_success = gsl_gaussian_fit(x_val, hist, bins, max_amplitude, &fitted_mu, &fitted_sigma);
+    
+    if (gsl_success) {
+        return fitted_sigma;
+    } else {
+        // If GSL fails, return a default sigma estimate
+        printf("Warning: GSL fitting failed in ksigma_1d, returning default sigma\n");
+        return (max_val - min_val) / 6.0f; // rough estimate: range/6
+    }
 }
 
 float ksigma_2d(const float *dataT, const int *mask_chanRFI, int nsamp, int nchan)
@@ -788,48 +801,6 @@ void binarySIR(
            pixelsBefore > 0 ? (float)pixelsBefore/pixelsAfter : 0.0f);
 }
 
-void flagChannelsByMeanOutliers(float *data, int nsamp, int nchan, int *horizontalMask,
-                               float *channel_means, float *channel_means_temp)
-{
-    int i, j;
-    
-    // Calculate mean for each channel
-    for (i = 0; i < nchan; i++)
-    {
-        float channel_mean, channel_std;
-        findMeanStd(data + i * nsamp, nsamp, &channel_mean, &channel_std);
-        channel_means[i] = channel_mean;
-    }
-    
-    // Calculate statistics of channel means
-    float mean_mean, mean_std;
-    findMeanStd(channel_means, nchan, &mean_mean, &mean_std);
-    memcpy(channel_means_temp, channel_means, nchan * sizeof(float));
-    float mean_median = median(channel_means_temp, nchan);
-    float mean_mad = mad(channel_means, nchan);
-    findMeanStd(channel_means, nchan, NULL, &mean_std);
-    
-    // Define bounds for acceptable channel mean values (20 * MAD threshold)
-    // float mean_lower_bound = mean_median - 0.8f * mean_mad;
-    // float mean_upper_bound = mean_median + 0.8f * mean_mad;
-    float mean_lower_bound = mean_median - 3.0f * mean_mad;
-    float mean_upper_bound = mean_median + 3.0f * mean_mad;
-    
-    // Flag channels whose mean is outside acceptable range
-    for (i = 0; i < nchan; i++)
-    {
-        if (channel_means[i] < mean_lower_bound || channel_means[i] > mean_upper_bound)
-        {
-            // printf("Flagging channel %d with mean %.2f outside bounds [%.2f, %.2f]\n",
-            //        i, channel_means[i], mean_lower_bound, mean_upper_bound);
-            // Mark entire channel as bad
-            for (j = 0; j < nsamp; j++)
-            {
-                horizontalMask[i * nsamp + j] = 1;
-            }
-        }
-    }
-}
 
 
 /// @brief Flag channels based on their standard deviation statistics using MAD-based outlier detection
@@ -879,82 +850,6 @@ void outChanDetection(float *data, int nsamp, int nchan, int *horizontalMask,
             }
         }
     }
-}
-
-
-
-/// @brief Normalize data by subtracting channel median and dividing by channel standard deviation
-/// @param data Input data array (nsamp * nchan)
-/// @param nsamp Number of time samples
-/// @param nchan Number of frequency channels
-/// @param finalMedian Output array to store channel medians
-/// @param finalStd Output array to store channel standard deviations
-/// @param median_temp Temporary array for median calculation
-void normalizeChannelData(float *data, int nsamp, int nchan, 
-                         float *finalMedian, float *finalStd, float *median_temp)
-{
-    int i, j;
-    
-    // Copy data for median calculation
-    memcpy(median_temp, data, nsamp * nchan * sizeof(float));
-
-    // Calculate median and standard deviation for each channel
-    #pragma omp parallel for
-    for (i = 0; i < nchan; i++)
-    {
-        finalMedian[i] = median(median_temp + i * nsamp, nsamp);
-        findMeanStd(data + i * nsamp, nsamp, NULL, &finalStd[i]);
-    }
-    
-    // Normalize each channel: (data - median) / std
-    #pragma omp parallel for
-    for (i = 0; i < nchan; i++)
-    {
-        for (j = 0; j < nsamp; j++)
-        {
-            int idx = j + i * nsamp;
-            data[idx] = (data[idx] - finalMedian[i]) / finalStd[i];
-        }
-    }
-}
-
-/// @brief Print threshold statistics for channel values
-/// @param channel_values Array of channel values to analyze
-/// @param nchan Number of channels
-/// @param thresh_values Array of threshold values
-/// @param threshold_names Array of threshold names
-/// @param num_thresholds Number of thresholds
-/// @param metric_name Name of the metric (e.g., "MAD", "STD")
-void printThresholdStatistics(const float *channel_values, int nchan, 
-                             const float *thresh_values, const char **threshold_names, 
-                             int num_thresholds, const char *metric_name)
-{
-    int *threshold_counts = (int *)calloc(num_thresholds, sizeof(int));
-    
-    // Count channels that would be flagged at different thresholds
-    int i, idx;
-    for (i = 0; i < nchan; i++) {
-        for (idx = 0; idx < num_thresholds; idx++) {
-            // For negative thresholds (like -1*MAD), count values less than threshold
-            // For positive thresholds, count values greater than threshold
-            if (strstr(threshold_names[idx], "-") == threshold_names[idx]) {
-                // Negative threshold: count values less than threshold
-                if (channel_values[i] < thresh_values[idx]) threshold_counts[idx]++;
-            } else {
-                // Positive threshold: count values greater than threshold
-                if (channel_values[i] > thresh_values[idx]) threshold_counts[idx]++;
-            }
-        }
-    }
-    
-    printf("\n=== Channels flagged at different %s thresholds ===\n", metric_name);
-    for (idx = 0; idx < num_thresholds; idx++) {
-        printf("%s: %d channels (%.2f%%)\n", 
-               threshold_names[idx], threshold_counts[idx], 
-               (float)threshold_counts[idx]/nchan*100);
-    }
-    
-    free(threshold_counts);
 }
 
 
@@ -1249,10 +1144,10 @@ void drawChanStatHist(float *data, int nsamp, int nchan, int plot, int use_mad)
         printf("Gaussian fit (fixed amp=%.2f): center=%.6f, sigma=%.6f\n", 
                main_hist_amplitude, fitted_mu, fitted_sigma);
     } else {
-        printf("Gaussian fit failed, falling back to simple fit\n");
-        fitted_sigma = simple_curve_fit(x_data, y_data, fit_points, stat_median);
+        printf("Error: GSL Gaussian fit failed\n");
+        // Set default values to prevent crashes
         fitted_mu = stat_median;
-        printf("Fallback Gaussian fit: center=%.6f, sigma=%.6f\n", fitted_mu, fitted_sigma);
+        fitted_sigma = stat_mad > 0 ? stat_mad : 1.0f;
     }
     
     // Store fitted parameters for use in zoomed histogram
@@ -1632,24 +1527,6 @@ void applyKillThresh(int *globalMask, int nsamp, int nchan, float killThresh,
                 } else {
                     localRFISkipped++;
                 }
-                
-                if (maskedRatio > 0.001f) {
-                    #pragma omp critical
-                    {
-                        // Optional detailed channel logging (currently commented out)
-                        // printf("Channel %d: %d/%d flagged (%.3f%%), range [%d-%d] (%.1f%% span)", 
-                        //        chan, maskedCount, nsamp, maskedRatio*100, 
-                        //        firstFlagged, lastFlagged, rangeRatio*100);
-                        if (maskedRatio > killThresh) {
-                            if (shouldKillChannel) {
-                                // printf(" -> KILLING ENTIRE CHANNEL");
-                            } else {
-                                // printf(" -> SKIPPED (localized RFI)");
-                            }
-                        }
-                        // printf("\n");
-                    }
-                }
             } else {
                 shouldKillChannel = 1;
             }
@@ -1673,34 +1550,18 @@ void applyKillThresh(int *globalMask, int nsamp, int nchan, float killThresh,
     for (idx = 0; idx < nsamp * nchan; idx++) {
         if (globalMask[idx] == 1) (*totalFlaggedAfter)++;
     }
-}
-
-/**
- * @brief Print killThresh analysis summary
- * @param killedChannels Number of channels killed
- * @param localRFISkipped Number of channels skipped due to localized RFI
- * @param totalFlaggedBefore Flagged pixels before killThresh
- * @param totalFlaggedAfter Flagged pixels after killThresh
- * @param nsamp Number of time samples
- * @param nchan Number of channels
- */
-void printKillThreshSummary(int killedChannels, int localRFISkipped, int totalFlaggedBefore, 
-                           int totalFlaggedAfter, int nsamp, int nchan)
-{
-    float rangeThreshold = 0.5f;  // Keep consistent with applyKillThresh
     
-    printf("killThresh Summary:\n");
-    printf("  - Killed channels: %d/%d (%.2f%%)\n", killedChannels, nchan, 
-           (float)killedChannels/nchan*100);
-    printf("  - Localized RFI skipped: %d/%d (%.2f%%)\n", localRFISkipped, nchan, 
-           (float)localRFISkipped/nchan*100);
-    printf("  - Range threshold: %.1f%% (flagged pixels must span >%.1f%% of channel to kill)\n", 
-           rangeThreshold*100, rangeThreshold*100);
-    printf("  - Flagged pixels before: %d/%d (%.2f%%)\n", totalFlaggedBefore, nsamp*nchan, 
-           (float)totalFlaggedBefore/(nsamp*nchan)*100);
-    printf("  - Flagged pixels after: %d/%d (%.2f%%)\n", totalFlaggedAfter, nsamp*nchan, 
-           (float)totalFlaggedAfter/(nsamp*nchan)*100);
-    printf("  - Additional pixels flagged: %d\n", totalFlaggedAfter - totalFlaggedBefore);
+    // Print killThresh summary
+    printf("killThresh Results:\n");
+    printf("  - Killed channels: %d/%d (%.2f%%)\n", *killedChannels, nchan, 
+           (float)(*killedChannels)/nchan*100);
+    printf("  - Localized RFI skipped: %d/%d (%.2f%%)\n", *localRFISkippedPtr, nchan, 
+           (float)(*localRFISkippedPtr)/nchan*100);
+    printf("  - Flagged pixels before: %d/%d (%.2f%%)\n", flaggedAfterSIR, nsamp*nchan, 
+           (float)flaggedAfterSIR/(nsamp*nchan)*100);
+    printf("  - Flagged pixels after: %d/%d (%.2f%%)\n", *totalFlaggedAfter, nsamp*nchan, 
+           (float)(*totalFlaggedAfter)/(nsamp*nchan)*100);
+    printf("  - Additional pixels flagged: %d\n", *totalFlaggedAfter - flaggedAfterSIR);
     printf("=== End killThresh Analysis ===\n\n");
 }
 
@@ -1765,7 +1626,7 @@ void applySubstitution(float *data, int *globalMask, int nsamp, int nchan, int *
 void identSubstNSigma(
     float *data, int nsamp, int nchan, float Nsigma, float channel_std_threshold, int iterationIndex, int plot,
     int *horizontalMask, int *verticalMask, int *globalMask,
-    float *finalMedian, float *finalStd, int cudaReady)
+    float *finalMedian, float *finalStd, int cudaReady, int *channel_fully_flagged)
 {    
     memset(horizontalMask, 0, nsamp * nchan * sizeof(int));
     memset(verticalMask, 0, nsamp * nchan * sizeof(int));
@@ -1780,21 +1641,16 @@ void identSubstNSigma(
     int i, j;
     
     
-    // Visualize channel MAD statistics for threshold determination in first 20 iterations
-    // Use iterationIndex as a proxy for iteration counter (passed from ReadFASTData.c)
+
     if (plot)
     {
         printf("=== Generating Channel MAD M_j Histogram (Iteration %d) ===\n", iterationIndex);
-        // visualizeChannelMAD(data, nsamp, nchan, 1);
         drawChanStatHist(data, nsamp, nchan, 1, 1);
         printf("=== MAD M_j Histogram Complete ===\n");
         
         printf("=== Generating Channel STD σ_j Histogram (Iteration %d) ===\n", iterationIndex);
-        // visualizeChannelStd(data, nsamp, nchan, 1);
         drawChanStatHist(data, nsamp, nchan, 1, 0);
         printf("=== STD σ_j Histogram Complete ===\n");
-
-        
     }
     
     // === 1. inChannel Detection ===
@@ -1842,7 +1698,8 @@ void identSubstNSigma(
     
     // Check which channels are fully flagged after all detections
     int fully_flagged_channels = 0;
-    int *channel_fully_flagged = (int *)calloc(nchan, sizeof(int));
+    // Initialize the input array to all zeros
+    memset(channel_fully_flagged, 0, nchan * sizeof(int));
     for (i = 0; i < nchan; i++) {
         int flagged_count = 0;
         for (j = 0; j < nsamp; j++) {
@@ -1905,7 +1762,6 @@ void identSubstNSigma(
     // Clean up allocated memory
     free(good_samples);
     free(random_indices);
-    free(channel_fully_flagged);
     free(median_temp);
 
     printf("### DEBUG: identSubstNSigma exiting with finalMedian=%.6f, finalStd=%.6f ###\n", *finalMedian, *finalStd);

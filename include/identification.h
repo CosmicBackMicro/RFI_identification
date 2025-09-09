@@ -47,4 +47,4 @@ void identSubstNSigma(
     float *data, int nsamp, int nchan, 
     float Nsigma, float channel_std_threshold, int iterationIndex, int plot,
     int *horizontalMask, int *verticalMask, int *globalMask,
-    float *finalMedian, float *finalStd, int cudaReady);
+    float *finalMedian, float *finalStd, int cudaReady, int *channel_fully_flagged);

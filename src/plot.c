@@ -88,7 +88,7 @@ void plotDownsampLongTimeAbs(Metadata *m, int numReads, float *dsDataT, float *d
     float *dsFreqProfile = malloc(sizeof(float) * m->nchanBinned * numReads);
     int *dsChannelMask = calloc(m->nchanBinned, sizeof(int));
 
-    getProfile(dsDataT, nsampPlot, nchanPlot, dsFreqProfile, dsTimeProfile, 1);
+    getProfile(dsDataT, nsampPlot, nchanPlot, dsFreqProfile, dsTimeProfile, 1, NULL);
 
     int palettType = 3;
     double contrast = 1.0;
@@ -193,7 +193,7 @@ void plotDownsampLongTimeAbs(Metadata *m, int numReads, float *dsDataT, float *d
  * @param rightPanelMode Mode for right panel: 0=mean, 1=std
  * @param mask Optional mask array for RFI flagging (NULL to skip mask plotting)
  */
-void plotTimeFreqSED(Metadata *m, int numReads, float *dsDataT, float *dsFreqArray, float startTime, int currentBlock, float *baseline, int topPanelMode, int rightPanelMode, int *mask)
+void plotTimeFreqSED(Metadata *m, int numReads, float *dsDataT, float *dsFreqArray, float startTime, int currentBlock, float *baseline, int topPanelMode, int rightPanelMode, int *mask, int *channel_fully_flagged)
 {
     // === Global Layout Configuration ===
     float globalMargin = 0.1;  // Symmetric margin for left/right/top/bottom
@@ -226,8 +226,8 @@ void plotTimeFreqSED(Metadata *m, int numReads, float *dsDataT, float *dsFreqArr
     int *dsChannelMask = calloc(m->nchanBinned, sizeof(int));
 
     // Calculate both mean and std profiles
-    getProfile(dsDataT, nsampPlot, nchanPlot, dsFreqProfile_mean, dsTimeProfile_mean, 1);
-    getProfileStd(dsDataT, nsampPlot, nchanPlot, dsFreqProfile_std, dsTimeProfile_std, 1);
+    getProfile(dsDataT, nsampPlot, nchanPlot, dsFreqProfile_mean, dsTimeProfile_mean, 1, mask);
+    getProfileStd(dsDataT, nsampPlot, nchanPlot, dsFreqProfile_std, dsTimeProfile_std, 1, mask);
 
     // Select profiles based on panel modes
     float *dsTimeProfile = (topPanelMode == 0) ? dsTimeProfile_mean : dsTimeProfile_std;
@@ -287,7 +287,30 @@ void plotTimeFreqSED(Metadata *m, int numReads, float *dsDataT, float *dsFreqArr
     cpgswin(freqProfileMin, freqProfileMax, fmin + plotStartChan * chan_bwPlot, fmax - (nchanPlot - plotEndChan + 1) * chan_bwPlot);
     cpgsch(0.7);
     cpgbox("BCNST", 0, 0, "BCMST", 0, 0);
-    cpgline(plotEndChan - plotStartChan + 1, dsFreqProfile + plotStartChan, dsFreqArray + plotStartChan);
+    
+    // Draw frequency profile with gaps for fully flagged channels
+    if (channel_fully_flagged != NULL) {
+        // Draw profile with gaps for fully flagged channels
+        int segmentStart = -1;
+        for (int i = plotStartChan; i <= plotEndChan + 1; i++) {
+            int isChannelFlagged = (i <= plotEndChan) ? channel_fully_flagged[i] : 1; // Treat end as flagged to close last segment
+            
+            if (!isChannelFlagged && segmentStart == -1) {
+                // Start a new segment
+                segmentStart = i;
+            } else if ((isChannelFlagged || i > plotEndChan) && segmentStart != -1) {
+                // End current segment and draw it
+                int segmentLength = i - segmentStart;
+                if (segmentLength > 0) {
+                    cpgline(segmentLength, dsFreqProfile + segmentStart, dsFreqArray + segmentStart);
+                }
+                segmentStart = -1;
+            }
+        }
+    } else {
+        // Fallback to original continuous line if no channel_fully_flagged info
+        cpgline(plotEndChan - plotStartChan + 1, dsFreqProfile + plotStartChan, dsFreqArray + plotStartChan);
+    }
 
     cpgmtxt("R", 2.1, 0.5, 0.5, "Frequency (MHz)");
     cpgmtxt("B", 3.0, 0.5, 0.5, "Value");

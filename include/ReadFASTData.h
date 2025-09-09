@@ -36,9 +36,9 @@ typedef struct {
 
 char *extractSourceName(const char *absolutePath);
 
-void getProfile(float *array, int nsamp, int nchan, float *freqProfile, float *timeProfile, int isTranspose);
+void getProfile(float *array, int nsamp, int nchan, float *freqProfile, float *timeProfile, int isTranspose, int *mask);
 
-void getProfileStd(float *array, int nsamp, int nchan, float *freqProfile, float *timeProfile, int isTranspose);
+void getProfileStd(float *array, int nsamp, int nchan, float *freqProfile, float *timeProfile, int isTranspose, int *mask);
 
 void downsamp2D(float *array, int nsamp, int nchan, 
     float *binnedArray, int binFactorTime, int binFactorFreq, int isTranspose);

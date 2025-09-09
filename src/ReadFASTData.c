@@ -302,7 +302,7 @@ float gaussianSample(float mu, float sigma)
 }
 
 
-void getProfile(float *array, int nsamp, int nchan, float *freqProfile, float *timeProfile, int isTranspose)
+void getProfile(float *array, int nsamp, int nchan, float *freqProfile, float *timeProfile, int isTranspose, int *mask)
 {
     int i, j;
 
@@ -312,22 +312,34 @@ void getProfile(float *array, int nsamp, int nchan, float *freqProfile, float *t
         for (i = 0; i < nchan; i++)
         {
             float sum = 0.0f;
+            int validCount = 0;
             for (j = 0; j < nsamp; j++)
             {
-                sum += array[i * nsamp + j];
+                int maskIdx = i * nsamp + j;
+                if (mask == NULL || mask[maskIdx] == 0) // Include if not masked
+                {
+                    sum += array[i * nsamp + j];
+                    validCount++;
+                }
             }
-            freqProfile[i] = sum / nsamp;
+            freqProfile[i] = (validCount > 0) ? sum / validCount : 0.0f;
         }
 
         #pragma omp parallel for
         for (i = 0; i < nsamp; i++)
         {
             float sum = 0.0f;
+            int validCount = 0;
             for (j = 0; j < nchan; j++)
             {
-                sum += array[j * nsamp + i];
+                int maskIdx = j * nsamp + i;
+                if (mask == NULL || mask[maskIdx] == 0) // Include if not masked
+                {
+                    sum += array[j * nsamp + i];
+                    validCount++;
+                }
             }
-            timeProfile[i] = sum / nchan;
+            timeProfile[i] = (validCount > 0) ? sum / validCount : 0.0f;
         }
     }
     else
@@ -336,27 +348,39 @@ void getProfile(float *array, int nsamp, int nchan, float *freqProfile, float *t
         for (i = 0; i < nchan; i++)
         {
             float sum = 0.0f;
+            int validCount = 0;
             for (j = 0; j < nsamp; j++)
             {
-                sum += array[j * nchan + i];
+                int maskIdx = j * nchan + i;
+                if (mask == NULL || mask[maskIdx] == 0) // Include if not masked
+                {
+                    sum += array[j * nchan + i];
+                    validCount++;
+                }
             }
-            freqProfile[i] = sum / nsamp;
+            freqProfile[i] = (validCount > 0) ? sum / validCount : 0.0f;
         }
 
         #pragma omp parallel for
         for (i = 0; i < nsamp; i++)
         {
             float sum = 0.0f;
+            int validCount = 0;
             for (j = 0; j < nchan; j++)
             {
-                sum += array[i * nchan + j];
+                int maskIdx = i * nchan + j;
+                if (mask == NULL || mask[maskIdx] == 0) // Include if not masked
+                {
+                    sum += array[i * nchan + j];
+                    validCount++;
+                }
             }
-            timeProfile[i] = sum / nchan;
+            timeProfile[i] = (validCount > 0) ? sum / validCount : 0.0f;
         }
     }
 }
 
-void getProfileStd(float *array, int nsamp, int nchan, float *freqProfile, float *timeProfile, int isTranspose)
+void getProfileStd(float *array, int nsamp, int nchan, float *freqProfile, float *timeProfile, int isTranspose, int *mask)
 {
     int i, j;
 
@@ -367,17 +391,30 @@ void getProfileStd(float *array, int nsamp, int nchan, float *freqProfile, float
         {
             float sum = 0.0f;
             float sumSq = 0.0f;
+            int validCount = 0;
             float *chanPtr = array + i * nsamp;
 
             for (j = 0; j < nsamp; j++)
             {
-                float value = chanPtr[j];
-                sum += value;
-                sumSq += value * value;
+                int maskIdx = i * nsamp + j;
+                if (mask == NULL || mask[maskIdx] == 0) // Include if not masked
+                {
+                    float value = chanPtr[j];
+                    sum += value;
+                    sumSq += value * value;
+                    validCount++;
+                }
             }
-            float mean = sum / nsamp;
-            float variance = (sumSq - 2 * mean * sum + nsamp * mean * mean) / nsamp;
-            freqProfile[i] = sqrt(variance);
+            if (validCount > 1)
+            {
+                float mean = sum / validCount;
+                float variance = (sumSq - 2 * mean * sum + validCount * mean * mean) / validCount;
+                freqProfile[i] = sqrt(variance);
+            }
+            else
+            {
+                freqProfile[i] = 0.0f;
+            }
         }
 
         #pragma omp parallel for
@@ -385,16 +422,29 @@ void getProfileStd(float *array, int nsamp, int nchan, float *freqProfile, float
         {
             float sum = 0.0f;
             float sumSq = 0.0f;
+            int validCount = 0;
 
             for (j = 0; j < nchan; j++)
             {
-                float value = array[j * nsamp + i];
-                sum += value;
-                sumSq += value * value;
+                int maskIdx = j * nsamp + i;
+                if (mask == NULL || mask[maskIdx] == 0) // Include if not masked
+                {
+                    float value = array[j * nsamp + i];
+                    sum += value;
+                    sumSq += value * value;
+                    validCount++;
+                }
             }
-            float mean = sum / nchan;
-            float variance = (sumSq - 2 * mean * sum + nchan * mean * mean) / nchan;
-            timeProfile[i] = sqrt(variance);
+            if (validCount > 1)
+            {
+                float mean = sum / validCount;
+                float variance = (sumSq - 2 * mean * sum + validCount * mean * mean) / validCount;
+                timeProfile[i] = sqrt(variance);
+            }
+            else
+            {
+                timeProfile[i] = 0.0f;
+            }
         }
     }
     else
@@ -404,16 +454,29 @@ void getProfileStd(float *array, int nsamp, int nchan, float *freqProfile, float
         {
             float sum = 0.0f;
             float sumSq = 0.0f;
+            int validCount = 0;
 
             for (j = 0; j < nsamp; j++)
             {
-                float value = array[j * nchan + i];
-                sum += value;
-                sumSq += value * value;
+                int maskIdx = j * nchan + i;
+                if (mask == NULL || mask[maskIdx] == 0) // Include if not masked
+                {
+                    float value = array[j * nchan + i];
+                    sum += value;
+                    sumSq += value * value;
+                    validCount++;
+                }
             }
-            float mean = sum / nsamp;
-            float variance = (sumSq - 2 * mean * sum + nsamp * mean * mean) / nsamp;
-            freqProfile[i] = sqrt(variance);
+            if (validCount > 1)
+            {
+                float mean = sum / validCount;
+                float variance = (sumSq - 2 * mean * sum + validCount * mean * mean) / validCount;
+                freqProfile[i] = sqrt(variance);
+            }
+            else
+            {
+                freqProfile[i] = 0.0f;
+            }
         }
 
         #pragma omp parallel for
@@ -421,17 +484,30 @@ void getProfileStd(float *array, int nsamp, int nchan, float *freqProfile, float
         {
             float sum = 0.0f;
             float sumSq = 0.0f;
+            int validCount = 0;
             float *sampPtr = array + i * nchan;
 
             for (j = 0; j < nchan; j++)
             {
-                float value = sampPtr[j];
-                sum += value;
-                sumSq += value * value;
+                int maskIdx = i * nchan + j;
+                if (mask == NULL || mask[maskIdx] == 0) // Include if not masked
+                {
+                    float value = sampPtr[j];
+                    sum += value;
+                    sumSq += value * value;
+                    validCount++;
+                }
             }
-            float mean = sum / nchan;
-            float variance = (sumSq - 2 * mean * sum + nchan * mean * mean) / nchan;
-            timeProfile[i] = sqrt(variance);
+            if (validCount > 1)
+            {
+                float mean = sum / validCount;
+                float variance = (sumSq - 2 * mean * sum + validCount * mean * mean) / validCount;
+                timeProfile[i] = sqrt(variance);
+            }
+            else
+            {
+                timeProfile[i] = 0.0f;
+            }
         }
     }
 }
@@ -723,6 +799,7 @@ int main(int argc, char *argv[])
     int *horizontalMask = (int *)calloc(nsampBinned * nchanBinned, sizeof(int));
     int *verticalMask = (int *)calloc(nsampBinned * nchanBinned, sizeof(int));
     int *globalMask = (int *)calloc(nsampBinned * nchanBinned, sizeof(int));
+    int *channel_fully_flagged = (int *)calloc(nchanBinned, sizeof(int)); // Track fully flagged channels
 
     float *finalMedian = malloc(sizeof(float) * nsampBinned * nchanBinned);
     float *finalStd = malloc(sizeof(float) * nsampBinned * nchanBinned);
@@ -785,7 +862,7 @@ int main(int argc, char *argv[])
             { 
                 cpgpage(); // Create new graphics page
                 cpgmtxt("T", 3.0, 0.35, 0.5, "Raw Data");
-                plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, NULL);
+                plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, NULL, NULL);
             }
 
 
@@ -801,17 +878,17 @@ int main(int argc, char *argv[])
                 char text2[100];
                 snprintf(text2, sizeof(text2), "Result after subtracting channel median");
                 cpgmtxt("T", 3.5, 0.5, 0.5, text2);
-                plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, NULL);
+                plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, NULL, NULL);
             }
 
 
 
-            float NSigmaInChan = 2.0f;
-            float NSigmaOutChan = 3.0f;
+            float NSigmaInChan = 2.3f; // Actually can go down to 2.0, but that will remove too many good pixels
+            float NSigmaOutChan = 1.9f;
             if (m.doSubstitution)
             {
                 identSubstNSigma(outDataT, nsampBinned, nchanBinned, NSigmaInChan, NSigmaOutChan, ii, m.plot,
-                                 horizontalMask, verticalMask, globalMask, finalMedian, finalStd, m.cudaReady);
+                                 horizontalMask, verticalMask, globalMask, finalMedian, finalStd, m.cudaReady, channel_fully_flagged);
             }
             if (writeMasks)
             {
@@ -822,7 +899,7 @@ int main(int argc, char *argv[])
             if (m.plot)
             { // Plot result after NSigma substitution
                 cpgpage();
-                plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, globalMask);
+                plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, globalMask, channel_fully_flagged);
             }
 
 
@@ -856,7 +933,7 @@ int main(int argc, char *argv[])
                 char text3[100];
                 snprintf(text3, sizeof(text3), "Result of SumThreshold RFI detection with chi=%.2f", timesOfSigma);
                 cpgmtxt("T", 3.5, 0.5, 0.5, text3);
-                plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, mask_ST);
+                plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, mask_ST, channel_fully_flagged);
             }
             if (m.doSumThreshold)
             {
@@ -867,7 +944,7 @@ int main(int argc, char *argv[])
                 cpgpage();
                 cpgmtxt("T", 3.5, 0.5, 0.5, "Result after pixel substitution");
                 // 顶部和右侧都显示标准差，无掩码
-                plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, NULL);
+                plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, NULL, channel_fully_flagged);
                 cpgpage();
             }            
         }
@@ -901,7 +978,7 @@ int main(int argc, char *argv[])
 
 
         numiter++;
-        if (numiter >= 2) {
+        if (numiter >= 3) {
             m.plot = 0; 
             return 0;
         }
@@ -965,6 +1042,7 @@ int main(int argc, char *argv[])
     free(horizontalMask);
     free(verticalMask);
     free(globalMask);
+    free(channel_fully_flagged);
     free(outRawData);
     free(outRawDataT);
     free(scale);

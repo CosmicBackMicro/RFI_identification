@@ -884,7 +884,7 @@ int main(int argc, char *argv[])
 
 
             float NSigmaInChan = 3.0f; // Updated to use 3-sigma threshold for iterative outlier detection
-            float NSigmaOutChan = 1.9f;
+            float NSigmaOutChan = 3.0f;
             if (m.doSubstitution)
             {
                 identSubstNSigma(outDataT, nsampBinned, nchanBinned, NSigmaInChan, NSigmaOutChan, ii, m.plot,

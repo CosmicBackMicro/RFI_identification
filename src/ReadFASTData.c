@@ -867,7 +867,7 @@ int main(int argc, char *argv[])
 
 
 
-            int subtractChanMed = 1;
+            int subtractChanMed = 1; 
             if (subtractChanMed)
             {
                 subtractChannelMedians(outDataT, nsampBinned, nchanBinned);

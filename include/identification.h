@@ -27,7 +27,7 @@ void binarySIR(int *mask, int nsamp, int nchan, int win_samp, int win_chan, floa
 void flagChannelsByMeanOutliers(float *data, int nsamp, int nchan, int *horizontalMask,
                                float *channel_means, float *channel_means_temp);
 void outChanDetection(float *data, int nsamp, int nchan, int *horizontalMask,
-                              float *channel_stds, float *channel_stds_temp, float channel_std_threshold);
+                              float *channel_stds, float *channel_stds_temp, float channel_std_threshold, float nsigma_in);
 
 void normalizeChannelData(float *data, int nsamp, int nchan, 
                          float *finalMedian, float *finalStd, float *median_temp);
@@ -48,3 +48,19 @@ void identSubstNSigma(
     float Nsigma, float channel_std_threshold, int iterationIndex, int plot,
     int *horizontalMask, int *verticalMask, int *globalMask,
     float *finalMedian, float *finalStd, int cudaReady, int *channel_fully_flagged);
+
+// Histogram functions
+void calculateHistogram(float *data, int n, int nbins, 
+                       float *hist_data, float *bin_min, float *bin_max, 
+                       float *bin_width, float *max_count);
+void drawHistogramFromData(float *hist_data, int nbins, 
+                          float bin_min, float bin_max, float bin_width, float max_count,
+                          const char *xlabel, const char *ylabel, const char *title,
+                          int draw_median, float median_value);
+void drawSimpleChannelSTDHist(float *data, int nsamp, int nchan, int plot);
+void drawSimpleChannelSTDHistWithMask(float *channel_stds, int nchan, int *channel_mask, int plot);
+
+// OutChannel comparison histogram function
+void drawOutChannelComparisonHist(float *initial_stats, float *final_stats, int nchan, 
+                                  int use_mad, int initial_flagged_count, int final_flagged_count,
+                                  int iterations, float nsigma_out, float nsigma_in);

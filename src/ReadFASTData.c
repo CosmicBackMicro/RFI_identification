@@ -904,7 +904,7 @@ int main(int argc, char *argv[])
 
 
 
-            float timesOfSigma = 8.0f;
+            float timesOfSigma = 3.0f;
             // float timesOfSigma = 8.0f;
             int M_len = 6;
             int win_samp = 3, win_chan = 3;
@@ -982,55 +982,10 @@ int main(int argc, char *argv[])
             m.plot = 0; 
             return 0;
         }
-        // if (numiter >= 20)   
-        // {
-        //     printf("Debug mode: Reached maximum iterations of 20, exiting.\n");
-        //     return 0;
-        // }
-
-        // if (m.savePlot)
-        // {
-        //     // Optional: convert_ps_to_png(saveName);
-        // }
-        // else
-        // {
-        //     // wait_for_mouse_click();
-        // }
-
-        /*
-            // Example usage of channel-specific mask extraction:
-            
-            // Method 1: Extract specific channels by indices
-            int targetChannels[] = {10, 15, 20, 25}; // Example: channels with known interference
-            int numTargetChannels = 4;
-            int *channelSpecificMask = (int *)calloc(nsampBinned * nchanBinned, sizeof(int));
-            extractChannelMask(globalMask, channelSpecificMask, nsampBinned, nchanBinned, 
-                             targetChannels, numTargetChannels, 1); // isTranspose=1 for transposed data
-            
-            // Method 2: Extract a range of channels
-            int *rangeSpecificMask = (int *)calloc(nsampBinned * nchanBinned, sizeof(int));
-            extractChannelRangeMask(globalMask, rangeSpecificMask, nsampBinned, nchanBinned,
-                                  10, 30, 1); // Extract channels 10-30
-            
-            // Write channel-specific masks
-            if (writeMasks) {
-                char channelMask_filename[256];
-                sprintf(channelMask_filename, "%smask_Channels_%d.png", m.datasetPath, ii);
-                writeIndexMaskPNG(channelSpecificMask, nsampBinned, nchanBinned, channelMask_filename);
-                
-                sprintf(channelMask_filename, "%smask_Range_%d.png", m.datasetPath, ii);
-                writeIndexMaskPNG(rangeSpecificMask, nsampBinned, nchanBinned, channelMask_filename);
-            }
-            
-            // Clean up
-            free(channelSpecificMask);
-            free(rangeSpecificMask);
-            */
 
     }
 
     // Cleanup
-    // Close PGPLOT graphics system, complete all graphics file writing and resource cleanup
     if (m.plot) cpgend();
     fits_close_file(fptr, &fits_status);
     free(freqArray);

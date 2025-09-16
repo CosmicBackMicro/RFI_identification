@@ -6,3 +6,4 @@ void findMinMax(float *arr, int size, float *min, float *max);
 void calc8bitHist(float *data, int size);
 float median(float *arr, int n);
 float mad(float *arr, int n);
+float stdFromMedian(float *arr, int n);

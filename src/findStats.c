@@ -147,6 +147,29 @@ float mad(float *arr, int n) {
     free(temp_deviations);
     return mad_value;
 }
+
+float stdFromMedian(float *arr, int n) {
+    if (n <= 1) {
+        return 0.0f;
+    }
+    
+    // Calculate median without modifying original array
+    float *temp_arr = (float *)malloc(n * sizeof(float));
+    memcpy(temp_arr, arr, n * sizeof(float));
+    float median_value = median(temp_arr, n);
+    free(temp_arr);
+    
+    // Calculate standard deviation from median
+    float sum_squared_dev = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float deviation = arr[i] - median_value;
+        sum_squared_dev += deviation * deviation;
+    }
+    
+    float mean_squared_dev = sum_squared_dev / n;
+    return sqrtf(mean_squared_dev);
+}
+
 #undef ELEM_SWAP
 
 void findMeanStd(float *arr, int size, float *mean, float *std)

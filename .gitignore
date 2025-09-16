@@ -17,6 +17,9 @@ output/
 lot/
 src/dataset*/
 
+# Intermediate results
+IntermediateResults/
+
 # Pretrained weights
 pretrained_weights/
 

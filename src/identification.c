@@ -1887,35 +1887,35 @@ void identSubstNSigma(
     applySubstitution(data, horizontalMask, nsamp, nchan, &outChanPixelsSubstituted);
     printf("outChannel substitution: replaced %d pixels\n", outChanPixelsSubstituted);
     
-    // Check which channels are fully flagged after all detections
+    // Check which channels are fully flagged after all detections and copy masks
     int fully_flagged_channels = 0;
-    // Initialize the input array to all zeros
+    int horizontalFlagged = 0;
+    int *channel_flagged_counts = (int *)calloc(nchan, sizeof(int));
     memset(channel_fully_flagged, 0, nchan * sizeof(int));
-    for (i = 0; i < nchan; i++) {
-        int flagged_count = 0;
-        for (j = 0; j < nsamp; j++) {
-            if (horizontalMask[i * nsamp + j] == 1) {
-                flagged_count++;
-            }
+    
+    for (int idx = 0; idx < nsamp * nchan; idx++) {
+        int chan = idx / nsamp;
+        globalMask[idx] = horizontalMask[idx];
+        if (horizontalMask[idx] == 1) {
+            horizontalFlagged++;
+            channel_flagged_counts[chan]++;
         }
-        if (flagged_count == nsamp) {
+    }
+    
+    for (int i = 0; i < nchan; i++) {
+        if (channel_flagged_counts[i] == nsamp) {
             channel_fully_flagged[i] = 1;
             fully_flagged_channels++;
         }
     }
+    
+    free(channel_flagged_counts);
+    
     printf("Final status: %d/%d channels fully flagged (%.2f%%)\n", 
            fully_flagged_channels, nchan, (float)fully_flagged_channels/nchan*100);
     
-
+    
     // subtractChannelMedians(data, nsamp, nchan);
-
-    // === 3. Copy horizontal mask to global mask (vertical detection removed for efficiency) ===
-    int horizontalFlagged = 0;
-    int idx;
-    for (idx = 0; idx < nsamp * nchan; idx++) {
-        globalMask[idx] = horizontalMask[idx];  // Direct copy instead of logicalOR
-        if (horizontalMask[idx] == 1) horizontalFlagged++;
-    }
     
     printf("\n=== RFI Detection Statistics ===\n");
     printf("Combined (point+channel) mask flagged: %d/%d pixels (%.4f%%)\n", 
@@ -1923,11 +1923,9 @@ void identSubstNSigma(
     printf("Global mask flagged: %d/%d pixels (%.4f%%)\n", 
            horizontalFlagged, nsamp*nchan, (float)horizontalFlagged/(nsamp*nchan)*100);
     printf("=== End RFI Detection Statistics ===\n");
-
+    
     // Copy horizontalMask to globalMask for final output
-    memcpy(globalMask, horizontalMask, nsamp * nchan * sizeof(int));
-
-    // Calculate final statistics for experimental function output
+    memcpy(globalMask, horizontalMask, nsamp * nchan * sizeof(int));    // Calculate final statistics for experimental function output
     float finalMedian_temp, finalStd_temp;
     findMeanStd(median_temp, nsamp * nchan, &finalMedian_temp, &finalStd_temp);
     float finalMedian_value = median(median_temp, nsamp * nchan);

@@ -16,6 +16,8 @@ test_output/
 output/
 lot/
 src/dataset*/
+src/profile_masking.py
+src/spike_finding.py
 
 # Intermediate results
 IntermediateResults/

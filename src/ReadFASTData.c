@@ -18,6 +18,32 @@
 #include "transpose.h"
 #include "psrPalett.h"
 #include "cuda_acceleration.h"
+#include "include/alg_CLFD.h"
+#include "include/alg_IQRM.h"
+
+// 将一维通道掩码扩展成二维 (channel-major: each channel occupies a contiguous block of nsamp samples)
+// 返回被标记通道数量
+static int expandChannelMask(const unsigned char *chan_mask, int nchan, int nsamp, int *mask2d) {
+    memset(mask2d, 0, sizeof(int) * nchan * nsamp);
+    int flagged = 0;
+    for (int ch = 0; ch < nchan; ++ch) {
+        if (!chan_mask[ch]) continue;
+        flagged++;
+        int base = ch * nsamp;
+        for (int t = 0; t < nsamp; ++t) mask2d[base + t] = 1;
+    }
+    return flagged;
+}
+#include "include/alg_IQRM.h"
+
+// Comparator for qsort (float ascending) used in IQRM substitution step
+static int cmp_float_for_qsort(const void *a, const void *b) {
+    float fa = *(const float*)a;
+    float fb = *(const float*)b;
+    if (fa < fb) return -1;
+    if (fa > fb) return 1;
+    return 0;
+}
 
 #ifndef PI
 #define PI 3.14159265358979323846
@@ -800,6 +826,9 @@ int main(int argc, char *argv[])
     int *verticalMask = (int *)calloc(nsampBinned * nchanBinned, sizeof(int));
     int *globalMask = (int *)calloc(nsampBinned * nchanBinned, sizeof(int));
     int *channel_fully_flagged = (int *)calloc(nchanBinned, sizeof(int)); // Track fully flagged channels
+    int *mask_CLFD = calloc(nsampBinned * nchanBinned, sizeof(int));
+    int *mask_SPIKE = calloc(nsampBinned * nchanBinned, sizeof(int));
+    float *replacement_SPIKE = malloc(nsampBinned * nchanBinned * sizeof(float));
 
     float *finalMedian = malloc(sizeof(float) * nsampBinned * nchanBinned);
     float *finalStd = malloc(sizeof(float) * nsampBinned * nchanBinned);
@@ -855,7 +884,7 @@ int main(int argc, char *argv[])
         
         if (m.generateMasks)
         {
-            memset(mask_ST, 0, sizeof(int) * nsampBinned * nchanBinned);
+
 
             // Plot the unprocessed raw data
             if (m.plot)
@@ -866,7 +895,7 @@ int main(int argc, char *argv[])
             }
 
 
-
+            // =======================Subtract Channel Median========================================================
             int subtractChanMed = 1; 
             if (subtractChanMed)
             {
@@ -881,72 +910,189 @@ int main(int argc, char *argv[])
                 plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, NULL, NULL);
             }
 
+            // =====================Channel Std IQR Detection (通道级识别)============================
+            // 基于每个通道时间序列的标准差，跨通道做 IQR 离群判定，整列标记。
+            {
+                float q_chan = 1.5f;  // Tukey 系数，可调 (1.5 经典，2.0 更保守)
+                float *chan_std = (float*)malloc(sizeof(float) * nchanBinned);
+                float *chan_std_sorted = (float*)malloc(sizeof(float) * nchanBinned);
+                int *chan_mask_1d = (int*)calloc(nchanBinned, sizeof(int));
+                int *mask_chanstd2d = (int*)calloc(nchanBinned * nsampBinned, sizeof(int));
+
+                // 1. 计算每个通道标准差
+                for (int ch = 0; ch < nchanBinned; ++ch) {
+                    float mean, std; float *col = outDataT + ch * nsampBinned;
+                    findMeanStd(col, nsampBinned, &mean, &std);
+                    chan_std[ch] = std;
+                }
+
+                // 2. 计算跨通道 Q1/Q3
+                memcpy(chan_std_sorted, chan_std, sizeof(float) * nchanBinned);
+                qsort(chan_std_sorted, nchanBinned, sizeof(float), cmp_float_for_qsort);
+                float q1, q3; 
+                if (nchanBinned >= 4) {
+                    int idx_q1 = (int)(0.25f * (nchanBinned - 1));
+                    int idx_q3 = (int)(0.75f * (nchanBinned - 1));
+                    q1 = chan_std_sorted[idx_q1];
+                    q3 = chan_std_sorted[idx_q3];
+                } else { // 通道数太少，直接放宽处理
+                    q1 = chan_std_sorted[0];
+                    q3 = chan_std_sorted[nchanBinned-1];
+                }
+                float iqr = q3 - q1;
+                float vmin = q1 - q_chan * iqr;
+                float vmax = q3 + q_chan * iqr;
+                if (iqr <= 0.0f) { // 退化情况：所有通道 std 几乎相同，不做标记
+                    vmin = -INFINITY; vmax = INFINITY;
+                }
+
+                // 3. 标记异常通道 (整列 mask)
+                int flagged_channels_std = 0;
+                for (int ch = 0; ch < nchanBinned; ++ch) {
+                    if (chan_std[ch] < vmin || chan_std[ch] > vmax) {
+                        chan_mask_1d[ch] = 1; flagged_channels_std++;
+                        int base = ch * nsampBinned;
+                        for (int t = 0; t < nsampBinned; ++t) mask_chanstd2d[base + t] = 1;
+                    }
+                }
+
+                // 4. 可视化（独立展示）
+                if (m.plot) {
+                    cpgpage();
+                    char t_before[128]; snprintf(t_before, sizeof(t_before), "Before Channel-Std IQR (q=%.2f)", q_chan);
+                    cpgmtxt("T", 3.0, 0.35, 0.5, t_before);
+                    plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, NULL, NULL);
+
+                    cpgpage();
+                    char t_after[160]; snprintf(t_after, sizeof(t_after), "After Channel-Std IQR flagged %d/%d (q=%.2f)", flagged_channels_std, nchanBinned, q_chan);
+                    cpgmtxt("T", 3.0, 0.35, 0.5, t_after);
+                    plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, mask_chanstd2d, NULL);
+                }
+
+                // 5. 输出 PNG
+                if (writeMasks) {
+                    char mask_CHANSTD_filename[256];
+                    sprintf(mask_CHANSTD_filename, "%smask_CHANSTD_%d.png", m.datasetPath, ii);
+                    writeIndexMaskPNG(mask_chanstd2d, nsampBinned, nchanBinned, mask_CHANSTD_filename);
+                }
+
+                // （可选）合并到主 mask_CLFD：默认不自动合并，只保留独立结果。
+                // 如果想合并，可取消下面注释：
+                // for (int k = 0; k < nchanBinned * nsampBinned; ++k) if (mask_chanstd2d[k]) mask_CLFD[k] = 1;
+
+                free(chan_std);
+                free(chan_std_sorted);
+                free(chan_mask_1d);
+                free(mask_chanstd2d);
+            }
+
+            // =====================IQRM (已注释，保留以便后续启用)============================
+            /*
+            float *chan_feature = (float*)malloc(sizeof(float) * nchanBinned);
+            for (int ch = 0; ch < nchanBinned; ++ch) {
+                float mean, std; float *col = outDataT + ch * nsampBinned; 
+                findMeanStd(col, nsampBinned, &mean, &std); chan_feature[ch] = std;
+            }
+            int radius = nchanBinned / 10; if (radius < 4) radius = (nchanBinned>4?4:nchanBinned/2+1);
+            float threshold = 3.0f; 
+            unsigned char *iqrm_mask_1d = (unsigned char*)calloc(nchanBinned, sizeof(unsigned char));
+            iqrm_mask(chan_feature, nchanBinned, radius, threshold, NULL, 0, iqrm_mask_1d);
+            int flagged_channels = expandChannelMask(iqrm_mask_1d, nchanBinned, nsampBinned, mask_CLFD);
+            if (m.plot) {
+                cpgpage(); cpgmtxt("T", 3.0, 0.35, 0.5, "Before IQRM");
+                plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, NULL, NULL);
+                cpgpage(); char title_after[128];
+                snprintf(title_after, sizeof(title_after), "After IQRM (flagged %d/%d, r=%d, thr=%.1f)", flagged_channels, nchanBinned, radius, threshold);
+                cpgmtxt("T", 3.0, 0.35, 0.5, title_after);
+                plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, mask_CLFD, NULL);
+            }
+            int do_substitute = 1; if (do_substitute) {
+                float *chan_buf = (float*)malloc(sizeof(float) * nsampBinned);
+                for (int ch = 0; ch < nchanBinned; ++ch) if (iqrm_mask_1d[ch]) { float *col = outDataT + ch * nsampBinned; memcpy(chan_buf, col, sizeof(float)*nsampBinned); qsort(chan_buf, nsampBinned, sizeof(float), cmp_float_for_qsort); float median = (nsampBinned % 2 == 0)? 0.5f*(chan_buf[nsampBinned/2-1]+chan_buf[nsampBinned/2]) : chan_buf[nsampBinned/2]; for (int t=0;t<nsampBinned;++t) col[t]=median; }
+                free(chan_buf);
+            }
+            if (writeMasks) { char mask_IQRM_filename[256]; sprintf(mask_IQRM_filename, "%smask_IQRM_%d.png", m.datasetPath, ii); writeIndexMaskPNG(mask_CLFD, nsampBinned, nchanBinned, mask_IQRM_filename); }
+            free(chan_feature); free(iqrm_mask_1d);
+            */
+
+            // =====================CLFD (启用)====================================================
+            CLFD(outDataT, nsampBinned, nchanBinned, 1.0f, NULL, 0, mask_CLFD);
+            for (int idx = 0; idx < nsampBinned * nchanBinned; idx++) {
+                if (mask_SPIKE[idx]) mask_CLFD[idx] = 1; // 如果有 spike 掩码，合并
+            }
+            substPixels2D(outDataT, nsampBinned, nchanBinned, mask_CLFD);
+            if (writeMasks) {
+                char mask_CLFD_filename[256];
+                sprintf(mask_CLFD_filename, "%smask_CLFD_%d.png", m.datasetPath, ii);
+                writeIndexMaskPNG(mask_CLFD, nsampBinned, nchanBinned, mask_CLFD_filename);
+            }
+            if (m.plot) {
+                cpgpage(); cpgmtxt("T", 3.0, 0.35, 0.5, "Before CLFD");
+                plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, NULL, NULL);
+                cpgpage(); cpgmtxt("T", 3.0, 0.35, 0.5, "After CLFD");
+                plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, mask_CLFD, NULL);
+            }
 
 
-            float NSigmaInChan = 3.0f; // Updated to use 3-sigma threshold for iterative outlier detection
-            float NSigmaOutChan = 3.0f;
-            if (m.doSubstitution)
-            {
-                identSubstNSigma(outDataT, nsampBinned, nchanBinned, NSigmaInChan, NSigmaOutChan, ii, m.plot,
-                                 horizontalMask, verticalMask, globalMask, finalMedian, finalStd, m.cudaReady, channel_fully_flagged);
-            }
-            if (writeMasks)
-            {
-                char mask_Subst_filename[256];
-                sprintf(mask_Subst_filename, "%smask_Subst_%d.png", m.datasetPath, ii);
-                writeIndexMaskPNG(globalMask, nsampBinned, nchanBinned, mask_Subst_filename);
-            }
-            if (m.plot)
-            { // Plot result after NSigma substitution
-                cpgpage();
-                plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, globalMask, channel_fully_flagged);
-            }
+
+            // =====================NSigmaHist============================================================
+            // float NSigmaInChan = 3.0f; // Updated to use 3-sigma threshold for iterative outlier detection
+            // float NSigmaOutChan = 3.0f;
+            // if (m.doSubstitution)
+            // {
+            //     identSubstNSigma(outDataT, nsampBinned, nchanBinned, NSigmaInChan, NSigmaOutChan, ii, m.plot,
+            //                      horizontalMask, verticalMask, globalMask, finalMedian, finalStd, m.cudaReady, channel_fully_flagged);
+            // }
+            // if (writeMasks)
+            // {
+            //     char mask_Subst_filename[256];
+            //     sprintf(mask_Subst_filename, "%smask_Subst_%d.png", m.datasetPath, ii);
+            //     writeIndexMaskPNG(globalMask, nsampBinned, nchanBinned, mask_Subst_filename);
+            // }
+            // if (m.plot)
+            // { // Plot result after NSigma substitution
+            //     cpgpage();
+            //     plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, globalMask, channel_fully_flagged);
+            // }
 
 
-
-            float timesOfSigma = 3.0f;
-            // float timesOfSigma = 8.0f;
-            int M_len = 6;
-            int win_samp = 3, win_chan = 3;
-            float thrup = 0.5f, thrdown = 0.5f;
-            if (m.doSumThreshold)
-            {
-                sumthreshold_2d(outDataT, nsampBinned, nchanBinned,
-                                mask_chanRFI, mask_ST, timesOfSigma, M_len);
-                // if (m.cudaReady) {
-                //     printf("Using CUDA-accelerated binarySIR filtering...\n");
-                //     cuda_binarySIR(mask_ST, nsampBinned, nchanBinned, win_samp, win_chan, thrup, thrdown);
-                // } else {
-                //     binarySIR(mask_ST, nsampBinned, nchanBinned, win_samp, win_chan, thrup, thrdown);
-                // }
-                // binarySIR(mask_ST, nsampBinned, nchanBinned, win_samp, win_chan, thrup, thrdown);
-            }
-            if (writeMasks)
-            {
-                char mask_ST_filename[256];
-                sprintf(mask_ST_filename, "%smask_ST_%d.png", m.datasetPath, ii);
-                writeIndexMaskPNG(mask_ST, nsampBinned, nchanBinned, mask_ST_filename);
-            }
-            if (m.plot)
-            {
-                cpgpage();
-                char text3[100];
-                snprintf(text3, sizeof(text3), "Result of SumThreshold RFI detection with chi=%.2f", timesOfSigma);
-                cpgmtxt("T", 3.5, 0.5, 0.5, text3);
-                plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, mask_ST, channel_fully_flagged);
-            }
-            if (m.doSumThreshold)
-            {
-                substPixels2D(outDataT, nsampBinned, nchanBinned, mask_ST);
-            }
-            if (m.plot)
-            {
-                cpgpage();
-                cpgmtxt("T", 3.5, 0.5, 0.5, "Result after pixel substitution");
-                // 顶部和右侧都显示标准差，无掩码
-                plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, NULL, channel_fully_flagged);
-                cpgpage();
-            }            
+            // =================================SumThreshold===================================================
+            // float timesOfSigma = 3.0f;
+            // int M_len = 6;
+            // int win_samp = 3, win_chan = 3;
+            // float thrup = 0.5f, thrdown = 0.5f;
+            // memset(mask_ST, 0, sizeof(int) * nsampBinned * nchanBinned);
+            // if (m.doSumThreshold)
+            // {
+            //     sumthreshold_2d(outDataT, nsampBinned, nchanBinned,
+            //                     mask_chanRFI, mask_ST, timesOfSigma, M_len);
+            // }
+            // if (writeMasks)
+            // {
+            //     char mask_ST_filename[256];
+            //     sprintf(mask_ST_filename, "%smask_ST_%d.png", m.datasetPath, ii);
+            //     writeIndexMaskPNG(mask_ST, nsampBinned, nchanBinned, mask_ST_filename);
+            // }
+            // if (m.plot)
+            // {
+            //     cpgpage();
+            //     char text3[100];
+            //     snprintf(text3, sizeof(text3), "Result of SumThreshold RFI detection with chi=%.2f", timesOfSigma);
+            //     cpgmtxt("T", 3.5, 0.5, 0.5, text3);
+            //     plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, mask_ST, channel_fully_flagged);
+            // }
+            // if (m.doSumThreshold)
+            // {
+            //     substPixels2D(outDataT, nsampBinned, nchanBinned, mask_ST);
+            // }
+            // if (m.plot)
+            // {
+            //     cpgpage();
+            //     cpgmtxt("T", 3.5, 0.5, 0.5, "Result after pixel substitution");
+            //     // 顶部和右侧都显示标准差，无掩码
+            //     plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, NULL, channel_fully_flagged);
+            //     cpgpage();
+            // }
         }
 
         if (m.write)
@@ -998,6 +1144,9 @@ int main(int argc, char *argv[])
     free(verticalMask);
     free(globalMask);
     free(channel_fully_flagged);
+    free(mask_CLFD);
+    free(mask_SPIKE);
+    free(replacement_SPIKE);
     free(outRawData);
     free(outRawDataT);
     free(scale);

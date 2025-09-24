@@ -153,6 +153,36 @@ __global__ void downsample2DKernel(const float *input, float *output,
     output[out_i * nchanBinned + out_j] = sum / (binFactorTime * binFactorFreq);
 }
 
+// ---------------------------------------------------------------------------
+// In-channel thresholding: flag samples where |x - mean[channel]| > Nsigma * std[channel]
+// Assumes data is channel-major: each channel occupies a contiguous block of nsamp
+__global__ void inChanThresholdKernel(const float *data, const float *means, const float *stds,
+                                      int nsamp, int nchan, float Nsigma, int *mask)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = nsamp * nchan;
+    if (idx >= total) return;
+
+    int ch = idx / nsamp;
+    int off = idx % nsamp;
+    float mu = means[ch];
+    float sd = stds[ch];
+    float thr = Nsigma * sd;
+    float v = data[ch * nsamp + off];
+    if (!(sd > 0.0f)) { mask[ch * nsamp + off] = 0; return; }
+    mask[ch * nsamp + off] = (fabsf(v - mu) > thr) ? 1 : 0;
+}
+
+// Expand per-channel mask (0/1 per channel) to 2D mask (channel-major)
+__global__ void expandChannelMask2DKernel(const int *chan_mask, int nchan, int nsamp, int *mask2d)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = nsamp * nchan;
+    if (idx >= total) return;
+    int ch = idx / nsamp;
+    mask2d[idx] = chan_mask[ch] ? 1 : 0;
+}
+
 // ============================================================================
 // Host Interface Functions
 // ============================================================================
@@ -287,6 +317,138 @@ void cuda_downsample2D_impl(const float *input, float *output,
     // Cleanup
     CUDA_CHECK(cudaFree(d_input));
     CUDA_CHECK(cudaFree(d_output));
+}
+
+// ---------------------------------------------------------------------------
+// Public (not yet integrated) helpers for in-channel and out-channel detection
+
+// In-channel outlier detection using per-channel mean/std and Nsigma threshold
+// data: channel-major layout (ch * nsamp + t)
+// mask_out: host pointer, size nsamp*nchan, 1 for outlier sample
+void cuda_inChanThreshold_impl(const float *data, int nsamp, int nchan, float Nsigma,
+                               int *mask_out)
+{
+    int total = nsamp * nchan;
+    if (nsamp <= 0 || nchan <= 0 || !data || !mask_out) {
+        fprintf(stderr, "cuda_inChanThreshold_impl: invalid input parameters\n");
+        return;
+    }
+
+    float *d_data = nullptr, *d_means = nullptr, *d_stds = nullptr;
+    int *d_mask = nullptr;
+
+    CUDA_CHECK(cudaMalloc(&d_data, total * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_means, nchan * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_stds, nchan * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_mask, total * sizeof(int)));
+
+    CUDA_CHECK(cudaMemcpy(d_data, data, total * sizeof(float), cudaMemcpyHostToDevice));
+
+    // Reuse existing kernel: one block per channel
+    {
+        int blockSize = 256;
+        int sharedMemSize = 2 * blockSize * sizeof(float);
+        channelStatsKernel<<<nchan, blockSize, sharedMemSize>>>(d_data, d_means, d_stds, nsamp, nchan);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    // Threshold per element
+    {
+        int blockSize = 256;
+        int gridSize = (total + blockSize - 1) / blockSize;
+        inChanThresholdKernel<<<gridSize, blockSize>>>(d_data, d_means, d_stds, nsamp, nchan, Nsigma, d_mask);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    CUDA_CHECK(cudaMemcpy(mask_out, d_mask, total * sizeof(int), cudaMemcpyDeviceToHost));
+
+    CUDA_CHECK(cudaFree(d_data));
+    CUDA_CHECK(cudaFree(d_means));
+    CUDA_CHECK(cudaFree(d_stds));
+    CUDA_CHECK(cudaFree(d_mask));
+}
+
+// Out-channel detection via IQR on per-channel standard deviations (host-side IQR)
+// channel_mask_out: host pointer, size nchan, 1 for flagged channel
+void cuda_outChanIQR_impl(const float *data, int nsamp, int nchan, float q,
+                          int *channel_mask_out)
+{
+    if (nsamp <= 0 || nchan <= 0 || !data || !channel_mask_out) {
+        fprintf(stderr, "cuda_outChanIQR_impl: invalid input parameters\n");
+        return;
+    }
+
+    int total = nsamp * nchan;
+    float *d_data = nullptr, *d_means = nullptr, *d_stds = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_data, total * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_means, nchan * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_stds, nchan * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(d_data, data, total * sizeof(float), cudaMemcpyHostToDevice));
+
+    // Per-channel stats on GPU
+    {
+        int blockSize = 256;
+        int sharedMemSize = 2 * blockSize * sizeof(float);
+        channelStatsKernel<<<nchan, blockSize, sharedMemSize>>>(d_data, d_means, d_stds, nsamp, nchan);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    // Copy stds back to host for IQR (robust and simple on host)
+    float *h_stds = (float*)malloc(nchan * sizeof(float));
+    CUDA_CHECK(cudaMemcpy(h_stds, d_stds, nchan * sizeof(float), cudaMemcpyDeviceToHost));
+
+    // Compute Q1/Q3 on host
+    float *sorted = (float*)malloc(nchan * sizeof(float));
+    memcpy(sorted, h_stds, nchan * sizeof(float));
+    // simple qsort comparator
+    auto cmp = [](const void* a, const void* b){
+        float fa = *(const float*)a, fb = *(const float*)b;
+        return (fa > fb) - (fa < fb);
+    };
+    qsort(sorted, nchan, sizeof(float), cmp);
+    auto pct_idx = [&](float p){
+        int idx = (int)(p * (nchan - 1));
+        if (idx < 0) idx = 0; if (idx >= nchan) idx = nchan - 1; return idx;
+    };
+    float q1 = sorted[pct_idx(0.25f)];
+    float q3 = sorted[pct_idx(0.75f)];
+    float iqr = q3 - q1;
+    float vmin = q1 - q * iqr;
+    float vmax = q3 + q * iqr;
+
+    for (int ch = 0; ch < nchan; ++ch) {
+        float s = h_stds[ch];
+        channel_mask_out[ch] = (s < vmin || s > vmax) ? 1 : 0;
+    }
+
+    free(sorted);
+    free(h_stds);
+    CUDA_CHECK(cudaFree(d_data));
+    CUDA_CHECK(cudaFree(d_means));
+    CUDA_CHECK(cudaFree(d_stds));
+}
+
+// Expand per-channel mask to 2D mask on GPU (channel-major)
+void cuda_expandChannelMask2D_impl(const int *channel_mask, int nchan, int nsamp, int *mask2d_out)
+{
+    if (!channel_mask || !mask2d_out || nchan <= 0 || nsamp <= 0) {
+        fprintf(stderr, "cuda_expandChannelMask2D_impl: invalid input parameters\n");
+        return;
+    }
+    int total = nchan * nsamp;
+    int *d_chan = nullptr, *d_mask2d = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_chan, nchan * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_mask2d, total * sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(d_chan, channel_mask, nchan * sizeof(int), cudaMemcpyHostToDevice));
+
+    int blockSize = 256;
+    int gridSize = (total + blockSize - 1) / blockSize;
+    expandChannelMask2DKernel<<<gridSize, blockSize>>>(d_chan, nchan, nsamp, d_mask2d);
+    CUDA_CHECK(cudaGetLastError());
+
+    CUDA_CHECK(cudaMemcpy(mask2d_out, d_mask2d, total * sizeof(int), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d_chan));
+    CUDA_CHECK(cudaFree(d_mask2d));
 }
 
 // ============================================================================

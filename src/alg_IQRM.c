@@ -1,53 +1,54 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <math.h>
+#include <float.h>
 #include <string.h>
+#include "findStats.h"
 
 #ifndef IQRM_GEOMETRIC_FACTOR
 #define IQRM_GEOMETRIC_FACTOR 1.5
 #endif
 
-int cmp_float(const void *a, const void *b) {
-    float da = *(const float*)a;
-    float db = *(const float*)b;
-    if (da < db) return -1;
-    if (da > db) return 1;
-    return 0;
-}
-
-/* Linear interpolation percentile on sorted array arr of length m (m > 0) */
-float percentile_linear(const float *arr, int m, float p) {
-    if (m <= 0) return NAN;
-    if (p <= 0.0) return arr[0];
-    if (p >= 100.0) return arr[m - 1];
-    float rank = p / 100.0f * (m - 1);
-    int lo = (int)floor(rank);
-    int hi = (int)ceil(rank);
-    float w = rank - lo;
-    if (hi == lo) return arr[lo];
-    return arr[lo] + (arr[hi] - arr[lo]) * w;
-}
-
-int compute_quartiles(const float *x, int n, float *q1, float *med, float *q3) {
+int calcQuartiles(const float *x, int n, float *q1, float *med, float *q3) {
     float *buf = (float*)malloc(n * sizeof(float));
     int m = 0;
     for (int i = 0; i < n; ++i) {
         float v = x[i];
-        if (!isnan(v)) buf[m++] = v;
+        if (v == v) buf[m++] = v; /* v==v is false only for NaN */
     }
     if (m == 0) {free(buf); return 0;}
     qsort(buf, m, sizeof(float), cmp_float);
-    *q1  = percentile_linear(buf, m, 25.0f);
-    *med = percentile_linear(buf, m, 50.0f);
-    *q3  = percentile_linear(buf, m, 75.0f);
+    *q1  = percentile(buf, m, 25.0f);
+    *med = percentile(buf, m, 50.0f);
+    *q3  = percentile(buf, m, 75.0f);
     free(buf);
     return 1;
+}
+
+/* Compute per-channel std on channel-major data: data[ch*nsamp + t] */
+static void compute_channel_std(const float *data_by_chan, int nsamp, int nchan, float *stds_out) {
+    for (int ch = 0; ch < nchan; ++ch) {
+        const float *col = data_by_chan + (size_t)ch * (size_t)nsamp;
+        double sum = 0.0, sum2 = 0.0; int cnt = 0;
+        for (int t = 0; t < nsamp; ++t) {
+            float v = col[t];
+            sum += v; sum2 += (double)v * (double)v; cnt++;
+        }
+        float s = 0.0f;
+        if (cnt > 1) {
+            double mean = sum / cnt;
+            double var = (sum2 - 2.0 * mean * sum + mean * mean * cnt) / cnt;
+            if (var < 0.0) var = 0.0;
+            s = (float)sqrt(var);
+        }
+        stds_out[ch] = s;
+    }
 }
 
 /* ---------------------- Outlier mask (Tukey) ------------------------- */
 void outlier_mask_diff(const float *d, int n, float threshold, unsigned char *m_out) {
     float q1, med, q3;
-    if (!compute_quartiles(d, n, &q1, &med, &q3)) {
+    if (!calcQuartiles(d, n, &q1, &med, &q3)) {
         /* No valid data => no outliers */
         for (int i = 0; i < n; ++i) m_out[i] = 0;
         return;
@@ -56,7 +57,7 @@ void outlier_mask_diff(const float *d, int n, float threshold, unsigned char *m_
     if (!(std > 0.0f)) std = 1e-12f;   /* avoid division by zero */
     for (int i = 0; i < n; ++i) {
         float v = d[i];
-        if (isnan(v)) { m_out[i] = 0; continue; }
+        if (v != v) { m_out[i] = 0; continue; }
         m_out[i] = (unsigned char)((v - med) > threshold * std);
     }
 }
@@ -75,10 +76,10 @@ void lagged_diff(const float *input, int num_elements, int lag, float *differenc
 }
 
 /* ---------------------- Main IQRM function --------------------------- */
-int iqrm_mask(float *x, int n, int radius, float threshold,
+int alg_iqrm_mask(float *x, int n, int radius, float threshold,
               int *ignore, int ignore_count,
               unsigned char *mask_out) {
-    /* 参数检查保留 */
+    /* Parameter checks retained */
     if (!x || !mask_out || n <= 0) return 1;
     if (radius <= 0) return 2;
     if (!(threshold > 0.0)) return 3;
@@ -145,4 +146,115 @@ int iqrm_mask(float *x, int n, int radius, float threshold,
     free(diff); 
     free(m);
     return 0;
+}
+
+/* ---------------------- Channel Std IQR detection ------------------- */
+int iqrmChanStd(const float *data_by_chan, int nsamp, int nchan,
+                         float tukey_q, unsigned char *chan_mask_out) {
+    if (!(tukey_q > 0.0f)) tukey_q = 1.5f;
+    float *stds = (float*)malloc((size_t)nchan * sizeof(float));
+    float *sorted = (float*)malloc((size_t)nchan * sizeof(float));
+
+    // 1) compute per-channel std
+    compute_channel_std(data_by_chan, nsamp, nchan, stds);
+
+    // 2) quartiles across channels
+    memcpy(sorted, stds, (size_t)nchan * sizeof(float));
+    qsort(sorted, nchan, sizeof(float), cmp_float);
+    float q1 = percentile(sorted, nchan, 25.0f);
+    float q3 = percentile(sorted, nchan, 75.0f);
+    float iqr = q3 - q1;
+    float vmin, vmax;
+    if (!(iqr > 0.0f)) { vmin = -FLT_MAX; vmax = FLT_MAX; }
+    else { vmin = q1 - tukey_q * iqr; vmax = q3 + tukey_q * iqr; }
+
+    // 3) flag
+    int flagged = 0;
+    for (int ch = 0; ch < nchan; ++ch) {
+        unsigned char f = (stds[ch] < vmin || stds[ch] > vmax) ? 1 : 0;
+        chan_mask_out[ch] = f; flagged += f;
+    }
+
+    free(stds); 
+    free(sorted);
+    return flagged;
+}
+
+/* ---------------------- Utilities ------------------- */
+void expandChanMask(const unsigned char *chan_mask, int nchan, int nsamp, int *mask2d) {
+    memset(mask2d, 0, (size_t)nchan * (size_t)nsamp * sizeof(int));
+    for (int ch = 0; ch < nchan; ++ch) {
+        if (!chan_mask[ch]) continue;
+        int base = ch * nsamp; // Base index for 2D mask
+        for (int t = 0; t < nsamp; ++t) mask2d[base + t] = 1;
+    }
+}
+
+/* ---------------------- Combined: Channel IQR + IQRM ------------------- */
+int IQRM(const float *data_by_chan, int nsamp, int nchan,
+                                 float tukey_q, float iqrm_threshold,
+                                 int **mask2d_out) {
+    if (!(tukey_q > 0.0f)) tukey_q = 1.5f;
+    if (!(iqrm_threshold > 0.0f)) iqrm_threshold = 3.0f;
+
+    // Compute per-channel std once
+    float *chan_std = (float*)malloc((size_t)nchan * sizeof(float));
+    compute_channel_std(data_by_chan, nsamp, nchan, chan_std);
+
+    // 1) Channel Std IQR on precomputed std
+    unsigned char *mask_std = (unsigned char*)calloc((size_t)nchan, sizeof(unsigned char));
+    float *sorted = (float*)malloc((size_t)nchan * sizeof(float)); // Sorted array for quartiles
+    memcpy(sorted, chan_std, (size_t)nchan * sizeof(float));
+    qsort(sorted, nchan, sizeof(float), cmp_float);
+    float q1 = percentile(sorted, nchan, 25.0f);
+    float q3 = percentile(sorted, nchan, 75.0f);
+    float iqr = q3 - q1;
+    float vmin, vmax;
+    vmin = q1 - tukey_q * iqr; 
+    vmax = q3 + tukey_q * iqr;
+    for (int ch = 0; ch < nchan; ++ch) {
+        mask_std[ch] = (chan_std[ch] < vmin || chan_std[ch] > vmax) ? 1 : 0;
+    }
+
+    // 2) IQRM with channel std as feature
+    float *chan_feature = chan_std; /* reuse */
+    int iqrm_radius = nchan / 10;  // Fixed radius as 1/10 of nchan
+    if (iqrm_radius < 1) iqrm_radius = 1;  // Ensure minimum radius of 1
+    unsigned char *mask_iqrm = (unsigned char*)calloc((size_t)nchan, sizeof(unsigned char));
+    alg_iqrm_mask(chan_feature, nchan, iqrm_radius, iqrm_threshold, NULL, 0, mask_iqrm);
+
+    // 3) Merge OR
+    unsigned char *mask_1d = (unsigned char*)calloc((size_t)nchan, sizeof(unsigned char));
+    int flagged = 0;
+    for (int ch = 0; ch < nchan; ++ch) { mask_1d[ch] = (mask_std[ch] || mask_iqrm[ch]) ? 1 : 0; flagged += mask_1d[ch]; }
+
+    // 4) Expand to 2D (allocate and return)
+    int *mask2d = NULL;
+    if (mask2d_out) {
+        mask2d = (int*)malloc((size_t)nchan * (size_t)nsamp * sizeof(int));
+        expandChanMask(mask_1d, nchan, nsamp, mask2d);
+
+        // Add pixel-level IQRM for unmarked channels
+        for (int ch = 0; ch < nchan; ++ch) {
+            if (mask_1d[ch]) continue; // channel already masked, all pixels 1
+            const float *time_series = data_by_chan + ch * (size_t)nsamp;
+            unsigned char *pixel_mask = (unsigned char*)malloc(nsamp * sizeof(unsigned char));
+            int pixel_radius = nsamp / 10;
+            if (pixel_radius < 1) pixel_radius = 1;
+            alg_iqrm_mask(time_series, nsamp, pixel_radius, iqrm_threshold, NULL, 0, pixel_mask);
+            for (int t = 0; t < nsamp; ++t) {
+                mask2d[ch * nsamp + t] = pixel_mask[t];
+            }
+            free(pixel_mask);
+        }
+
+        *mask2d_out = mask2d;
+    }
+
+    free(mask_1d);
+    free(mask_iqrm);
+    free(sorted);
+    free(mask_std);
+    free(chan_std);
+    return flagged;
 }

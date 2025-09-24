@@ -1,23 +1,8 @@
-#include <stdio.h>
 #include <stdlib.h>
-#include <math.h>
 #include <string.h>
-
-// Comparison for qsort
-int compare(const void* a, const void* b) {
-    return (*(float*)a > *(float*)b) - (*(float*)a < *(float*)b);
-}
-
-// Calculate percentile
-float percentile(float* arr, int n, float p) {
-    float* sorted = (float*)malloc(n * sizeof(float));
-    memcpy(sorted, arr, n * sizeof(float));
-    qsort(sorted, n, sizeof(float), compare);
-    int idx = (int)(p * (n - 1));
-    float result = sorted[idx];
-    free(sorted);
-    return result;
-}
+#include <math.h>
+#include <float.h>
+#include "findStats.h"
 
 // CLFD (formerly profile_mask) for 2D time-frequency array
 // Input: data (nsamp x nchan, column-major), mask (pre-allocated, same shape)
@@ -44,8 +29,12 @@ void CLFD(float* data, int nsamp, int nchan, float q, int* zap_freqs, int zap_le
             chan_features[i] = data[j * nsamp + i];
         }
 
-        float q1 = percentile(chan_features, nsamp, 0.25f);
-        float q3 = percentile(chan_features, nsamp, 0.75f);
+        float* sorted = (float*)malloc(nsamp * sizeof(float));
+        memcpy(sorted, chan_features, nsamp * sizeof(float));
+        qsort(sorted, nsamp, sizeof(float), cmp_float);
+        float q1 = percentile(sorted, nsamp, 25.0f);
+        float q3 = percentile(sorted, nsamp, 75.0f);
+        free(sorted);
         float iqr_val = q3 - q1;
         float min_val = q1 - q * iqr_val;
         float max_val = q3 + q * iqr_val;
@@ -81,7 +70,8 @@ void spike_mask(float* data, int nsamp, int nchan, float q, int* zap_freqs, int 
         for (int i = 0; i < nsamp; i++) {
             chan_data[i] = data[j * nsamp + i];
         }
-        baselines[j] = percentile(chan_data, nsamp, 0.5f);  // 中位数
+        qsort(chan_data, nsamp, sizeof(float), cmp_float);
+        baselines[j] = percentile(chan_data, nsamp, 50.0f);  // 中位数
         free(chan_data);
     }
 
@@ -101,9 +91,10 @@ void spike_mask(float* data, int nsamp, int nchan, float q, int* zap_freqs, int 
         for (int i = 0; i < nsamp; i++) {
             bin_data[i] = subtracted[j * nsamp + i];
         }
-        q1_arr[j] = percentile(bin_data, nsamp, 0.25f);
-        med_arr[j] = percentile(bin_data, nsamp, 0.5f);
-        q3_arr[j] = percentile(bin_data, nsamp, 0.75f);
+        qsort(bin_data, nsamp, sizeof(float), cmp_float);
+        q1_arr[j] = percentile(bin_data, nsamp, 25.0f);
+        med_arr[j] = percentile(bin_data, nsamp, 50.0f);
+        q3_arr[j] = percentile(bin_data, nsamp, 75.0f);
     }
     free(bin_data);
 

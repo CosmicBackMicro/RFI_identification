@@ -93,6 +93,32 @@ void cuda_binarySIR(int *mask, int nsamp, int nchan,
                    int win_samp, int win_chan, 
                    float thr_up, float thr_down);
 
+/**
+ * CUDA-accelerated pipeline (skeleton) for identSubstNSigma
+ * Approximates point-level outlier detection on GPU and produces masks.
+ * This is a framework function intended to be extended.
+ *
+ * @param data            In/Out data array (nsamp * nchan)
+ * @param nsamp           Number of samples per channel
+ * @param nchan           Number of channels
+ * @param Nsigma          Sigma threshold for point-level detection
+ * @param channel_std_threshold  Threshold for channel-level (reserved, not used in skeleton)
+ * @param iterationIndex  Iteration index (reserved for logging)
+ * @param plot            Whether to plot (not used in CUDA path)
+ * @param horizontalMask  Output mask (nsamp * nchan), 1 = flagged
+ * @param verticalMask    Output mask (nsamp * nchan), reserved/zeroed in skeleton
+ * @param globalMask      Output mask (nsamp * nchan), copy of horizontalMask in skeleton
+ * @param finalMedian     Output overall median estimate (approx; skeleton writes mean)
+ * @param finalStd        Output overall std estimate (approx; skeleton writes std)
+ * @param channel_fully_flagged Output per-channel full-flag indicator (nchan)
+ */
+void cuda_identSubstNSigma(float *data, int nsamp, int nchan,
+                           float Nsigma, float channel_std_threshold,
+                           int iterationIndex, int plot,
+                           int *horizontalMask, int *verticalMask, int *globalMask,
+                           float *finalMedian, float *finalStd,
+                           int *channel_fully_flagged);
+
 // ============================================================================
 // Utility Macros
 // ============================================================================

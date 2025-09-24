@@ -6,64 +6,23 @@
 #include "ReadFASTData.h"
 #include "omp.h"
 
-// int partition(float *arr, int left, int right) {
-//     float pivot = arr[(left + right) / 2];  // Select pivot
-//     int i = left - 1, j = right + 1;
+int cmp_float(const void *a, const void *b) {
+    float da = *(const float*)a;
+    float db = *(const float*)b;
+    if (da < db) return -1;
+    if (da > db) return 1;
+    return 0;
+}
 
-//     while (1) {
-//         // Scan from left to find the first element >= pivot
-//         while (i < right) {
-//             i++;
-//             if (arr[i] >= pivot) break;
-//         }
-//         // Scan from right to find the first element <= pivot
-//         while (j > left) {
-//             j--;
-//             if (arr[j] <= pivot) break;
-//         }
-//         // Check if pointers meet or cross
-//         if (i >= j) return j;
-//         // Swap elements
-//         float temp = arr[i];
-//         arr[i] = arr[j];
-//         arr[j] = temp;
-//     }
-// }
-
-// float quickselect(float *arr, int left, int right, int k)
-// {
-//     if (left == right)
-//         return arr[left];
-
-//     int p = partition(arr, left, right);
-
-//     if (k <= p)
-//     {
-//         return quickselect(arr, left, p, k);
-//     }
-//     else
-//     {
-//         return quickselect(arr, p + 1, right, k);
-//     }
-// }
-
-// void findMedian(float *arr, int size, float *median)
-// {
-//     float *tmp = malloc(size * sizeof(float));
-//     memcpy(tmp, arr, size * sizeof(float));
-    
-// #pragma omp parallel
-//     {
-//         int tid = omp_get_thread_num();
-//         int threads = omp_get_num_threads();
-//         int chunk = (size + threads - 1) / threads;
-//         int left = tid * chunk;
-//         int right = (left + chunk > size) ? size - 1 : left + chunk - 1;
-//         quickselect(tmp, left, right, left + (right - left) / 2);
-//     }
-//     *median = quickselect(tmp, 0, size - 1, size / 2);
-//     free(tmp);
-// }
+/* Linear interpolation percentile on sorted array arr of length m (m > 0) */
+float percentile(const float *arr, int m, float p) {
+    float rank = p / 100.0f * (m - 1);
+    int lo = (int)floor(rank);
+    int hi = (int)ceil(rank);
+    float w = rank - lo;
+    if (hi == lo) return arr[lo];
+    return arr[lo] + (arr[hi] - arr[lo]) * w;
+}
 
 #define ELEM_SWAP(a,b) { register float t=(a);(a)=(b);(b)=t; }
 

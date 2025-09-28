@@ -110,14 +110,14 @@ void cuda_binarySIR(int *mask, int nsamp, int nchan,
  * @param globalMask      Output mask (nsamp * nchan), copy of horizontalMask in skeleton
  * @param finalMedian     Output overall median estimate (approx; skeleton writes mean)
  * @param finalStd        Output overall std estimate (approx; skeleton writes std)
- * @param channel_fully_flagged Output per-channel full-flag indicator (nchan)
+ * @param flaggedChans      Output per-channel full-flag indicator (nchan)
  */
 void cuda_identSubstNSigma(float *data, int nsamp, int nchan,
-                           float Nsigma, float channel_std_threshold,
+                           float NSigmaInChan, float NSigmaOutChan,
                            int iterationIndex, int plot,
                            int *horizontalMask, int *verticalMask, int *globalMask,
                            float *finalMedian, float *finalStd,
-                           int *channel_fully_flagged);
+                           int *flaggedChans);
 
 // ============================================================================
 // Utility Macros

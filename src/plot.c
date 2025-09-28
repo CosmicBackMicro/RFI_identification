@@ -193,7 +193,7 @@ void plotDownsampLongTimeAbs(Metadata *m, int numReads, float *dsDataT, float *d
  * @param rightPanelMode Mode for right panel: 0=mean, 1=std
  * @param mask Optional mask array for RFI flagging (NULL to skip mask plotting)
  */
-void plotTimeFreqSED(Metadata *m, int numReads, float *dsDataT, float *dsFreqArray, float startTime, int currentBlock, float *baseline, int topPanelMode, int rightPanelMode, int *mask, int *channel_fully_flagged)
+void plotTimeFreqSED(Metadata *m, int numReads, float *dsDataT, float *dsFreqArray, float startTime, int currentBlock, float *baseline, int topPanelMode, int rightPanelMode, int *mask, int *flaggedChans)
 {
     // === Global Layout Configuration ===
     float globalMargin = 0.1;  // Symmetric margin for left/right/top/bottom
@@ -289,11 +289,11 @@ void plotTimeFreqSED(Metadata *m, int numReads, float *dsDataT, float *dsFreqArr
     cpgbox("BCNST", 0, 0, "BCMST", 0, 0);
     
     // Draw frequency profile with gaps for fully flagged channels
-    if (channel_fully_flagged != NULL) {
+    if (flaggedChans != NULL) {
         // Draw profile with gaps for fully flagged channels
         int segmentStart = -1;
         for (int i = plotStartChan; i <= plotEndChan + 1; i++) {
-            int isChannelFlagged = (i <= plotEndChan) ? channel_fully_flagged[i] : 1; // Treat end as flagged to close last segment
+            int isChannelFlagged = (i <= plotEndChan) ? flaggedChans[i] : 1; // Treat end as flagged to close last segment
             
             if (!isChannelFlagged && segmentStart == -1) {
                 // Start a new segment
@@ -308,7 +308,7 @@ void plotTimeFreqSED(Metadata *m, int numReads, float *dsDataT, float *dsFreqArr
             }
         }
     } else {
-        // Fallback to original continuous line if no channel_fully_flagged info
+        // Fallback to original continuous line if no flaggedChans info
         cpgline(plotEndChan - plotStartChan + 1, dsFreqProfile + plotStartChan, dsFreqArray + plotStartChan);
     }
 

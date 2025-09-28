@@ -707,6 +707,27 @@ void writeFITSDataset(unsigned char *outRawData, float *scale, float *offset,
         printf("Successfully wrote block %d to %s\n", blockIndex, filename);
     }
 }
+
+// --- Mask allocation/cleanup helpers ---
+void allocIdentNSigmaMasks(IdentNSigmaMasks *m, int nsamp, int nchan) {
+    m->horizontalMask = (int *)calloc(nsamp * nchan, sizeof(int));
+    m->verticalMask   = (int *)calloc(nsamp * nchan, sizeof(int));
+    m->globalMask     = (int *)calloc(nsamp * nchan, sizeof(int));
+    m->pointMask      = (int *)calloc(nsamp * nchan, sizeof(int));
+    m->chanBrightMask = (int *)calloc(nsamp * nchan, sizeof(int));
+    m->chanDarkMask   = (int *)calloc(nsamp * nchan, sizeof(int));
+}
+
+void freeIdentNSigmaMasks(IdentNSigmaMasks *m) {
+    free(m->horizontalMask);
+    free(m->verticalMask);
+    free(m->globalMask);
+    free(m->pointMask);
+    free(m->chanBrightMask);
+    free(m->chanDarkMask);
+}
+
+
 int main(int argc, char *argv[])
 {
     setup_openmp(20);
@@ -789,29 +810,23 @@ int main(int argc, char *argv[])
 
     // Allocate output buffers
     // unsigned char *outRawData = malloc(sizeof(unsigned char) * nchanBinned * nsampBinned);
-    // unsigned char *outRawDataT = malloc(sizeof(unsigned char) * nchanBinned * nsampBinned);
     unsigned char *outRawData = malloc(sizeof(unsigned char) * nchan * nsamp);
-    unsigned char *outRawDataT = malloc(sizeof(unsigned char) * nchan * nsamp);
     float *outData = fftwf_malloc(sizeof(float) * nchanBinned * nsampBinned);
     float *outDataT = fftwf_malloc(sizeof(float) * nchanBinned * nsampBinned);
 
-    // Allocate RFI mask buffers
-    int *mask_chanRFI = calloc(nsampBinned * nchanBinned, sizeof(int));
-    int *mask_ST = calloc(nsampBinned * nchanBinned, sizeof(int));
-    int *horizontalMask = (int *)calloc(nsampBinned * nchanBinned, sizeof(int));
-    int *verticalMask = (int *)calloc(nsampBinned * nchanBinned, sizeof(int));
-    int *globalMask = (int *)calloc(nsampBinned * nchanBinned, sizeof(int));
-    int *channel_fully_flagged = (int *)calloc(nchanBinned, sizeof(int)); // Track fully flagged channels
-    int *mask_CLFD = calloc(nsampBinned * nchanBinned, sizeof(int));
-    int *mask_SPIKE = calloc(nsampBinned * nchanBinned, sizeof(int));
-    float *replacement_SPIKE = malloc(nsampBinned * nchanBinned * sizeof(float));
+    // Allocate RFI-related buffers (only those actually used below)
+    int *flaggedChans = (int *)calloc(nchanBinned, sizeof(int)); // Track fully flagged channels
+
+    IdentNSigmaMasks maskSet;
+    allocIdentNSigmaMasks(&maskSet, nsampBinned, nchanBinned);
+
 
     float *finalMedian = malloc(sizeof(float) * nsampBinned * nchanBinned);
     float *finalStd = malloc(sizeof(float) * nsampBinned * nchanBinned);
     float *scale = malloc(sizeof(float) * nchan);  // Fix: Use original nchan size
     float *offset = malloc(sizeof(float) * nchan); // Fix: Use original nchan size
-    float *scaleBinned = malloc(sizeof(float) * nchanBinned); // New: for downsampled data
-    float *offsetBinned = malloc(sizeof(float) * nchanBinned); // New: for downsampled data
+    float *scaleBinned = malloc(sizeof(float) * nchanBinned); // For downsampled data
+    float *offsetBinned = malloc(sizeof(float) * nchanBinned); // For downsampled data
     
     float *rawToFloatArray = NULL;
     int needDownsamp = (binFactorTime * binFactorFreq != 1);
@@ -919,44 +934,80 @@ int main(int argc, char *argv[])
             // }
 
             // =====================CLFD (启用)====================================================
-            CLFD(outDataT, nsampBinned, nchanBinned, 3.0f, NULL, 0, mask_CLFD);
-            for (int idx = 0; idx < nsampBinned * nchanBinned; idx++) {
-                if (mask_SPIKE[idx]) mask_CLFD[idx] = 1; // 如果有 spike 掩码，合并
-            }
-            substPixels2D(outDataT, nsampBinned, nchanBinned, mask_CLFD);
-            if (writeMasks) {
-                char mask_CLFD_filename[256];
-                sprintf(mask_CLFD_filename, "%smask_CLFD_%d.png", m.datasetPath, ii);
-                writeIndexMaskPNG(mask_CLFD, nsampBinned, nchanBinned, mask_CLFD_filename);
-            }
-            if (m.plot) {
-                cpgpage(); cpgmtxt("T", 3.0, 0.35, 0.5, "Before CLFD");
-                plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, NULL, NULL);
-                cpgpage(); cpgmtxt("T", 3.0, 0.35, 0.5, "After CLFD");
-                plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, mask_CLFD, NULL);
-            }
+            // CLFD(outDataT, nsampBinned, nchanBinned, 3.0f, NULL, 0, mask_CLFD);
+            // for (int idx = 0; idx < nsampBinned * nchanBinned; idx++) {
+            //     if (mask_SPIKE[idx]) mask_CLFD[idx] = 1; // 如果有 spike 掩码，合并
+            // }
+            // substPixels2D(outDataT, nsampBinned, nchanBinned, mask_CLFD);
+            // if (writeMasks) {
+            //     char mask_CLFD_filename[256];
+            //     sprintf(mask_CLFD_filename, "%smask_CLFD_%d.png", m.datasetPath, ii);
+            //     writeIndexMaskPNG(mask_CLFD, nsampBinned, nchanBinned, mask_CLFD_filename);
+            // }
+            // if (m.plot) {
+            //     cpgpage(); cpgmtxt("T", 3.0, 0.35, 0.5, "Before CLFD");
+            //     plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, NULL, NULL);
+            //     cpgpage(); cpgmtxt("T", 3.0, 0.35, 0.5, "After CLFD");
+            //     plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, mask_CLFD, NULL);
+            // }
 
 
 
             // =====================NSigmaHist============================================================
-            // float NSigmaInChan = 3.0f; // Updated to use 3-sigma threshold for iterative outlier detection
-            // float NSigmaOutChan = 3.0f;
-            // if (m.doSubstitution)
-            // {
-            //     identSubstNSigma(outDataT, nsampBinned, nchanBinned, NSigmaInChan, NSigmaOutChan, ii, m.plot,
-            //                      horizontalMask, verticalMask, globalMask, finalMedian, finalStd, m.cudaReady, channel_fully_flagged);
-            // }
-            // if (writeMasks)
-            // {
-            //     char mask_Subst_filename[256];
-            //     sprintf(mask_Subst_filename, "%smask_Subst_%d.png", m.datasetPath, ii);
-            //     writeIndexMaskPNG(globalMask, nsampBinned, nchanBinned, mask_Subst_filename);
-            // }
-            // if (m.plot)
-            // { // Plot result after NSigma substitution
-            //     cpgpage();
-            //     plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, globalMask, channel_fully_flagged);
-            // }
+            float NSigmaInChan = 3.0f; // Updated to use 3-sigma threshold for iterative outlier detection
+            float NSigmaOutChan = 3.0f;
+            if (m.doSubstitution)
+            {
+                identSubstNSigma(outDataT, nsampBinned, nchanBinned, NSigmaInChan, NSigmaOutChan, ii, m.plot,
+                                 &maskSet, finalMedian, finalStd, m.cudaReady, flaggedChans);
+            }
+            if (writeMasks)
+            {
+                char mask_horizontal_filename[256];
+                char mask_vertical_filename[256];
+                char mask_global_filename[256];
+                char mask_point_filename[256];
+                char mask_bright_filename[256];
+                char mask_dark_filename[256];
+
+                sprintf(mask_horizontal_filename, "%smask_horizontal_%d.png", m.datasetPath, ii);
+                writeIndexMaskPNG(maskSet.horizontalMask, nsampBinned, nchanBinned, mask_horizontal_filename);
+
+                sprintf(mask_vertical_filename, "%smask_vertical_%d.png", m.datasetPath, ii);
+                writeIndexMaskPNG(maskSet.verticalMask, nsampBinned, nchanBinned, mask_vertical_filename);
+
+                sprintf(mask_global_filename, "%smask_global_%d.png", m.datasetPath, ii);
+                writeIndexMaskPNG(maskSet.globalMask, nsampBinned, nchanBinned, mask_global_filename);
+
+                if (maskSet.pointMask) {
+                    sprintf(mask_point_filename, "%smask_point_%d.png", m.datasetPath, ii);
+                    writeIndexMaskPNG(maskSet.pointMask, nsampBinned, nchanBinned, mask_point_filename);
+                }
+
+                if (maskSet.chanBrightMask) {
+                    sprintf(mask_bright_filename, "%smask_chanBright_%d.png", m.datasetPath, ii);
+                    writeIndexMaskPNG(maskSet.chanBrightMask, nsampBinned, nchanBinned, mask_bright_filename);
+                }
+
+                if (maskSet.chanDarkMask) {
+                    sprintf(mask_dark_filename, "%smask_chanDark_%d.png", m.datasetPath, ii);
+                    writeIndexMaskPNG(maskSet.chanDarkMask, nsampBinned, nchanBinned, mask_dark_filename);
+                }
+            }
+            if (m.plot)
+            { // Plot result after NSigma substitution
+                cpgpage();
+                plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, maskSet.globalMask, flaggedChans);
+            }
+
+            // --- Final visualization: show data after all pixel substitutions ---
+            if (m.plot)
+            {
+                cpgpage();
+                cpgmtxt("T", 3.0, 0.35, 0.5, "Final result after all substitutions");
+                // Display processed data without mask overlay; stats panels remain enabled (top/right)
+                plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, NULL, flaggedChans);
+            }
 
 
             // =================================SumThreshold===================================================
@@ -982,7 +1033,7 @@ int main(int argc, char *argv[])
             //     char text3[100];
             //     snprintf(text3, sizeof(text3), "Result of SumThreshold RFI detection with chi=%.2f", timesOfSigma);
             //     cpgmtxt("T", 3.5, 0.5, 0.5, text3);
-            //     plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, mask_ST, channel_fully_flagged);
+            //     plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, mask_ST, flaggedChans);
             // }
             // if (m.doSumThreshold)
             // {
@@ -993,7 +1044,7 @@ int main(int argc, char *argv[])
             //     cpgpage();
             //     cpgmtxt("T", 3.5, 0.5, 0.5, "Result after pixel substitution");
             //     // 顶部和右侧都显示标准差，无掩码
-            //     plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, NULL, channel_fully_flagged);
+            //     plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, NULL, flaggedChans);
             //     cpgpage();
             // }
         }
@@ -1041,17 +1092,10 @@ int main(int argc, char *argv[])
     free(dsFreqArray);
     free(outData);
     free(outDataT);
-    free(mask_ST);
-    free(mask_chanRFI);
-    free(horizontalMask);
-    free(verticalMask);
-    free(globalMask);
-    free(channel_fully_flagged);
-    free(mask_CLFD);
-    free(mask_SPIKE);
-    free(replacement_SPIKE);
+    
+    freeIdentNSigmaMasks(&maskSet);
+    free(flaggedChans);
     free(outRawData);
-    free(outRawDataT);
     free(scale);
     free(offset);
     free(scaleBinned);

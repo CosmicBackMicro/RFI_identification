@@ -26,7 +26,7 @@ void binarySIR(int *mask, int nsamp, int nchan, int win_samp, int win_chan, floa
 
 void flagChannelsByMeanOutliers(float *data, int nsamp, int nchan, int *horizontalMask,
                                float *channel_means, float *channel_means_temp);
-void outChanDetection(float *data, int nsamp, int nchan, int *horizontalMask,
+void outChanDetection(float *data, int nsamp, int nchan, int *channelFlagged,
                               float *channel_stds, float *channel_stds_temp, float channel_std_threshold, float nsigma_in);
 
 void normalizeChannelData(float *data, int nsamp, int nchan, 
@@ -43,11 +43,20 @@ void drawUnifiedThresholdLines(const float *thresh_values, const char **threshol
                               const int *threshold_enabled, int num_thresholds,
                               float max_count, float x_min, float x_max);
 
+typedef struct {
+    int *horizontalMask;
+    int *verticalMask;
+    int *globalMask;
+    int *pointMask;
+    int *chanBrightMask;
+    int *chanDarkMask;
+} IdentNSigmaMasks;
+
 void identSubstNSigma(
-    float *data, int nsamp, int nchan, 
-    float Nsigma, float channel_std_threshold, int iterationIndex, int plot,
-    int *horizontalMask, int *verticalMask, int *globalMask,
-    float *finalMedian, float *finalStd, int cudaReady, int *channel_fully_flagged);
+    float *data, int nsamp, int nchan,
+    float NSigmaInChan, float NSigmaOutChan, int iterationIndex, int plot,
+    IdentNSigmaMasks *masks,
+    float *finalMedian, float *finalStd, int cudaReady, int *flaggedChans);
 
 // Histogram functions
 void calculateHistogram(float *data, int n, int nbins, 

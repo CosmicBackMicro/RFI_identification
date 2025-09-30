@@ -562,51 +562,70 @@ void sumthreshold_2d(
     free(chi_i);
 }
 
-// Function to randomly replace flagged pixels with unflagged pixels from the same time sample
-void randomReplaceRFIPixels(float *data, const int *mask, int nsamp, int nchan)
+// Function to randomly replace pixels of channels flagged in a 1D channel mask
+// For each time sample (column), values are sampled from unflagged channels at the same time
+// channelMask[j] == 1 -> this channel's pixels will be replaced; 0 -> used as source pool only
+// If pointMask is provided (non-NULL), only unmasked pixels (pointMask[k*nsamp+i]==0) are allowed in the source pool
+void randomReplaceRFIPixels(float *data, const int *channelMask, const int *pointMask, int nsamp, int nchan)
 {
     int i, j;
-    
-    // Initialize random seed once
-    srand((unsigned int)time(NULL));
-    
-    #pragma omp parallel for private(j)
+
     for (i = 0; i < nsamp; i++) {
-        // For each time sample (column), collect unflagged pixel values
-        float *unflagged_values = (float*)malloc(nchan * sizeof(float));
-        int unflagged_count = 0;
-        
-        // Collect unflagged values in this time sample
+        // For each time sample (column), collect values from unflagged channels (channelMask==0)
+        float *source_values = (float*)malloc(nchan * sizeof(float));
+        if (!source_values) return;
+        int source_count = 0;
+
         for (j = 0; j < nchan; j++) {
-            if (!mask[j * nsamp + i]) {
-                unflagged_values[unflagged_count++] = data[j * nsamp + i];
+            if (channelMask[j] == 0) {
+                if (!pointMask || pointMask[j * nsamp + i] == 0) {
+                    source_values[source_count++] = data[j * nsamp + i];
+                }
             }
         }
-        
-        // If we have unflagged values, use them to replace flagged pixels
-        if (unflagged_count > 0) {
-            // Create thread-local random state for thread safety
-            unsigned int seed = (unsigned int)(i + time(NULL) + omp_get_thread_num());
-            
+
+        if (source_count > 0) {
+            unsigned int seed = (unsigned int)(i * 1315423911u + 12345u);
             for (j = 0; j < nchan; j++) {
-                if (mask[j * nsamp + i]) {
-                    // Randomly select from unflagged values in this time sample
-                    int random_idx = rand_r(&seed) % unflagged_count;
-                    data[j * nsamp + i] = unflagged_values[random_idx];
+                if (channelMask[j] != 0) {
+                    int random_idx = rand_r(&seed) % source_count;
+                    data[j * nsamp + i] = source_values[random_idx];
                 }
             }
         } else {
-            // If no unflagged values in this time sample, set flagged values to 0
+            // No unflagged channels (or all masked by pointMask) at this time sample; zero out flagged channels at this time
             for (j = 0; j < nchan; j++) {
-                if (mask[j * nsamp + i]) {
+                if (channelMask[j] != 0) {
                     data[j * nsamp + i] = 0.0f;
                 }
             }
         }
-        
-        free(unflagged_values);
+
+        free(source_values);
     }
 }
+
+// void randomReplaceRFIPixels1(float *data, const int *flaggedChans, const int *pointMask, int nsamp, int nchan)
+// {
+//     int i, j;
+//     float *validPixels = (float *)malloc(nchan * sizeof(float));
+//     for (i = 0; i < nsamp; i++) {
+//         int validCnt = 0;
+//         for (j = 0; j < nchan; j++) {
+//             if (flaggedChans[j] == 0 && pointMask[j * nsamp + i] == 0) {
+//                 validPixels[validCnt] = data[j * nsamp + i];
+//                 validCnt++;
+//             }
+//         }
+//         for (j = 0; j < nchan; j++) {
+//             int randIdx = rand() % validCnt;
+//             if (flaggedChans[j] != 0) {
+//                 data[j * nsamp + i] = validPixels[randIdx];
+//             }
+//         }
+//     }
+//     free(validPixels);
+// }
 
 void writeIndexMaskPNG(int *mask, int nsamp, int nchan, char *filename)
 {
@@ -1871,10 +1890,30 @@ void identSubstNSigma(
         if (pointMask[i] == 1) flaggedBeforeKillThresh++;
     }
     
-    // === 4. In-Chan Subst ===
-    printf("=== Applying random replacement to flagged pixels ===\n");
-    randomReplaceRFIPixels(data, pointMask, nsamp, nchan);
-    printf("Random replacement completed\n");
+    // === 4. Cross-channel replacement for fully-masked channels (derived from pointMask)
+    // Build a 1D channel mask: channelMask[i] = 1 if channel i is fully masked in pointMask
+    int *channelMask1D = (int *)calloc(nchan, sizeof(int));
+    int fullyMaskedChans = 0;
+    for (i = 0; i < nchan; i++) {
+        int base = i * nsamp;
+        int maskedCount = 0;
+        for (j = 0; j < nsamp; j++) {
+            if (pointMask[base + j]) maskedCount++;
+        }
+        if (maskedCount == nsamp) {
+            channelMask1D[i] = 1;
+            fullyMaskedChans++;
+        }
+    }
+
+    if (fullyMaskedChans > 0) {
+        printf("=== Applying cross-channel replacement for %d fully masked channels ===\n", fullyMaskedChans);
+    randomReplaceRFIPixels(data, channelMask1D, pointMask, nsamp, nchan);
+        printf("Cross-channel replacement completed\n");
+    } else {
+        printf("=== No fully masked channels after point-level detection; skip cross-channel replacement ===\n");
+    }
+    free(channelMask1D);
 
     int killedChannels, localRFISkipped, totalFlaggedAfter;
     applyKillThresh(pointMask, flaggedChans, nsamp, nchan, killThresh, flaggedBeforeKillThresh,
@@ -1892,10 +1931,15 @@ void identSubstNSigma(
     free(channel_stds_temp);
     // Accumulate channel-wise mask into global
     logicalOR(globalMask, horizontalMask, nsamp, nchan);
-    
-    // === 5. Out-Chan Subst ===
-    int outChanPixelsSubstituted;
-    applySubstitution(data, horizontalMask, nsamp, nchan, &outChanPixelsSubstituted);
+
+    // === 5. Out-Chan Cross-channel substitution for fully flagged channels ===
+    int outChanPixelsSubstituted = 0;
+    int flaggedChanCount = 0;
+    for (i = 0; i < nchan; i++) if (flaggedChans[i]) flaggedChanCount++;
+    if (flaggedChanCount > 0) {
+        randomReplaceRFIPixels(data, flaggedChans, pointMask, nsamp, nchan);
+        outChanPixelsSubstituted = flaggedChanCount * nsamp;
+    }
     printf("outChannel substitution: replaced %d pixels\n", outChanPixelsSubstituted);
     
     int nFlaggedChans = 0;

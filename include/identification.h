@@ -20,7 +20,9 @@ void mergeMask2D(int *masks[], int nmasks, int nsamp, int nchan, int *result);
 void substPixels2D(float *data, int nsamp, int nchan, int *mask);
 
 // Function to randomly replace flagged pixels with unflagged pixels from the same time sample
-void randomReplaceRFIPixels(float *data, const int *mask, int nsamp, int nchan);
+// Replace pixels for channels flagged in channelMask using values from unflagged channels at the same time
+// If pointMask is non-NULL, only unmasked pixels are used as source
+void randomReplaceRFIPixels(float *data, const int *channelMask, const int *pointMask, int nsamp, int nchan);
 void substPixels(float *data, int size, int *mask, int *goodSamps, int *randIdx);
 void binarySIR(int *mask, int nsamp, int nchan, int win_samp, int win_chan, float thrup, float thrdown);
 

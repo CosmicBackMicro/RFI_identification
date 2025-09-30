@@ -13,6 +13,7 @@
 #include "ReadFASTData.h"
 #include "identification.h"
 #include "findStats.h"
+#include "mask.h"
 #include "plot.h"
 #include "cmd.h"
 #include "transpose.h"

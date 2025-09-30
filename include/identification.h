@@ -13,10 +13,6 @@ float ksigma_1d(float *data, int n, int bins, float *hist, float *x_val, float *
 
 float ksigma_2d(const float *dataT, const int *mask, int nsamp, int nchan);
 
-void writeIndexMaskPNG(int *mask, int nsamp, int nchan, char *filename);
-
-void mergeMask2D(int *masks[], int nmasks, int nsamp, int nchan, int *result);
-
 void substPixels2D(float *data, int nsamp, int nchan, int *mask);
 
 // Function to randomly replace flagged pixels with unflagged pixels from the same time sample

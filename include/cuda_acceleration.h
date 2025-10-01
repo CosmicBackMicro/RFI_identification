@@ -27,31 +27,6 @@ void cuda_cleanup(void);
 int cuda_isAvailable(void);
 
 /**
- * CUDA-accelerated channel median subtraction
- * Subtracts median value from each frequency channel
- * 
- * @param data Input/output data array (nsamp * nchan elements)
- * @param channel_medians Array of median values for each channel
- * @param nsamp Number of time samples per channel
- * @param nchan Number of frequency channels
- */
-void cuda_subtractChannelMedians(float *data, const float *channel_medians, 
-                                int nsamp, int nchan);
-
-/**
- * CUDA-accelerated channel statistics calculation
- * Calculates mean and standard deviation for each channel
- * 
- * @param data Input data array (nsamp * nchan elements)
- * @param means Output array for channel means (nchan elements)
- * @param stds Output array for channel standard deviations (nchan elements)
- * @param nsamp Number of time samples per channel
- * @param nchan Number of frequency channels
- */
-void cuda_calculateChannelStats(const float *data, float *means, float *stds, 
-                               int nsamp, int nchan);
-
-/**
  * CUDA-accelerated matrix transpose
  * Transposes a 2D matrix using shared memory optimization
  * 
@@ -61,63 +36,6 @@ void cuda_calculateChannelStats(const float *data, float *means, float *stds,
  * @param cols Number of columns in input matrix
  */
 void cuda_transpose(const float *input, float *output, int rows, int cols);
-
-/**
- * CUDA-accelerated 2D downsampling
- * Downsamples a 2D array by averaging over bins
- * 
- * @param input Input array (nsamp * nchan elements)
- * @param output Output downsampled array ((nsamp/binFactorTime) * (nchan/binFactorFreq) elements)
- * @param nsamp Number of time samples in input
- * @param nchan Number of frequency channels in input
- * @param binFactorTime Downsampling factor in time dimension
- * @param binFactorFreq Downsampling factor in frequency dimension
- */
-void cuda_downsample2D(const float *input, float *output, 
-                      int nsamp, int nchan,
-                      int binFactorTime, int binFactorFreq);
-
-/**
- * CUDA-accelerated binary morphological filtering (binarySIR)
- * Applies structural indexing reduction with configurable window size and thresholds
- * 
- * @param mask Input/output binary mask array (nsamp * nchan elements, 0 or 1)
- * @param nsamp Number of time samples per channel
- * @param nchan Number of frequency channels
- * @param win_samp Window size in time dimension (must be odd)
- * @param win_chan Window size in frequency dimension (must be odd)
- * @param thr_up Upper threshold for density ratio (0.0-1.0)
- * @param thr_down Lower threshold for density ratio (0.0-1.0)
- */
-void cuda_binarySIR(int *mask, int nsamp, int nchan,
-                   int win_samp, int win_chan, 
-                   float thr_up, float thr_down);
-
-/**
- * CUDA-accelerated pipeline (skeleton) for identSubstNSigma
- * Approximates point-level outlier detection on GPU and produces masks.
- * This is a framework function intended to be extended.
- *
- * @param data            In/Out data array (nsamp * nchan)
- * @param nsamp           Number of samples per channel
- * @param nchan           Number of channels
- * @param Nsigma          Sigma threshold for point-level detection
- * @param channel_std_threshold  Threshold for channel-level (reserved, not used in skeleton)
- * @param iterationIndex  Iteration index (reserved for logging)
- * @param plot            Whether to plot (not used in CUDA path)
- * @param horizontalMask  Output mask (nsamp * nchan), 1 = flagged
- * @param verticalMask    Output mask (nsamp * nchan), reserved/zeroed in skeleton
- * @param globalMask      Output mask (nsamp * nchan), copy of horizontalMask in skeleton
- * @param finalMedian     Output overall median estimate (approx; skeleton writes mean)
- * @param finalStd        Output overall std estimate (approx; skeleton writes std)
- * @param flaggedChans      Output per-channel full-flag indicator (nchan)
- */
-void cuda_identSubstNSigma(float *data, int nsamp, int nchan,
-                           float NSigmaInChan, float NSigmaOutChan,
-                           int iterationIndex, int plot,
-                           int *horizontalMask, int *verticalMask, int *globalMask,
-                           float *finalMedian, float *finalStd,
-                           int *flaggedChans);
 
 // ============================================================================
 // Utility Macros

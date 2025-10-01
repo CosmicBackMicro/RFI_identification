@@ -41,7 +41,7 @@ void drawUnifiedThresholdLines(const float *thresh_values, const char **threshol
                               const int *threshold_enabled, int num_thresholds,
                               float max_count, float x_min, float x_max);
 
-typedef struct {
+typedef struct IdentNSigmaMasks {
     int *horizontalMask;
     int *verticalMask;
     int *globalMask;

@@ -709,24 +709,7 @@ void writeFITSDataset(unsigned char *outRawData, float *scale, float *offset,
     }
 }
 
-// --- Mask allocation/cleanup helpers ---
-void allocIdentNSigmaMasks(IdentNSigmaMasks *m, int nsamp, int nchan) {
-    m->horizontalMask = (int *)calloc(nsamp * nchan, sizeof(int));
-    m->verticalMask   = (int *)calloc(nsamp * nchan, sizeof(int));
-    m->globalMask     = (int *)calloc(nsamp * nchan, sizeof(int));
-    m->pointMask      = (int *)calloc(nsamp * nchan, sizeof(int));
-    m->chanBrightMask = (int *)calloc(nsamp * nchan, sizeof(int));
-    m->chanDarkMask   = (int *)calloc(nsamp * nchan, sizeof(int));
-}
-
-void freeIdentNSigmaMasks(IdentNSigmaMasks *m) {
-    free(m->horizontalMask);
-    free(m->verticalMask);
-    free(m->globalMask);
-    free(m->pointMask);
-    free(m->chanBrightMask);
-    free(m->chanDarkMask);
-}
+// --- Mask allocation/cleanup helpers are implemented in mask.c ---
 
 
 int main(int argc, char *argv[])
@@ -964,36 +947,7 @@ int main(int argc, char *argv[])
             }
             if (writeMasks)
             {
-                char mask_horizontal_filename[256];
-                char mask_vertical_filename[256];
-                char mask_global_filename[256];
-                char mask_point_filename[256];
-                char mask_bright_filename[256];
-                char mask_dark_filename[256];
-
-                sprintf(mask_horizontal_filename, "%smask_horizontal_%d.png", m.datasetPath, ii);
-                writeIndexMaskPNG(maskSet.horizontalMask, nsampBinned, nchanBinned, mask_horizontal_filename);
-
-                sprintf(mask_vertical_filename, "%smask_vertical_%d.png", m.datasetPath, ii);
-                writeIndexMaskPNG(maskSet.verticalMask, nsampBinned, nchanBinned, mask_vertical_filename);
-
-                sprintf(mask_global_filename, "%smask_global_%d.png", m.datasetPath, ii);
-                writeIndexMaskPNG(maskSet.globalMask, nsampBinned, nchanBinned, mask_global_filename);
-
-                if (maskSet.pointMask) {
-                    sprintf(mask_point_filename, "%smask_point_%d.png", m.datasetPath, ii);
-                    writeIndexMaskPNG(maskSet.pointMask, nsampBinned, nchanBinned, mask_point_filename);
-                }
-
-                if (maskSet.chanBrightMask) {
-                    sprintf(mask_bright_filename, "%smask_chanBright_%d.png", m.datasetPath, ii);
-                    writeIndexMaskPNG(maskSet.chanBrightMask, nsampBinned, nchanBinned, mask_bright_filename);
-                }
-
-                if (maskSet.chanDarkMask) {
-                    sprintf(mask_dark_filename, "%smask_chanDark_%d.png", m.datasetPath, ii);
-                    writeIndexMaskPNG(maskSet.chanDarkMask, nsampBinned, nchanBinned, mask_dark_filename);
-                }
+                writeAllMasksPNG(&maskSet, nsampBinned, nchanBinned, m.datasetPath, ii);
             }
             if (m.plot)
             { // Plot result after NSigma substitution

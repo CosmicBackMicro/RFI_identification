@@ -5,6 +5,7 @@
 #include <omp.h>
 
 #include "mask.h"
+#include "identification.h" // for IdentNSigmaMasks definition
 
 void writeIndexMaskPNG(int *mask, int nsamp, int nchan, char *filename)
 {
@@ -88,4 +89,68 @@ void logicalOR(int *globalMask, const int *mask, int nsamp, int nchan)
     for (int idx = 0; idx < total; idx++) {
         if (mask[idx]) globalMask[idx] = 1;
     }
+}
+
+void writeAllMasksPNG(const IdentNSigmaMasks *masks, int nsamp, int nchan,
+                      const char *datasetPath, int index)
+{
+    if (!masks || !datasetPath) return;
+
+    char filename[512];
+
+    // horizontal
+    if (masks->horizontalMask) {
+        snprintf(filename, sizeof(filename), "%smask_horizontal_%d.png", datasetPath, index);
+        writeIndexMaskPNG(masks->horizontalMask, nsamp, nchan, filename);
+    }
+
+    // vertical
+    if (masks->verticalMask) {
+        snprintf(filename, sizeof(filename), "%smask_vertical_%d.png", datasetPath, index);
+        writeIndexMaskPNG(masks->verticalMask, nsamp, nchan, filename);
+    }
+
+    // global
+    if (masks->globalMask) {
+        snprintf(filename, sizeof(filename), "%smask_global_%d.png", datasetPath, index);
+        writeIndexMaskPNG(masks->globalMask, nsamp, nchan, filename);
+    }
+
+    // point
+    if (masks->pointMask) {
+        snprintf(filename, sizeof(filename), "%smask_point_%d.png", datasetPath, index);
+        writeIndexMaskPNG(masks->pointMask, nsamp, nchan, filename);
+    }
+
+    // chanBright
+    if (masks->chanBrightMask) {
+        snprintf(filename, sizeof(filename), "%smask_chanBright_%d.png", datasetPath, index);
+        writeIndexMaskPNG(masks->chanBrightMask, nsamp, nchan, filename);
+    }
+
+    // chanDark
+    if (masks->chanDarkMask) {
+        snprintf(filename, sizeof(filename), "%smask_chanDark_%d.png", datasetPath, index);
+        writeIndexMaskPNG(masks->chanDarkMask, nsamp, nchan, filename);
+    }
+}
+
+void allocIdentNSigmaMasks(IdentNSigmaMasks *m, int nsamp, int nchan) {
+    if (!m) return;
+    m->horizontalMask = (int *)calloc(nsamp * nchan, sizeof(int));
+    m->verticalMask   = (int *)calloc(nsamp * nchan, sizeof(int));
+    m->globalMask     = (int *)calloc(nsamp * nchan, sizeof(int));
+    m->pointMask      = (int *)calloc(nsamp * nchan, sizeof(int));
+    m->chanBrightMask = (int *)calloc(nsamp * nchan, sizeof(int));
+    m->chanDarkMask   = (int *)calloc(nsamp * nchan, sizeof(int));
+}
+
+void freeIdentNSigmaMasks(IdentNSigmaMasks *m) {
+    if (!m) return;
+    free(m->horizontalMask);
+    free(m->verticalMask);
+    free(m->globalMask);
+    free(m->pointMask);
+    free(m->chanBrightMask);
+    free(m->chanDarkMask);
 }

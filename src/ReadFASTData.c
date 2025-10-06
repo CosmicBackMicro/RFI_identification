@@ -944,8 +944,40 @@ int main(int argc, char *argv[])
             float NSigmaOutChan = 3.0f;
             if (m.doSubstitution)
             {
-                identSubstNSigma(outDataT, nsampBinned, nchanBinned, NSigmaInChan, NSigmaOutChan, ii, m.plot,
-                                 &maskSet, finalMedian, finalStd, m.cudaReady, flaggedChans);
+                // Test CUDA version if available, otherwise use CPU version
+                if (m.cudaReady) {
+                    printf("=== Testing CUDA-accelerated RFI detection ===\n");
+                    double cuda_start_time = omp_get_wtime();
+
+                    int cuda_result = cuda_identSubstNSigma(outDataT, nsampBinned, nchanBinned,
+                                                          NSigmaInChan, NSigmaOutChan, ii, m.plot,
+                                                          &maskSet, finalMedian, finalStd, flaggedChans);
+
+                    double cuda_time = omp_get_wtime() - cuda_start_time;
+                    if (cuda_result == 0) {
+                        printf("CUDA RFI detection completed successfully in %.4f seconds\n", cuda_time);
+                    } else {
+                        printf("CUDA RFI detection failed, falling back to CPU version\n");
+                        // Fallback to CPU version
+                        double cpu_start_time = omp_get_wtime();
+
+                        identSubstNSigma(outDataT, nsampBinned, nchanBinned, NSigmaInChan, NSigmaOutChan, ii, m.plot,
+                                       &maskSet, finalMedian, finalStd, m.cudaReady, flaggedChans);
+
+                        double cpu_time = omp_get_wtime() - cpu_start_time;
+                        printf("CPU RFI detection (fallback) completed in %.4f seconds\n", cpu_time);
+                    }
+                } else {
+                    // Use CPU version
+                    printf("=== Using CPU RFI detection ===\n");
+                    double cpu_start_time = omp_get_wtime();
+
+                    identSubstNSigma(outDataT, nsampBinned, nchanBinned, NSigmaInChan, NSigmaOutChan, ii, m.plot,
+                                   &maskSet, finalMedian, finalStd, m.cudaReady, flaggedChans);
+
+                    double cpu_time = omp_get_wtime() - cpu_start_time;
+                    printf("CPU RFI detection completed in %.4f seconds\n", cpu_time);
+                }
             }
             if (writeMasks)
             {

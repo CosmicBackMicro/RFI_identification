@@ -37,6 +37,30 @@ int cuda_isAvailable(void);
  */
 void cuda_transpose(const float *input, float *output, int rows, int cols);
 
+/**
+ * CUDA-accelerated RFI detection using N-sigma thresholding
+ * Processes the complete identSubstNSigma pipeline on GPU
+ * 
+ * @param data Input data array (nsamp * nchan elements, will be modified)
+ * @param nsamp Number of time samples
+ * @param nchan Number of channels
+ * @param NSigmaInChan N-sigma threshold for in-channel (pixel-level) detection
+ * @param NSigmaOutChan N-sigma threshold for out-channel (channel-level) detection
+ * @param iterationIndex Current iteration index for logging
+ * @param plot Whether to generate plots (currently not supported in CUDA version)
+ * @param masks Structure containing all mask arrays
+ * @param finalMedian Output: final median of processed data
+ * @param finalStd Output: final standard deviation of processed data
+ * @param flaggedChans Output: array indicating which channels are flagged
+ * @return 0 on success, -1 on failure
+ */
+int cuda_identSubstNSigma(
+    float *data, int nsamp, int nchan,
+    float NSigmaInChan, float NSigmaOutChan,
+    int iterationIndex, int plot,
+    void *masks,
+    float *finalMedian, float *finalStd, int *flaggedChans);
+
 // ============================================================================
 // Utility Macros
 // ============================================================================

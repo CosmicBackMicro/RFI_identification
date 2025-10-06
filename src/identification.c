@@ -1573,12 +1573,25 @@ int inChanDetection(float *data, int nsamp, int nchan, float Nsigma,
 {
     int totalOutliers = 0;
     
-    // Allocate temporary arrays for each thread
+    // Static buffers: allocate once, reuse (assuming single-threaded or careful use)
+    static float *median_temp = NULL;
+    static int *good_samples = NULL;
+    static int *random_indices = NULL;
+    
+    // Allocate buffers on first call
+    if (median_temp == NULL) {
+        median_temp = (float *)malloc(nsamp * sizeof(float));
+        good_samples = (int *)malloc(nsamp * sizeof(int));
+        random_indices = (int *)malloc(nsamp * sizeof(int));
+    }
+    
+    // Clear buffers for safety (static variables retain values across calls)
+    memset(median_temp, 0, nsamp * sizeof(float));
+    memset(good_samples, 0, nsamp * sizeof(int));
+    memset(random_indices, 0, nsamp * sizeof(int));
+    
     #pragma omp parallel reduction(+:totalOutliers)
     {
-        float *median_temp = (float *)malloc(nsamp * sizeof(float));
-        int *good_samples = (int *)malloc(nsamp * sizeof(int));
-        int *random_indices = (int *)malloc(nsamp * sizeof(int));
         int i;
         
         #pragma omp for
@@ -1593,10 +1606,6 @@ int inChanDetection(float *data, int nsamp, int nchan, float Nsigma,
             
             totalOutliers += channelOutliers;
         }
-        
-        free(median_temp);
-        free(good_samples);
-        free(random_indices);
     }
     
     return totalOutliers;
@@ -1819,31 +1828,6 @@ void identSubstNSigma(
     for (i = 0; i < nsamp * nchan; i++) {
         if (pointMask[i] == 1) flaggedBeforeKillThresh++;
     }
-    
-    // === 4. Cross-channel replacement for fully-masked channels (derived from pointMask)
-    // Build a 1D channel mask: channelMask[i] = 1 if channel i is fully masked in pointMask
-    int *channelMask1D = (int *)calloc(nchan, sizeof(int));
-    int fullyMaskedChans = 0;
-    for (i = 0; i < nchan; i++) {
-        int base = i * nsamp;
-        int maskedCount = 0;
-        for (j = 0; j < nsamp; j++) {
-            if (pointMask[base + j]) maskedCount++;
-        }
-        if (maskedCount == nsamp) {
-            channelMask1D[i] = 1;
-            fullyMaskedChans++;
-        }
-    }
-
-    if (fullyMaskedChans > 0) {
-        printf("=== Applying cross-channel replacement for %d fully masked channels ===\n", fullyMaskedChans);
-    randomReplaceRFIPixels(data, channelMask1D, pointMask, nsamp, nchan);
-        printf("Cross-channel replacement completed\n");
-    } else {
-        printf("=== No fully masked channels after point-level detection; skip cross-channel replacement ===\n");
-    }
-    free(channelMask1D);
 
     int killedChannels, localRFISkipped, totalFlaggedAfter;
     applyKillThresh(pointMask, flaggedChans, nsamp, nchan, killThresh, flaggedBeforeKillThresh,

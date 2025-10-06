@@ -711,29 +711,18 @@ void writeFITSDataset(unsigned char *outRawData, float *scale, float *offset,
 
 // --- Mask allocation/cleanup helpers are implemented in mask.c ---
 
-
-int main(int argc, char *argv[])
-{
-    setup_openmp(20);
-    
-    Metadata m;
-
-    int status = parseCommandLineArguments(argc, argv, &m);
-    if (status != 0) {
-        return status;
-    }
-    readMetadata(&m);
-
-    // Initialize CUDA if requested by user
-    m.cudaReady = 0; // Default: CUDA not ready
-    if (m.enableCuda) {
+int setup_cuda(Metadata *m) {
+    m->cudaReady = 0; // Default: CUDA not ready
+    if (m->enableCuda) {
         if (cuda_isAvailable()) {
             if (cuda_init() == 0) {
                 printf("CUDA acceleration enabled.\n");
-                m.cudaReady = 1; // CUDA is ready to use
+                m->cudaReady = 1; // CUDA is ready to use
+                return 0;
             } else {
                 printf("CUDA initialization failed, using CPU only.\n");
-                m.enableCuda = 0; // Disable CUDA for this session
+                m->enableCuda = 0; // Disable CUDA for this session
+                return 0;
             }
         } else {
             fprintf(stderr, "Error: You requested CUDA acceleration, but CUDA is not available on this system.\n");
@@ -742,7 +731,20 @@ int main(int argc, char *argv[])
         }
     } else {
         printf("Message: --enableCuda option not found, using CPU. \n");
+        return 0;
     }
+}
+
+int main(int argc, char *argv[])
+{
+    Metadata m;
+    int status = parseCommandLineArguments(argc, argv, &m);
+    if (status != 0) return status;
+    readMetadata(&m);
+
+    // Initialize OpenMP and CUDA 
+    setup_openmp(20);
+    if (setup_cuda(&m) != 0) return -1;
 
     fitsfile *fptr = NULL;
     int fits_status = 0;

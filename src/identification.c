@@ -235,7 +235,7 @@ void subtractChannelMedians(float *data, int nsamp, int nchan)
     }
     
     // Subtract median from each channel
-    #pragma omp parallel for
+    // #pragma omp parallel for
     for (i = 0; i < nchan; i++) {
         for (j = 0; j < nsamp; j++) {
             data[i * nsamp + j] -= channel_medians[i];
@@ -769,6 +769,53 @@ void binarySIR(
 
 
 
+
+/// @brief 兜底均值检测：对标准差检测未标记的通道检查均值离群
+/// @param data 数据数组
+/// @param nsamp 每个通道的样本数
+/// @param nchan 通道数
+/// @param channelFlagged 通道标记数组（输入/输出）
+/// @return 额外标记的通道数
+int meanOutlierDetection(float *data, int nsamp, int nchan, int *channelFlagged) {
+    float *chan_means = (float *)malloc(nchan * sizeof(float));
+    int mean_check_count = 0;
+    
+    // 计算未标记通道的均值
+    for (int i = 0; i < nchan; i++) {
+        if (!channelFlagged[i]) {  // 只对未标记通道
+            float mean, std;
+            findMeanStd(data + i * nsamp, nsamp, &mean, &std);
+            chan_means[mean_check_count++] = mean;
+        }
+    }
+    
+    int additional_flagged = 0;
+    if (mean_check_count >= 3) {  // 至少需要3个通道计算统计
+        // 计算均值分布的中位数和标准差
+        float mean_median = median(chan_means, mean_check_count);
+        float mean_std;
+        findMeanStd(chan_means, mean_check_count, NULL, &mean_std);
+        
+        // 标记均值离群的通道（超过中位数 ± 3*std）
+        float upper_bound = mean_median + 3.0f * mean_std;
+        float lower_bound = mean_median - 3.0f * mean_std;
+        
+        for (int i = 0; i < nchan; i++) {
+            if (!channelFlagged[i]) {  // 只检查未标记的
+                float mean, std;
+                findMeanStd(data + i * nsamp, nsamp, &mean, &std);
+                if (mean > upper_bound || mean < lower_bound) {
+                    channelFlagged[i] = 1;  // 标记为异常
+                    additional_flagged++;
+                }
+            }
+        }
+    }
+    
+    free(chan_means);
+    return additional_flagged;
+}
+
 /// @brief Flag channels based on their standard deviation statistics using iterative 3-sigma outlier detection
 /// @param data Input data array (nsamp * nchan)
 /// @param nsamp Number of time samples
@@ -898,6 +945,12 @@ void outChanDetection(float *data, int nsamp, int nchan, int *channelFlagged,
     }
     
     printf("outChannel detection completed (%d iterations, %d channels flagged)\n", iter, final_flagged_count);
+    
+    // === 兜底均值检测 ===
+    int additional_flagged = meanOutlierDetection(data, nsamp, nchan, channelFlagged);
+    final_flagged_count += additional_flagged;
+    printf("Mean-based outlier check: flagged %d additional channels (total now: %d)\n", 
+           additional_flagged, final_flagged_count);
     
     // Create final statistics array (mark flagged channels with negative values)
     float *final_channel_stds = (float *)malloc(nchan * sizeof(float));

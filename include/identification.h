@@ -27,6 +27,8 @@ void flagChannelsByMeanOutliers(float *data, int nsamp, int nchan, int *horizont
 void outChanDetection(float *data, int nsamp, int nchan, int *channelFlagged,
                               float *channel_stds, float *channel_stds_temp, float channel_std_threshold, float nsigma_in, int plot);
 
+int meanOutlierDetection(float *data, int nsamp, int nchan, int *channelFlagged);
+
 void normalizeChannelData(float *data, int nsamp, int nchan, 
                          float *finalMedian, float *finalStd, float *median_temp);
 

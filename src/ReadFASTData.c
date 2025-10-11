@@ -284,7 +284,7 @@ void downsamp2D(float *array, int nsamp, int nchan,
 void convertToFloat(unsigned char *rawData, float *data, int size)
 {
     int i;
-    #pragma omp parallel for
+    // #pragma omp parallel for
     for (i = 0; i < size; i++)
     {
         data[i] = (float)rawData[i];
@@ -311,7 +311,7 @@ void getProfile(float *array, int nsamp, int nchan, float *freqProfile, float *t
 
     if (isTranspose)
     {
-        #pragma omp parallel for
+        // #pragma omp parallel for
         for (i = 0; i < nchan; i++)
         {
             float sum = 0.0f;
@@ -328,7 +328,7 @@ void getProfile(float *array, int nsamp, int nchan, float *freqProfile, float *t
             freqProfile[i] = (validCount > 0) ? sum / validCount : 0.0f;
         }
 
-        #pragma omp parallel for
+        // #pragma omp parallel for
         for (i = 0; i < nsamp; i++)
         {
             float sum = 0.0f;
@@ -347,7 +347,7 @@ void getProfile(float *array, int nsamp, int nchan, float *freqProfile, float *t
     }
     else
     {
-        #pragma omp parallel for
+        // #pragma omp parallel for
         for (i = 0; i < nchan; i++)
         {
             float sum = 0.0f;
@@ -364,7 +364,7 @@ void getProfile(float *array, int nsamp, int nchan, float *freqProfile, float *t
             freqProfile[i] = (validCount > 0) ? sum / validCount : 0.0f;
         }
 
-        #pragma omp parallel for
+        // #pragma omp parallel for
         for (i = 0; i < nsamp; i++)
         {
             float sum = 0.0f;
@@ -389,7 +389,7 @@ void getProfileStd(float *array, int nsamp, int nchan, float *freqProfile, float
 
     if (isTranspose)
     {
-        #pragma omp parallel for
+        // #pragma omp parallel for
         for (i = 0; i < nchan; i++)
         {
             float sum = 0.0f;
@@ -420,7 +420,7 @@ void getProfileStd(float *array, int nsamp, int nchan, float *freqProfile, float
             }
         }
 
-        #pragma omp parallel for
+        // #pragma omp parallel for
         for (i = 0; i < nsamp; i++)
         {
             float sum = 0.0f;
@@ -452,7 +452,7 @@ void getProfileStd(float *array, int nsamp, int nchan, float *freqProfile, float
     }
     else
     {
-        #pragma omp parallel for
+        // #pragma omp parallel for
         for (i = 0; i < nchan; i++)
         {
             float sum = 0.0f;
@@ -482,7 +482,7 @@ void getProfileStd(float *array, int nsamp, int nchan, float *freqProfile, float
             }
         }
 
-        #pragma omp parallel for
+        // #pragma omp parallel for
         for (i = 0; i < nsamp; i++)
         {
             float sum = 0.0f;
@@ -822,14 +822,19 @@ int main(int argc, char *argv[])
 
     int numiter = 0;
     int ii;
-    int writeMasks = 1;
     for (ii = 0; ii < numReads; ii++)
     {
+        double loop_start = omp_get_wtime();
         printf("Processing block %d of %d, %d subints per block, %.3f%% done.\n", ii, numReads, blocksPerRead, (ii * 100.0f / numReads));
+        
         // Read a raw data block of `blocksPerRead` subints with its scale and offset
+        double read_start = omp_get_wtime();
         readRawBlock(fptr, ii, blocksPerRead, nchan, blockSize, scale, offset, outRawData, &fits_status);
+        double read_time = omp_get_wtime() - read_start;
+        printf("Read block time: %.4f seconds\n", read_time);
         
         // Convert raw data to float and apply scale/offset BEFORE downsampling
+        double convert_start = omp_get_wtime();
         if (needDownsamp) {
             convertToFloat(outRawData, rawToFloatArray, nsamp * nchan);
             applyScaleOffset(rawToFloatArray, scale, offset, nsamp, nchan);
@@ -844,20 +849,19 @@ int main(int argc, char *argv[])
             memcpy(scaleBinned, scale, sizeof(float) * nchanBinned);
             memcpy(offsetBinned, offset, sizeof(float) * nchanBinned);
         }
+        double convert_time = omp_get_wtime() - convert_start;
+        printf("Convert/downsamp time: %.4f seconds\n", convert_time);
         
         // CUDA-accelerated transpose (with fallback to CPU)
         printf("Performing matrix transpose (%d x %d)...\n", nsampBinned, nchanBinned);
+        double transpose_start = omp_get_wtime();
         if (m.cudaReady) {
-            double start_time = omp_get_wtime();
             cuda_transpose(outData, outDataT, nsampBinned, nchanBinned);
-            double cuda_time = omp_get_wtime() - start_time;
-            printf("CUDA transpose completed in %.4f seconds\n", cuda_time);
         } else {
-            double start_time = omp_get_wtime();
             transpose(outData, nsampBinned, nchanBinned, outDataT);
-            double cpu_time = omp_get_wtime() - start_time;
-            printf("CPU transpose completed in %.4f seconds\n", cpu_time);
         }
+        double transpose_time = omp_get_wtime() - transpose_start;
+        printf("Transpose time: %.4f seconds\n", transpose_time);
         
         if (m.generateMasks)
         {
@@ -873,7 +877,7 @@ int main(int argc, char *argv[])
 
 
             // =======================Subtract Channel Median========================================================
-            int subtractChanMed = 1; 
+            int subtractChanMed = 0; 
             if (subtractChanMed)
             {
                 subtractChannelMedians(outDataT, nsampBinned, nchanBinned);
@@ -939,47 +943,29 @@ int main(int argc, char *argv[])
 
 
 
-            // =====================NSigmaHist============================================================
             float NSigmaInChan = 3.0f; // Updated to use 3-sigma threshold for iterative outlier detection
             float NSigmaOutChan = 3.0f;
             if (m.doSubstitution)
             {
+                double rfi_start = omp_get_wtime();
                 // Test CUDA version if available, otherwise use CPU version
                 if (m.cudaReady) {
-                    printf("=== Testing CUDA-accelerated RFI detection ===\n");
-                    double cuda_start_time = omp_get_wtime();
-
                     int cuda_result = cuda_identSubstNSigma(outDataT, nsampBinned, nchanBinned,
                                                           NSigmaInChan, NSigmaOutChan, ii, m.plot,
                                                           &maskSet, finalMedian, finalStd, flaggedChans);
-
-                    double cuda_time = omp_get_wtime() - cuda_start_time;
-                    if (cuda_result == 0) {
-                        printf("CUDA RFI detection completed successfully in %.4f seconds\n", cuda_time);
-                    } else {
-                        printf("CUDA RFI detection failed, falling back to CPU version\n");
-                        // Fallback to CPU version
-                        double cpu_start_time = omp_get_wtime();
-
-                        identSubstNSigma(outDataT, nsampBinned, nchanBinned, NSigmaInChan, NSigmaOutChan, ii, m.plot,
-                                       &maskSet, finalMedian, finalStd, m.cudaReady, flaggedChans);
-
-                        double cpu_time = omp_get_wtime() - cpu_start_time;
-                        printf("CPU RFI detection (fallback) completed in %.4f seconds\n", cpu_time);
+                    if (cuda_result != 0) {
+                        return -1;
                     }
                 } else {
                     // Use CPU version
                     printf("=== Using CPU RFI detection ===\n");
-                    double cpu_start_time = omp_get_wtime();
-
                     identSubstNSigma(outDataT, nsampBinned, nchanBinned, NSigmaInChan, NSigmaOutChan, ii, m.plot,
                                    &maskSet, finalMedian, finalStd, m.cudaReady, flaggedChans);
-
-                    double cpu_time = omp_get_wtime() - cpu_start_time;
-                    printf("CPU RFI detection completed in %.4f seconds\n", cpu_time);
                 }
+                double rfi_time = omp_get_wtime() - rfi_start;
+                printf("RFI detection time: %.4f seconds\n", rfi_time);
             }
-            if (writeMasks)
+            if (m.writeMasks)
             {
                 writeAllMasksPNG(&maskSet, nsampBinned, nchanBinned, m.datasetPath, ii);
             }
@@ -987,6 +973,12 @@ int main(int argc, char *argv[])
             { // Plot result after NSigma substitution
                 cpgpage();
                 plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, maskSet.globalMask, flaggedChans);
+            }
+
+            // Plot all individual masks except globalMask
+            if (m.plot)
+            {
+                plotAllMasks(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, &maskSet, flaggedChans);
             }
 
             // --- Final visualization: show data after all pixel substitutions ---
@@ -1040,11 +1032,12 @@ int main(int argc, char *argv[])
 
         if (m.write)
         {
+            double write_start = omp_get_wtime();
             calcCompress(outDataT, nchanBinned, nsampBinned, scaleBinned, offsetBinned);
             transpose(outDataT, nchanBinned, nsampBinned, outData);
             applyCompress(outData, outRawData, nchanBinned, nsampBinned, scaleBinned, offsetBinned);
             
-            int writeBack = 0, writeDastset = 1;
+            int writeBack = m.writeBack, writeDastset = 1;
             
             if (writeBack) {
                 writeBlock(fptr, blocksPerRead, nchanBinned, nsampBinned, binnedBlockSize,
@@ -1063,14 +1056,20 @@ int main(int argc, char *argv[])
             if (writeDastset) {
                 writeFITSDataset(outRawData, scaleBinned, offsetBinned, nsampBinned, nchanBinned, ii, &m, &fits_status);
             }
+            double write_time = omp_get_wtime() - write_start;
+            printf("Write operations time: %.4f seconds\n", write_time);
         }
 
 
         numiter++;
         if (numiter >= 3) {
             m.plot = 0; 
-            return 0;
+            // return 0;
         }
+        
+        double loop_time = omp_get_wtime() - loop_start;
+        printf("Total loop %d time: %.4f seconds\n", ii, loop_time);
+        printf("iteration %d done.\n\n", numiter);
 
     }
 

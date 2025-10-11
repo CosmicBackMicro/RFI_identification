@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <dlfcn.h>
+#include <omp.h>
 
 // Include header for CUDA functions
 #include "cuda_acceleration.h"
@@ -1151,10 +1152,22 @@ int cuda_identSubstNSigma(
         fprintf(stderr, "Error: CUDA RFI detection requested but CUDA is not available\n");
         return -1;
     }
-    
-    return cudaIdentSubstNSigma(data, nsamp, nchan, NSigmaInChan, NSigmaOutChan,
-                               iterationIndex, plot, (IdentNSigmaMasks*)masks,
-                               finalMedian, finalStd, flaggedChans);
+
+    printf("=== Testing CUDA-accelerated RFI detection ===\n");
+    double start_time = omp_get_wtime();
+
+    int result = cudaIdentSubstNSigma(data, nsamp, nchan, NSigmaInChan, NSigmaOutChan,
+                                      iterationIndex, plot, (IdentNSigmaMasks*)masks,
+                                      finalMedian, finalStd, flaggedChans);
+
+    double elapsed = omp_get_wtime() - start_time;
+    if (result == 0) {
+        printf("CUDA RFI detection completed successfully in %.4f seconds\n", elapsed);
+    } else {
+        printf("CUDA RFI detection failed with code %d\n", result);
+    }
+
+    return result;
 }
 
 } // extern "C"

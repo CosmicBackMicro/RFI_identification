@@ -7,6 +7,7 @@
 #include "psrPalett.h"
 #include "plot.h"
 #include "findStats.h"
+#include "identification.h"
 
 #define PALETT_GREY 1
 #define PALETT_BLUE 2
@@ -511,4 +512,19 @@ void plot8bitHist(int *hist, float lowerBound, float upperBound, float mean, flo
     cpgsls(1);
     cpgsci(1);
     cpgslw(1); // Reset
+}
+
+void plotAllMasks(Metadata *m, int blocksPerRead, float *outDataT, float *dsFreqArray, int startTime, int numiter, IdentNSigmaMasks *maskSet, int *flaggedChans) {
+    // List of masks to plot, excluding globalMask
+    int *masks[] = {maskSet->horizontalMask, maskSet->verticalMask, maskSet->pointMask, maskSet->chanBrightMask, maskSet->chanDarkMask, maskSet->chanComplexMask};
+    char *maskNames[] = {"horizontalMask", "verticalMask", "pointMask", "chanBrightMask", "chanDarkMask", "chanComplexMask"};
+    int numMasks = 6;
+
+    for (int i = 0; i < numMasks; i++) {
+        cpgpage();
+        char title[100];
+        snprintf(title, sizeof(title), "Mask: %s", maskNames[i]);
+        cpgmtxt("T", 4.0, 0.35, 0.5, title);
+        plotTimeFreqSED(m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, masks[i], flaggedChans);
+    }
 }

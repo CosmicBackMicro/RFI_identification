@@ -13,7 +13,7 @@ HAS_NVCC := $(shell which nvcc >/dev/null 2>&1 && echo 1 || echo 0)
 # 构建模式：
 # 可通过 make MODE=release 或 make MODE=debug 切换，
 # 也可以直接修改下面这行来改变默认模式
-MODE ?= release
+MODE ?= debug
 
 
 # 基础编译选项

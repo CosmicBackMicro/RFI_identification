@@ -17,6 +17,8 @@ static struct option long_options[] = {
     {"datasetPath", optional_argument, NULL, 'p'},      // --datasetPath
     {"plot", required_argument, NULL, 'P'},             // --plot
     {"write", required_argument, NULL, 'W'},            // --write
+    {"writeBack", required_argument, NULL, 'B'},        // --writeBack
+    {"writeMasks", required_argument, NULL, 'k'},       // --writeMasks
     {"doSubstitution", required_argument, NULL, 'e'},   // --doSubstitution
     {"doSumThreshold", required_argument, NULL, 'r'},   // --doSumThreshold
     {"enableCuda", required_argument, NULL, 'c'},       // --enableCuda

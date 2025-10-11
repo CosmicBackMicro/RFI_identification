@@ -2,6 +2,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import os, re
 import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
+import segmentation_models_pytorch as smp
+from segmentation_models_pytorch.encoders import get_preprocessing_fn
+
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # 设置使用的GPU设备
 os.environ['SMP_HUB_MODE'] = "original"
 
@@ -16,8 +20,6 @@ import fitsio
 import albumentations as albu
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
-import segmentation_models_pytorch as smp
-from segmentation_models_pytorch.encoders import get_preprocessing_fn
 
 class UNetLightningModule(pl.LightningModule):
     def __init__(self, encoder_name="resnet50", classes=2, learning_rate=0.0001, weights_path=None, scheduler_type="cosine"):
@@ -28,7 +30,18 @@ class UNetLightningModule(pl.LightningModule):
         self.scheduler_type = scheduler_type
         
         # 初始化模型
-        self.model = smp.UnetPlusPlus(
+        # self.model = smp.UnetPlusPlus(
+        #     encoder_name=encoder_name,
+        #     encoder_weights=None,
+        #     in_channels=1,  # 单通道射电图像
+        #     decoder_channels=(256, 128, 64, 32, 16),  # ResNet50需要5个解码器通道
+        #     decoder_use_norm="batchnorm",
+        #     decoder_attention_type="scse",  # 添加注意力机制
+        #     decoder_interpolation="bilinear",  # 更好的上采样
+        #     classes=classes,
+        #     activation=None  # 移除激活函数，在损失函数中处理
+        # )
+        self.model = smp.Unet(
             encoder_name=encoder_name,
             encoder_weights=None,
             in_channels=1,  # 单通道射电图像
@@ -47,9 +60,10 @@ class UNetLightningModule(pl.LightningModule):
             print(f"Loaded weights from {weights_path}")
         
         # 定义损失函数
-        self.dice_loss = smp.losses.DiceLoss(mode='multiclass')
-        self.ce_loss = smp.losses.SoftCrossEntropyLoss(smooth_factor=0.1)
-        
+        # self.dice_loss = smp.losses.DiceLoss(mode='multiclass')
+        # self.ce_loss = smp.losses.SoftCrossEntropyLoss(smooth_factor=0.1)
+        self.loss_fn = smp.losses.DiceLoss(smp.losses.MULTICLASS_MODE, from_logits=True)
+
         self.learning_rate = learning_rate
         
     def joint_loss(self, y_pred, y_true):
@@ -69,14 +83,15 @@ class UNetLightningModule(pl.LightningModule):
         images, masks = batch
         outputs = self(images)
         
-        loss = self.joint_loss(outputs, masks)
-        
+        # loss = self.joint_loss(outputs, masks)
+        loss = self.loss_fn(outputs, masks)
+
         # 将输出转换为概率并计算预测
         probs = torch.softmax(outputs, dim=1)
         preds = torch.argmax(probs, dim=1)
         
-        # 计算指标 - 转换为二进制格式
-        tp, fp, fn, tn = smp.metrics.get_stats(preds.long(), masks.long(), mode='multiclass', num_classes=2)
+        # 计算指标 - 多类格式
+        tp, fp, fn, tn = smp.metrics.get_stats(preds, masks.long(), mode='multiclass', num_classes=3)
         iou = smp.metrics.iou_score(tp, fp, fn, tn, reduction="micro")
         f1 = smp.metrics.f1_score(tp, fp, fn, tn, reduction="micro")
         accuracy = smp.metrics.accuracy(tp, fp, fn, tn, reduction="micro")
@@ -91,16 +106,23 @@ class UNetLightningModule(pl.LightningModule):
     
     def validation_step(self, batch, batch_idx):
         images, masks = batch
+        
+        # 调试：检查masks的值范围
+        if torch.any(masks < 0) or torch.any(masks >= 3):
+            print(f"Invalid mask values found: min={masks.min()}, max={masks.max()}")
+            masks = torch.clamp(masks, 0, 2)  # 临时修复
+        
         outputs = self(images)
         
-        loss = self.joint_loss(outputs, masks)
-        
+        # loss = self.joint_loss(outputs, masks)
+        loss = self.loss_fn(outputs, masks)
+
         # 将输出转换为概率并计算预测
         probs = torch.softmax(outputs, dim=1)
         preds = torch.argmax(probs, dim=1)
         
-        # 计算指标 - 转换为二进制格式
-        tp, fp, fn, tn = smp.metrics.get_stats(preds.long(), masks.long(), mode='multiclass', num_classes=2)
+        # 计算指标 - 多类格式
+        tp, fp, fn, tn = smp.metrics.get_stats(preds, masks.long(), mode='multiclass', num_classes=3)
         iou = smp.metrics.iou_score(tp, fp, fn, tn, reduction="micro")
         f1 = smp.metrics.f1_score(tp, fp, fn, tn, reduction="micro")
         accuracy = smp.metrics.accuracy(tp, fp, fn, tn, reduction="micro")
@@ -165,7 +187,7 @@ class UNetLightningModule(pl.LightningModule):
                 mode='min', 
                 factor=0.5, 
                 patience=3,
-                verbose=True,
+                verbose="True",
                 min_lr=1e-7
             )
             return {
@@ -232,7 +254,7 @@ class FITSDataset(Dataset):
     """
 
     # CLASSES = ["background", "periodic", "blob", "pulse"]
-    CLASSES = ["background", "rfi"]  # Define your classes here
+    CLASSES = ["bkg", "chan_rfi", "point_rfi"]  # Define your classes here
 
     @staticmethod
     def extract_id(filename):
@@ -347,12 +369,14 @@ class FITSDataset(Dataset):
             image = self.load_fits_image(self.image_list[i])
 
             masks = cv2.imread(self.mask_list[i], cv2.IMREAD_UNCHANGED)
-            if masks.dtype == np.uint8 and masks.max() > 1:
-                masks = masks // 255
+            # 移除不正确的归一化逻辑 - masks已经是类标签
+            # if masks.dtype == np.uint8 and masks.max() > 1:
+            #     masks = masks // 255
 
             mask_labels = np.zeros(masks.shape[:2], dtype=np.uint8)
-            for idx, cls_val in enumerate(self.class_values):
-                mask_labels[masks == cls_val] = idx
+            if self.class_values:
+                for idx, cls_val in enumerate(self.class_values):
+                    mask_labels[masks == cls_val] = idx
 
             if self.augmentation:
                 sample = self.augmentation(image=image, mask=mask_labels)
@@ -371,119 +395,6 @@ class FITSDataset(Dataset):
     def __len__(self):
         return len(self.ids)
     
-def get_training_augmentation():
-    """
-    针对射电天文时间-频率图像的数据增强策略
-    
-    设计原则：
-    1. 保持时间-频率轴的物理意义
-    2. 模拟真实的射电观测条件变化
-    3. 增强模型对不同RFI模式的泛化能力
-    """
-    train_transform = [
-        # albu.Resize(512, 512),  # 标准化输入尺寸
-        albu.Resize(512, 512),  # 标准化输入尺寸
-        
-        # 亮度和对比度变化 - 模拟不同观测条件和仪器响应
-        albu.RandomBrightnessContrast(
-            brightness_limit=0.2,    # 适度的亮度变化
-            contrast_limit=0.3,      # 对比度增强有助于突出RFI特征
-            p=0.5
-        ),
-        
-        # 添加噪声 - 模拟射电观测中的热噪声和系统噪声
-        albu.GaussNoise(
-            std_range=(0.01, 0.05),   # 标准差范围，控制噪声强度
-            mean_range=(0, 0),        # 均值范围，保持为0
-            per_channel=True,         # 每个通道独立添加噪声
-            p=0.3
-        ),
-        
-        # 轻微的缩放 - 模拟不同时间分辨率的观测
-        albu.Affine(
-            scale=(0.85, 1.15),      # 保守的缩放范围
-            translate_percent=0,      # 不进行平移，保持时间对齐
-            rotate=0,                 # 不旋转，保持轴向意义
-            p=0.3
-        ),
-        
-        # 频率轴方向的翻转 - 某些情况下频谱可能倒置
-        albu.VerticalFlip(p=0.2),   # 降低概率，仅在确实合理时使用
-        
-        # # 小幅度的弹性变形 - 模拟色散延迟等物理效应
-        # albu.ElasticTransform(
-        #     alpha=20,                 # 降低变形强度，提高稳定性
-        #     sigma=3,                  # 降低平滑度参数
-        #     approximate=True,         # 加速计算
-        #     p=0.15                    # 降低概率
-        # ),
-        
-        # # Gamma校正 - 模拟不同的动态范围压缩
-        # # 注意：为了避免数值不稳定，使用更保守的gamma范围
-        # albu.RandomGamma(
-        #     gamma_limit=(80, 120),    # 更保守的gamma变化 (对应0.8-1.2)
-        #     p=0.2                     # 降低概率，减少数值问题
-        # ),
-    ]
-    return albu.Compose(train_transform)
-
-def get_validation_augmentation():
-    """验证集只进行尺寸标准化，不做其他变换"""
-    test_transform = [
-        albu.Resize(512, 512),  # 回到512x512以提高验证速度
-    ]
-    return albu.Compose(test_transform)
-
-def get_advanced_radio_augmentation():
-    """
-    高级射电天文数据增强策略（可选使用）
-    
-    专门针对射电天文RFI检测任务设计的增强方法
-    """
-    train_transform = [
-        albu.Resize(512, 512),
-        
-        # 模拟频率分辨率变化
-        albu.OneOf([
-            albu.GaussianBlur(blur_limit=(1, 3), sigma_limit=0, p=1.0),  # 模拟低频率分辨率
-            albu.MedianBlur(blur_limit=3, p=1.0),                        # 去除尖锐噪声
-        ], p=0.2),
-        
-        # 模拟不同的动态范围和量化噪声
-        albu.OneOf([
-            albu.RandomGamma(gamma_limit=(85, 115), p=1.0),  # 更保守的gamma范围
-            albu.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=1.0),    # 局部对比度增强
-        ], p=0.2),  # 降低概率
-        
-        # 射电干扰的强度变化
-        albu.RandomBrightnessContrast(
-            brightness_limit=0.2,     # 降低亮度变化范围
-            contrast_limit=0.3,       # 降低对比度变化范围
-            p=0.4
-        ),
-        
-        # 模拟系统噪声 - 使用更稳定的噪声类型
-        albu.OneOf([
-            albu.GaussNoise(std_range=(0.01, 0.03), mean_range=(0, 0), per_channel=True, p=1.0),
-            albu.ISONoise(color_shift=(0.01, 0.05), intensity=(0.1, 0.3), p=1.0),
-        ], p=0.3),
-        
-        # 轻微的几何变形（模拟色散等效应）- 更保守的参数
-        albu.OneOf([
-            albu.ElasticTransform(alpha=15, sigma=2, approximate=True, p=1.0),
-            albu.OpticalDistortion(distort_limit=0.05, shift_limit=0.02, p=1.0),
-        ], p=0.1),
-        
-        # 保守的缩放（模拟不同观测带宽）
-        albu.Affine(
-            scale=(0.95, 1.05),       # 更保守的缩放范围
-            translate_percent=0,
-            rotate=0,
-            p=0.15
-        ),
-    ]
-    return albu.Compose(train_transform)
-
 def get_stable_training_augmentation():
     """
     稳定的射电天文数据增强策略 - 平衡性能和质量的版本
@@ -525,9 +436,9 @@ def get_stable_training_augmentation():
 def to_tensor(x, **kwargs):
     # 对于图像：确保输入是灰度图像
     if len(x.shape) == 2:
-        # 灰度图像或标签掩码，添加通道维度
-        if x.dtype == np.uint8 and x.max() < 10:  # 假设是标签掩码
-            return x.astype('int64')  # 标签掩码不需要额外的通道维度
+        # 灰度图像或标签掩码
+        if x.dtype == np.uint8:  # 标签掩码
+            return x.astype('int64')  # 不添加通道维度
         else:
             # 灰度图像，添加通道维度
             x = np.expand_dims(x, axis=0)  # Shape is now (1, H, W)
@@ -542,7 +453,15 @@ def get_preprocessing(preprocessing_fn):
         # 由于图像已经在[0,1]范围内，不需要额外的归一化
         albu.Lambda(image=to_tensor, mask=to_tensor),
     ]
-    return albu.Compose(_transform)
+    return albu.Compose(_transform) # type: ignore
+
+
+def get_validation_augmentation(height, width):
+    """Add paddings to make image shape divisible by 32"""
+    test_transform = [
+        albu.Resize(height, width)
+    ]
+    return albu.Compose(test_transform) # type: ignore
 
 def visualize_augmentations(dataset, samples=3, cols=3):
     """可视化原始图像、ground truth mask 和叠加效果"""
@@ -561,6 +480,8 @@ def visualize_augmentations(dataset, samples=3, cols=3):
         
         if hasattr(mask, 'numpy'):
             mask = mask.numpy()
+        
+        mask = mask.squeeze()  # 移除通道维度以便可视化
         
         # 反归一化图像以便正确显示
         # 因为图像经过了 Normalize(mean=0.0, std=1.0, max_pixel_value=255.0)
@@ -581,7 +502,7 @@ def visualize_augmentations(dataset, samples=3, cols=3):
         # 第三列：图像与mask的叠加
         # 直接在伪彩色图像上叠加mask，不转换为RGB
         
-        # 先显示伪彩色的图像作为背景
+        # 先显示伔彩色的图像作为背景
         ax[i, 2].imshow(image, cmap='gist_heat', vmin=0, vmax=1.5, alpha=1.0)
         
         # 创建mask的叠加层，只在RFI区域显示
@@ -601,7 +522,7 @@ def visualize_augmentations(dataset, samples=3, cols=3):
     plt.show()
 
 if __name__ == "__main__":
-    dataset_top_dir = "/home/cbm/deRFI/dataset"
+    dataset_top_dir = "/home/cbm/deRFI/Datasets/dataset"
     image_dir = os.path.join(dataset_top_dir, "image")
     mask_dir = os.path.join(dataset_top_dir, "mask")
 
@@ -612,8 +533,10 @@ if __name__ == "__main__":
     val_mask_dir = os.path.join(mask_dir, "val")
 
     # 超参数配置 - 平衡性能和质量的版本
-    ENCODER = "resnet50"
-    CLASSES = ["background", "rfi"]
+    # ENCODER = "resnet50"
+    ENCODER = "mit_b0"  # 使用支持的Transformer-based encoder: Mix Transformer
+    # CLASSES = ["background", "rfi"]
+    CLASSES = ["bkg", "chan_rfi", "point_rfi"]
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     LEARNING_RATE = 3e-4  
     BATCH_SIZE = 3  # 增加batch size提高训练效率
@@ -637,14 +560,14 @@ if __name__ == "__main__":
         val_image_dir,
         val_mask_dir,
         classes=CLASSES,
-        augmentation=get_validation_augmentation(),
+        augmentation=get_validation_augmentation(512, 512),  # 指定大小以匹配训练
         preprocessing=get_preprocessing(None),
         normalization_method="median_sigma",  # 验证集使用相同的归一化方法
     )
     
     # 可视化数据增强效果
-    print("可视化数据增强效果...")
-    visualize_augmentations(train_dataset, samples=3, cols=3)
+    # print("可视化数据增强效果...")
+    # visualize_augmentations(train_dataset, samples=3, cols=3)
 
     # 创建数据加载器 - 优化性能设置
     train_loader = DataLoader(
@@ -670,7 +593,7 @@ if __name__ == "__main__":
     # 创建模型
     model = UNetLightningModule(
         encoder_name=ENCODER,
-        classes=len(CLASSES),
+        classes=len(CLASSES),  # 多类分割，输出通道数等于类别数
         learning_rate=LEARNING_RATE,
         weights_path=weights_path,
         scheduler_type="cosine"  # 可选: "cosine", "plateau", "step", "exponential"
@@ -682,7 +605,7 @@ if __name__ == "__main__":
     
     # 配置回调函数
     callbacks = [
-        pl.callbacks.ModelCheckpoint(
+        ModelCheckpoint(
             dirpath='checkpoints',
             filename='best_model-{epoch:02d}-{val_iou:.4f}',
             monitor='val_iou',
@@ -691,13 +614,13 @@ if __name__ == "__main__":
             save_last=True,
             verbose=True
         ),
-        pl.callbacks.EarlyStopping(
+        EarlyStopping(
             monitor='val_loss',
             patience=10,
             mode='min',
             verbose=True
         ),
-        pl.callbacks.LearningRateMonitor(logging_interval='epoch')
+        LearningRateMonitor(logging_interval='epoch')
     ]
     
     # 配置 TensorBoard 日志记录器

@@ -104,17 +104,17 @@ void writeAllMasksPNG(const IdentNSigmaMasks *masks, int nsamp, int nchan,
         writeIndexMaskPNG(masks->horizontalMask, nsamp, nchan, filename);
     }
 
-    // vertical
-    if (masks->verticalMask) {
-        snprintf(filename, sizeof(filename), "%smask_vertical_%d.png", datasetPath, index);
-        writeIndexMaskPNG(masks->verticalMask, nsamp, nchan, filename);
-    }
+    // // vertical
+    // if (masks->verticalMask) {
+    //     snprintf(filename, sizeof(filename), "%smask_vertical_%d.png", datasetPath, index);
+    //     writeIndexMaskPNG(masks->verticalMask, nsamp, nchan, filename);
+    // }
 
-    // global
-    if (masks->globalMask) {
-        snprintf(filename, sizeof(filename), "%smask_global_%d.png", datasetPath, index);
-        writeIndexMaskPNG(masks->globalMask, nsamp, nchan, filename);
-    }
+    // // global
+    // if (masks->globalMask) {
+    //     snprintf(filename, sizeof(filename), "%smask_global_%d.png", datasetPath, index);
+    //     writeIndexMaskPNG(masks->globalMask, nsamp, nchan, filename);
+    // }
 
     // point
     if (masks->pointMask) {
@@ -122,17 +122,23 @@ void writeAllMasksPNG(const IdentNSigmaMasks *masks, int nsamp, int nchan,
         writeIndexMaskPNG(masks->pointMask, nsamp, nchan, filename);
     }
 
-    // chanBright
-    if (masks->chanBrightMask) {
-        snprintf(filename, sizeof(filename), "%smask_chanBright_%d.png", datasetPath, index);
-        writeIndexMaskPNG(masks->chanBrightMask, nsamp, nchan, filename);
-    }
+    // // chanBright
+    // if (masks->chanBrightMask) {
+    //     snprintf(filename, sizeof(filename), "%smask_chanBright_%d.png", datasetPath, index);
+    //     writeIndexMaskPNG(masks->chanBrightMask, nsamp, nchan, filename);
+    // }
 
-    // chanDark
-    if (masks->chanDarkMask) {
-        snprintf(filename, sizeof(filename), "%smask_chanDark_%d.png", datasetPath, index);
-        writeIndexMaskPNG(masks->chanDarkMask, nsamp, nchan, filename);
-    }
+    // // chanDark
+    // if (masks->chanDarkMask) {
+    //     snprintf(filename, sizeof(filename), "%smask_chanDark_%d.png", datasetPath, index);
+    //     writeIndexMaskPNG(masks->chanDarkMask, nsamp, nchan, filename);
+    // }
+
+    // // chanComplex
+    // if (masks->chanComplexMask) {
+    //     snprintf(filename, sizeof(filename), "%smask_chanComplex_%d.png", datasetPath, index);
+    //     writeIndexMaskPNG(masks->chanComplexMask, nsamp, nchan, filename);
+    // }
 }
 
 void allocIdentNSigmaMasks(IdentNSigmaMasks *m, int nsamp, int nchan) {
@@ -143,6 +149,7 @@ void allocIdentNSigmaMasks(IdentNSigmaMasks *m, int nsamp, int nchan) {
     m->pointMask      = (int *)calloc(nsamp * nchan, sizeof(int));
     m->chanBrightMask = (int *)calloc(nsamp * nchan, sizeof(int));
     m->chanDarkMask   = (int *)calloc(nsamp * nchan, sizeof(int));
+    m->chanComplexMask = (int *)calloc(nsamp * nchan, sizeof(int));
 }
 
 void freeIdentNSigmaMasks(IdentNSigmaMasks *m) {
@@ -153,4 +160,5 @@ void freeIdentNSigmaMasks(IdentNSigmaMasks *m) {
     free(m->pointMask);
     free(m->chanBrightMask);
     free(m->chanDarkMask);
+    free(m->chanComplexMask);
 }

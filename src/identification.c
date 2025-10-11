@@ -779,11 +779,11 @@ void binarySIR(
 /// @param channel_std_threshold Sigma threshold for outlier detection (T_chan)
 /// @param nsigma_in Sigma threshold for inChannel detection (T_point)
 void outChanDetection(float *data, int nsamp, int nchan, int *channelFlagged,
-                              float *channel_stds, float *channel_stds_temp, float channel_std_threshold, float nsigma_in)
+                              float *channel_stds, float *channel_stds_temp, float channel_std_threshold, float nsigma_in, int plot)
 {
-    const int MAX_ITERATIONS = 100;   // Maximum iterations for convergence
-    const float STD_CHANGE_THRESHOLD = 0.0001f;  // Standard deviation change rate threshold (0.01%)
-    const float MEDIAN_CHANGE_THRESHOLD = 1e-6f;  // Median change threshold
+    const int MAX_ITERATIONS = 20;   // Reduced maximum iterations for faster convergence
+    const float STD_CHANGE_THRESHOLD = 0.01f;  // Relaxed standard deviation change rate threshold (1%)
+    const float MEDIAN_CHANGE_THRESHOLD = 1e-4f;  // Relaxed median change threshold
     
     int i;
     
@@ -797,7 +797,7 @@ void outChanDetection(float *data, int nsamp, int nchan, int *channelFlagged,
     }
     
     // Calculate standard deviation for each channel
-    printf("    [DEBUG] outChannel: Calculating channel standard deviations\n");
+    // #pragma omp parallel for
     for (i = 0; i < nchan; i++)
     {
         float channel_mean, channel_std;
@@ -826,14 +826,10 @@ void outChanDetection(float *data, int nsamp, int nchan, int *channelFlagged,
     }
     
     if (valid_count < 3) {
-        printf("    [DEBUG] outChannel: Too few valid channels (%d < 3), skipping\n", valid_count);
         free(channel_mask);
         free(valid_stds);
         return;
     }
-    
-    printf("    [DEBUG] outChannel: Starting iterative outlier detection: initial_channels=%d/%d (%.1f%%)\n", 
-           valid_count, nchan, (float)valid_count/nchan*100);
     
     while (iter < MAX_ITERATIONS && valid_count >= 3)
     {
@@ -857,12 +853,13 @@ void outChanDetection(float *data, int nsamp, int nchan, int *channelFlagged,
         // Calculate bounds
         float upper_bound = current_median + channel_std_threshold * current_std;
         float lower_bound = current_median - channel_std_threshold * current_std;
+        lower_bound = (lower_bound < 0) ? 0 : lower_bound; // Ensure non-negative lower bound
         
         // Flag new outlier channels and rebuild valid data array
         int new_outliers = 0;
         valid_count = 0;  // Reset and rebuild
         
-        #pragma omp parallel for reduction(+:new_outliers)
+        // #pragma omp parallel for reduction(+:new_outliers)
         for (i = 0; i < nchan; i++) {
             if (channel_mask[i] == 0) {  // Currently valid
                 if (channel_stds[i] > upper_bound || channel_stds[i] < lower_bound) {
@@ -883,23 +880,9 @@ void outChanDetection(float *data, int nsamp, int nchan, int *channelFlagged,
         
         total_flagged += new_outliers;
         
-        // === Centralized Debug Output ===
-        printf("    [DEBUG] outChannel Iter %d: valid=%d, median=%.6f, std=%.6f", 
-               iter + 1, valid_count + new_outliers, current_median, current_std);
-        if (iter > 0) {
-            printf(", med_change=%.8f, std_change_rate=%.6f", median_change, std_change_rate);
-        }
-        printf("\n    [DEBUG]      bounds=[%.6f, %.6f], flagged=%d, remaining=%d/%d (%.1f%%)", 
-               lower_bound, upper_bound, new_outliers, valid_count, nchan, (float)valid_count/nchan*100);
-        
-        if (converged) {
-            printf(" -> CONVERGED (median stable & std rate < %.3f)\n", STD_CHANGE_THRESHOLD);
+        // Break if no new outliers found (algorithm has converged)
+        if (new_outliers == 0) {
             break;
-        } else if (new_outliers == 0) {
-            printf(" -> CONVERGED (no new outliers)\n");
-            break;
-        } else {
-            printf("\n");
         }
         
         // Update for next iteration
@@ -908,25 +891,17 @@ void outChanDetection(float *data, int nsamp, int nchan, int *channelFlagged,
         iter++;
     }
     
-    // Final summary
-    if (iter >= MAX_ITERATIONS) {
-        printf("    [DEBUG] outChannel -> STOPPED (max iterations %d reached)\n", MAX_ITERATIONS);
-    } else if (valid_count < 3) {
-        printf("    [DEBUG] outChannel -> STOPPED (too few valid channels: %d < 3)\n", valid_count);
-    }
-    
-    printf("    [DEBUG] outChannel Final result: flagged %d channels in %d iterations, remaining_valid=%d/%d (%.1f%%)\n",
-           total_flagged, iter, valid_count, nchan, (float)valid_count/nchan*100);
-    
     // Count final flagged channels
     int final_flagged_count = 0;
     for (i = 0; i < nchan; i++) {
         if (channelFlagged[i]) final_flagged_count++;
     }
     
+    printf("outChannel detection completed (%d iterations, %d channels flagged)\n", iter, final_flagged_count);
+    
     // Create final statistics array (mark flagged channels with negative values)
     float *final_channel_stds = (float *)malloc(nchan * sizeof(float));
-    #pragma omp parallel for
+    // #pragma omp parallel for
     for (i = 0; i < nchan; i++) {
         if (channelFlagged[i]) {
             final_channel_stds[i] = -1.0f; // Mark as flagged
@@ -935,14 +910,12 @@ void outChanDetection(float *data, int nsamp, int nchan, int *channelFlagged,
         }
     }
     
-    // Display comparison histogram if significant changes occurred
-    if (total_flagged > 0) {
+    // Display comparison histogram if significant changes occurred and plotting is enabled
+    if (total_flagged > 0 && plot) {
         printf("\n=== Displaying outChannel Detection Comparison ===\n");
         drawOutChannelComparisonHist(initial_channel_stds, final_channel_stds, nchan, 
                                    0, initial_flagged_count, final_flagged_count, iter, channel_std_threshold, nsigma_in); // Using STD (0)
         printf("=== OutChannel Comparison Complete ===\n");
-    } else {
-        printf("    [DEBUG] outChannel: No channels flagged, skipping comparison histogram\n");
     }
     
     // Cleanup
@@ -1477,10 +1450,9 @@ int inChanOutlierIter(float *data, int nsamp, float Nsigma,
         return 0;
     }
     
-    printf("    [DEBUG] Starting iterative outlier detection: initial_samples=%d/%d (%.1f%%)\n", 
-           valid_count, nsamp, (float)valid_count/nsamp*100);
+    int converged = 0;
     
-    while (iter < MAX_ITERATIONS && valid_count >= 3)
+    while (iter < MAX_ITERATIONS && valid_count >= 3 && !converged)
     {
         // Calculate current median
         current_median = median(median_temp, valid_count);
@@ -1489,7 +1461,6 @@ int inChanOutlierIter(float *data, int nsamp, float Nsigma,
         current_std = stdFromMedian(median_temp, valid_count);
         
         // Check convergence conditions after first iteration
-        int converged = 0;
         if (iter > 0) {
             median_change = fabsf(current_median - last_median);
             std_change_rate = (last_std > 0) ? fabsf(current_std - last_std) / last_std : 0.0f;
@@ -1520,23 +1491,8 @@ int inChanOutlierIter(float *data, int nsamp, float Nsigma,
             }
         }
         
-        // === Centralized Debug Output ===
-        printf("    [DEBUG] Iter %d: valid=%d, median=%.6f, std=%.6f", 
-               iter + 1, valid_count + new_outliers, current_median, current_std);
-        if (iter > 0) {
-            printf(", med_change=%.8f, std_change_rate=%.6f", median_change, std_change_rate);
-        }
-        printf("\n    [DEBUG]      bounds=[%.6f, %.6f], flagged=%d, remaining=%d/%d (%.1f%%)", 
-               lower_bound, upper_bound, new_outliers, valid_count, nsamp, (float)valid_count/nsamp*100);
-        
-        if (converged) {
-            printf(" -> CONVERGED (median stable & std rate < %.3f)\n", STD_CHANGE_THRESHOLD);
-            break;
-        } else if (new_outliers == 0) {
-            printf(" -> CONVERGED (no new outliers)\n");
-            break;
-        } else {
-            printf("\n");
+        if (new_outliers == 0 && iter > 0) {
+            converged = 1;
         }
         
         // Update for next iteration
@@ -1545,19 +1501,13 @@ int inChanOutlierIter(float *data, int nsamp, float Nsigma,
         iter++;
     }
     
-    // Final summary
-    if (iter >= MAX_ITERATIONS) {
-        printf("    [DEBUG] -> STOPPED (max iterations %d reached)\n", MAX_ITERATIONS);
-    } else if (valid_count < 3) {
-        printf("    [DEBUG] -> STOPPED (too few valid samples: %d < 3)\n", valid_count);
+    // Adjust reason if stopped due to insufficient samples
+    if (valid_count < 3) {
+        // No action needed, just continue
     }
-    
-    printf("    [DEBUG] Final result: removed %d outliers in %d iterations, final_valid=%d/%d (%.1f%%)\n",
-           total_outliers, iter, valid_count, nsamp, (float)valid_count/nsamp*100);
     
     return total_outliers;
 }
-
 /**
  * @brief Perform channel-level outlier detection using extracted iterative functions
  * @param data Input data array (nsamp * nchan)
@@ -1565,33 +1515,20 @@ int inChanOutlierIter(float *data, int nsamp, float Nsigma,
  * @param nchan Number of channels
  * @param Nsigma Sigma threshold for outlier detection
  * @param horizontalMask Output horizontal mask array
- * @param flaggedChans Array indicating which channels are fully flagged
+ * @param channel_fully_flagged Array indicating which channels are fully flagged
  * @return Total number of outliers detected across all channels
  */
 int inChanDetection(float *data, int nsamp, int nchan, float Nsigma,
-                               int *horizontalMask, int *flaggedChans)
+                               int *horizontalMask, int *channel_fully_flagged)
 {
     int totalOutliers = 0;
     
-    // Static buffers: allocate once, reuse (assuming single-threaded or careful use)
-    static float *median_temp = NULL;
-    static int *good_samples = NULL;
-    static int *random_indices = NULL;
-    
-    // Allocate buffers on first call
-    if (median_temp == NULL) {
-        median_temp = (float *)malloc(nsamp * sizeof(float));
-        good_samples = (int *)malloc(nsamp * sizeof(int));
-        random_indices = (int *)malloc(nsamp * sizeof(int));
-    }
-    
-    // Clear buffers for safety (static variables retain values across calls)
-    memset(median_temp, 0, nsamp * sizeof(float));
-    memset(good_samples, 0, nsamp * sizeof(int));
-    memset(random_indices, 0, nsamp * sizeof(int));
-    
+    // Allocate temporary arrays for each thread
     #pragma omp parallel reduction(+:totalOutliers)
     {
+        float *median_temp = (float *)malloc(nsamp * sizeof(float));
+        int *good_samples = (int *)malloc(nsamp * sizeof(int));
+        int *random_indices = (int *)malloc(nsamp * sizeof(int));
         int i;
         
         #pragma omp for
@@ -1606,10 +1543,15 @@ int inChanDetection(float *data, int nsamp, int nchan, float Nsigma,
             
             totalOutliers += channelOutliers;
         }
+        
+        free(median_temp);
+        free(good_samples);
+        free(random_indices);
     }
     
     return totalOutliers;
 }
+
 
 /**
  * @brief Apply killThresh analysis to flag heavily contaminated channels
@@ -1765,11 +1707,86 @@ void applySubstitution(float *data, int *globalMask, int nsamp, int nchan, int *
     printf("=== End Pixel Substitution ===\n\n");
 }
 
-// Helper: Expand 1D channel mask to 2D mask (set entire channel to 1 if flagged)
-// moved to mask.c: expandChannelMask
+/**
+ * @brief Classify flagged channels into bright, dark, and complex based on channel means and continuity
+ * @param data Data array (nsamp * nchan)
+ * @param nsamp Number of time samples
+ * @param nchan Number of channels
+ * @param flaggedChans Array indicating which channels are flagged (1 if flagged, 0 otherwise)
+ * @param brightMask Output mask for bright channels (set to 1 for entire bright flagged channels)
+ * @param darkMask Output mask for dark channels (set to 1 for entire dark flagged channels)
+ * @param complexMask Output mask for complex channels (set to 1 for entire complex flagged channels)
+ */
+void classifyChannels(float *data, int nsamp, int nchan, int *flaggedChans, int *brightMask, int *darkMask, int *complexMask) {
+    if (!(brightMask || darkMask || complexMask) || nchan <= 0) return;
 
-// Helper: OR one mask into the global mask (element-wise logical OR)
-// moved to mask.c: logicalOR
+    float *channelMeans = (float *)malloc(nchan * sizeof(float));
+    if (!channelMeans) {
+        fprintf(stderr, "Memory allocation failed in classifyBrightDarkChannels\n");
+        return;
+    }
+
+    float overallChannelMean = 0.0f;
+    for (int i = 0; i < nchan; i++) {
+        double sum = 0.0;
+        int base = i * nsamp;
+        for (int j = 0; j < nsamp; j++) {
+            sum += data[base + j];
+        }
+        float mean = (nsamp > 0) ? (float)(sum / nsamp) : 0.0f;
+        channelMeans[i] = mean;
+        overallChannelMean += mean;
+    }
+    overallChannelMean /= (float)nchan;
+
+    // Find contiguous blocks of flagged channels
+    int minConsecutive = 3; // Minimum consecutive channels to classify as bright/dark
+    int i = 0;
+    while (i < nchan) {
+        if (!flaggedChans[i]) {
+            i++;
+            continue;
+        }
+        // Start of a block
+        int start = i;
+        while (i < nchan && flaggedChans[i]) i++;
+        int end = i - 1; // end inclusive
+        int blockLength = end - start + 1;
+
+        // Classify the block
+        int allAbove = 1;
+        int allBelow = 1;
+        for (int k = start; k <= end; k++) {
+            if (channelMeans[k] <= overallChannelMean) allAbove = 0;
+            if (channelMeans[k] >= overallChannelMean) allBelow = 0;
+        }
+
+        int *targetMask = NULL;
+        if (blockLength >= minConsecutive) {
+            if (allAbove) {
+                targetMask = brightMask;
+            } else if (allBelow) {
+                targetMask = darkMask;
+            } else {
+                targetMask = complexMask;
+            }
+        } else {
+            if (allAbove) targetMask = brightMask;
+            else if (allBelow) targetMask = darkMask;
+        }
+
+        if (targetMask) {
+            for (int k = start; k <= end; k++) {
+                int base = k * nsamp;
+                for (int j = 0; j < nsamp; j++) {
+                    targetMask[base + j] = 1;
+                }
+            }
+        }
+    }
+
+    free(channelMeans);
+}
 
 void identSubstNSigma(
     float *data, int nsamp, int nchan,
@@ -1784,6 +1801,7 @@ void identSubstNSigma(
     int *pointMask = masks->pointMask;
     int *brightMask = masks->chanBrightMask;
     int *darkMask = masks->chanDarkMask;
+    int *complexMask = masks->chanComplexMask;
 
     memset(horizontalMask, 0, nsamp * nchan * sizeof(int));
     memset(verticalMask, 0, nsamp * nchan * sizeof(int));
@@ -1791,6 +1809,7 @@ void identSubstNSigma(
     memset(pointMask, 0, nsamp * nchan * sizeof(int));
     memset(brightMask, 0, nsamp * nchan * sizeof(int));
     memset(darkMask, 0, nsamp * nchan * sizeof(int));
+    memset(complexMask, 0, nsamp * nchan * sizeof(int));
 
     int *good_samples = (int *)malloc(nsamp * sizeof(int));
     int *random_indices = (int *)malloc(nsamp * sizeof(int));
@@ -1798,7 +1817,7 @@ void identSubstNSigma(
     memcpy(median_temp, data, nsamp * nchan * sizeof(float));
     
     float killThresh = 0.2f;
-    int i, j;
+    int i;
     
 
     if (plot)
@@ -1810,19 +1829,24 @@ void identSubstNSigma(
     
     // === 1. inChannel Detection ===
     printf("=== Performing point-level (pixel) outlier detection ===\n");
+    double inchan_start = omp_get_wtime();
     int pixelOutliers = 0;
     pixelOutliers = inChanDetection(data, nsamp, nchan, NSigmaInChan, 
                                                 pointMask, flaggedChans);
-    printf("Point-level detection: flagged %d outlier pixels\n", pixelOutliers);
+    double inchan_time = omp_get_wtime() - inchan_start;
+    printf("Point-level detection: flagged %d outlier pixels (%.4f seconds)\n", pixelOutliers, inchan_time);
     // Accumulate point-wise mask into global
     logicalOR(globalMask, pointMask, nsamp, nchan);
     
     // === 2. inChannel Pixel Substitution ===
+    double subst_start = omp_get_wtime();
     int inChanPixelsSubstituted;
     applySubstitution(data, pointMask, nsamp, nchan, &inChanPixelsSubstituted);
-    printf("inChannel substitution: replaced %d pixels\n", inChanPixelsSubstituted);
+    double subst_time = omp_get_wtime() - subst_start;
+    printf("inChannel substitution: replaced %d pixels (%.4f seconds)\n", inChanPixelsSubstituted, subst_time);
     
     // === 3. killThresh Analysis ===
+    double killthresh_start = omp_get_wtime();
     // Count flagged pixels before killThresh
     int flaggedBeforeKillThresh = 0;
     for (i = 0; i < nsamp * nchan; i++) {
@@ -1832,12 +1856,17 @@ void identSubstNSigma(
     int killedChannels, localRFISkipped, totalFlaggedAfter;
     applyKillThresh(pointMask, flaggedChans, nsamp, nchan, killThresh, flaggedBeforeKillThresh,
                    &killedChannels, &localRFISkipped, &totalFlaggedAfter);
+    double killthresh_time = omp_get_wtime() - killthresh_start;
+    printf("killThresh analysis completed (%.4f seconds)\n", killthresh_time);
     
     // === 4. outChannel Detection ===
     printf("=== Performing channel-level outlier detection ===\n");
+    double outchan_start = omp_get_wtime();
     float *channel_stds = (float *)malloc(nchan * sizeof(float));
     float *channel_stds_temp = (float *)malloc(nchan * sizeof(float));
-    outChanDetection(data, nsamp, nchan, flaggedChans, channel_stds, channel_stds_temp, NSigmaOutChan, NSigmaInChan);
+    outChanDetection(data, nsamp, nchan, flaggedChans, channel_stds, channel_stds_temp, NSigmaOutChan, NSigmaInChan, plot);
+    double outchan_time = omp_get_wtime() - outchan_start;
+    printf("outChannel detection completed (%.4f seconds)\n", outchan_time);
     
     // Expand 1D flaggedChans to 2D horizontalMask
     expandChannelMask(flaggedChans, horizontalMask, nsamp, nchan);
@@ -1861,41 +1890,8 @@ void identSubstNSigma(
         if (flaggedChans[i]) nFlaggedChans++;
     }
     
-    float *channelMeans = NULL;
-    float overallChannelMean = 0.0f;
-    if ((brightMask || darkMask) && nchan > 0) {
-        channelMeans = (float *)malloc(nchan * sizeof(float));
-        for (i = 0; i < nchan; i++) {
-            double sum = 0.0;
-            int base = i * nsamp;
-            for (j = 0; j < nsamp; j++) {
-                sum += median_temp[base + j];
-            }
-            float mean = (nsamp > 0) ? (float)(sum / nsamp) : 0.0f;
-            channelMeans[i] = mean;
-            overallChannelMean += mean;
-        }
-        overallChannelMean /= (float)nchan;
-
-        for (i = 0; i < nchan; i++) {
-            if (!flaggedChans[i]) {
-                continue;
-            }
-
-            int *targetMask = NULL;
-            if (channelMeans[i] >= overallChannelMean) {
-                targetMask = brightMask;
-            } else {
-                targetMask = darkMask;
-            }
-
-            if (targetMask) {
-                int base = i * nsamp;
-                for (j = 0; j < nsamp; j++) {
-                    targetMask[base + j] = 1;
-                }
-            }
-        }
+    if ((brightMask || darkMask || complexMask) && nchan > 0) {
+        classifyChannels(median_temp, nsamp, nchan, flaggedChans, brightMask, darkMask, complexMask);
     }
 
     printf("Final status: %d/%d channels fully flagged (%.2f%%)\n", 
@@ -1905,6 +1901,7 @@ void identSubstNSigma(
     logicalOR(globalMask, verticalMask, nsamp, nchan);
     logicalOR(globalMask, brightMask, nsamp, nchan);
     logicalOR(globalMask, darkMask, nsamp, nchan);
+    logicalOR(globalMask, complexMask, nsamp, nchan);
 
     // Recompute totals for reporting
     int globalFlagged = 0;
@@ -1935,8 +1932,6 @@ void identSubstNSigma(
 
     *finalMedian = finalMedian_value;
     *finalStd = finalStd_temp;
-
-    free(channelMeans);
 
     // Clean up allocated memory
     free(good_samples);

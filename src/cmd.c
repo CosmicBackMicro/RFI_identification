@@ -55,6 +55,8 @@ int parseCommandLineArguments(int argc, char *argv[], Metadata *m) {
         {"blocksPerRead", required_argument, 0, 'n'},
         {"plot", required_argument, 0, 'P'},
         {"write", required_argument, 0, 'W'},
+        {"writeBack", required_argument, 0, 'B'},
+        {"writeMasks", required_argument, 0, 'k'},
         {"enableCuda", required_argument, 0, 'c'},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
@@ -72,9 +74,11 @@ int parseCommandLineArguments(int argc, char *argv[], Metadata *m) {
     m->doSubstitution = 1;
     m->doSumThreshold = 1;
     m->enableCuda = 1;  // Default: enable CUDA if available
+    m->writeBack = 0;    // Default: do not write back to original file
+    m->writeMasks = 1;   // Default: write mask images
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "i:S:d:s:t:f:r:e:M:p:n:P:W:c:T:h", long_options, NULL))) {
+    while ((opt = getopt_long(argc, argv, "i:S:d:s:t:f:r:e:M:p:n:P:W:B:k:c:T:h", long_options, NULL))) {
         if (opt == -1) break;
 
         switch (opt) {
@@ -111,6 +115,12 @@ int parseCommandLineArguments(int argc, char *argv[], Metadata *m) {
             case 'W':
                 m->write = atoi(optarg);
                 break;
+            case 'B':
+                m->writeBack = atoi(optarg);
+                break;
+            case 'k':
+                m->writeMasks = atoi(optarg);
+                break;
             case 'e':
                 m->doSubstitution = atoi(optarg);
                 break;
@@ -133,6 +143,9 @@ int parseCommandLineArguments(int argc, char *argv[], Metadata *m) {
                 printf("  -M, --generateMasks=MASKS     Whether to generate masks\n");
                 printf("  -p, --datasetPath=PATH        Path to dataset\n");
                 printf("  -P, --plot=MODE               Plot or not\n");
+                printf("  -W, --write=MODE              Write processed data to separate FITS files\n");
+                printf("  -B, --writeBack=MODE          Write back modified data to original FITS file (dangerous!)\n");
+                printf("  -k, --writeMasks=MODE         Write mask images to PNG files\n");
                 printf("  -c, --enableCuda=MODE         Enable CUDA acceleration (1=enable, 0=disable)\n");
                 printf("  -h, --help                    Show this help message\n");
                 return 1; // Return non-zero to indicate no further processing
@@ -145,6 +158,22 @@ int parseCommandLineArguments(int argc, char *argv[], Metadata *m) {
     if (m->filename == NULL) {
         fprintf(stderr, "Error: Input filename is required\n");
         return -1;
+    }
+
+    // Safety check for writeBack
+    if (m->writeBack) {
+        printf("ATTENTION! --writeBack will modify the original data! If you know what you are doing, type the full sentence 'I know what I am doing!' and press Enter.\n");
+        char input[256];
+        if (fgets(input, sizeof(input), stdin) == NULL) {
+            fprintf(stderr, "Error reading input\n");
+            return -1;
+        }
+        // Remove newline
+        input[strcspn(input, "\n")] = 0;
+        if (strcmp(input, "I know what I am doing!") != 0) {
+            fprintf(stderr, "Confirmation failed. Exiting.\n");
+            return -1;
+        }
     }
 
     return 0; // Success

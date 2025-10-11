@@ -4,7 +4,7 @@ typedef struct {
     /* From Command Line */
     char *filename;
     float startTime;
-    int plot, write;
+    int plot, write, writeBack, writeMasks;
     int savePlot;
     int binFactorTime, binFactorFreq;
     float timeDuration;

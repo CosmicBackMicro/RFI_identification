@@ -11,7 +11,7 @@ a.out
 *.ckpt
 
 # Data files
-dataset/
+Datasets/
 test_output/
 output/
 lot/
@@ -21,6 +21,7 @@ src/spike_finding.py
 
 # Intermediate results
 IntermediateResults/
+profile/
 
 # Pretrained weights
 pretrained_weights/

@@ -7,6 +7,7 @@
 
 #include <png.h>
 #include <omp.h>
+#include <stdint.h>
 #include "cpgplot.h"
 
 // GSL headers for nonlinear fitting
@@ -27,10 +28,175 @@
 #define PI 3.14159265358979323846
 #endif
 
+int eraseIsolatedPixels(int *mask, int width, int height, int N)
+{
+    if (!mask || width <= 0 || height <= 0) {
+        return 0;
+    }
+
+    // Normalize N: odd, at least 1, at most min(width,height)
+    if (N < 1) N = 1;
+    if ((N & 1) == 0) N += 1; // make odd
+    const int W = width;
+    const int H = height;
+    const int min_wh = (W < H) ? W : H;
+    if (N > min_wh) {
+        N = (min_wh % 2 == 1) ? min_wh : (min_wh - 1);
+        if (N < 1) N = 1;
+    }
+    const size_t pixels = (size_t)W * (size_t)H;
+
+    // Build a padded integral image S of size (H+1) x (W+1), zero-initialized
+    const int SW = W + 1;
+    const int SH = H + 1;
+    uint32_t *S = (uint32_t *)calloc((size_t)SW * (size_t)SH, sizeof(uint32_t));
+    if (!S) return 0;
+
+    // 1-based build: S[y+1,x+1] = bin + S[y,x+1] + S[y+1,x] - S[y,x]
+    for (int y = 0; y < H; ++y) {
+        const int row_off = (y + 1) * SW;
+        const int prev_off = y * SW;
+        const int base = y * W;
+        for (int x = 0; x < W; ++x) {
+            const uint32_t v = (mask[base + x] != 0) ? 1u : 0u;
+            S[row_off + (x + 1)] = v + S[prev_off + (x + 1)] + S[row_off + x] - S[prev_off + x];
+        }
+    }
+
+    // Work buffer marking isolated pixels
+    unsigned char *to_zero = (unsigned char *)calloc(pixels, sizeof(unsigned char));
+    if (!to_zero) {
+        free(S);
+        return 0;
+    }
+
+    const int half = N / 2;
+    int suppressed = 0;
+    for (int y = 0; y < H; ++y) {
+        for (int x = 0; x < W; ++x) {
+            const int idx = y * W + x;
+            if (mask[idx] == 0) continue;
+
+            int x0 = x - half; if (x0 < 0) x0 = 0;
+            int y0 = y - half; if (y0 < 0) y0 = 0;
+            int x1 = x + half; if (x1 >= W) x1 = W - 1;
+            int y1 = y + half; if (y1 >= H) y1 = H - 1;
+
+            // Convert to 1-based indices for S
+            const int X0 = x0, Y0 = y0;
+            const int X1 = x1 + 1, Y1 = y1 + 1;
+            const int sum = (int)( S[Y1 * SW + X1]
+                                 - S[Y0 * SW + X1]
+                                 - S[Y1 * SW + X0]
+                                 + S[Y0 * SW + X0] );
+            if (sum == 1) {
+                to_zero[idx] = 1u;
+                ++suppressed;
+            }
+        }
+    }
+
+    for (int i = 0; i < (int)pixels; ++i) {
+        if (to_zero[i]) mask[i] = 0;
+    }
+
+    free(S);
+    free(to_zero);
+    return suppressed;
+}
+
+/**
+ * Simple 4-connected (diamond) dilation for integer masks.
+ * Any non-zero pixel in the input is treated as 1. The dilation radius
+ * controls how far each pixel expands using Manhattan distance
+ * (radius=1 => up/down/left/right neighbors only).
+ * The operation can be repeated for multiple iterations.
+ *
+ * Returns the count of newly activated pixels compared to the original mask.
+ */
+int dilateMask(int *mask, int width, int height, int radius, int iterations)
+{
+    if (!mask || width <= 0 || height <= 0) {
+        return 0;
+    }
+    if (radius < 1) radius = 1;
+    if (iterations < 1) iterations = 1;
+
+    const size_t total = (size_t)width * (size_t)height;
+    int *src = (int *)malloc(total * sizeof(int));
+    int *dst = (int *)malloc(total * sizeof(int));
+    if (!src || !dst) {
+        free(src);
+        free(dst);
+        return 0;
+    }
+
+    for (size_t i = 0; i < total; ++i) {
+        src[i] = (mask[i] != 0) ? 1 : 0;
+    }
+
+    for (int iter = 0; iter < iterations; ++iter) {
+        memset(dst, 0, total * sizeof(int));
+
+        for (int y = 0; y < height; ++y) {
+            const int row_off = y * width;
+            for (int x = 0; x < width; ++x) {
+                if (src[row_off + x] == 0) {
+                    continue;
+                }
+                const int y_min = (y - radius < 0) ? 0 : (y - radius);
+                const int y_max = (y + radius >= height) ? (height - 1) : (y + radius);
+                const int x_min = (x - radius < 0) ? 0 : (x - radius);
+                const int x_max = (x + radius >= width) ? (width - 1) : (x + radius);
+                for (int ny = y_min; ny <= y_max; ++ny) {
+                    const int base = ny * width;
+                    for (int nx = x_min; nx <= x_max; ++nx) {
+                        if (abs(nx - x) + abs(ny - y) <= radius) {
+                            dst[base + nx] = 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (iter + 1 < iterations) {
+            int *tmp = src;
+            src = dst;
+            dst = tmp;
+        }
+    }
+
+    int newly_activated = 0;
+    int *final_mask = dst; // dst holds the latest result after the loop
+    for (size_t i = 0; i < total; ++i) {
+        if (final_mask[i] && mask[i] == 0) {
+            ++newly_activated;
+        }
+        mask[i] = final_mask[i] ? 1 : 0;
+    }
+
+    free(src);
+    free(dst);
+    return newly_activated;
+}
+
+
 float gaus(float x, float med, float sigma)
 {
     return expf(-(x - med) * (x - med) / (2 * sigma * sigma)) / (sqrtf(2 * PI) * sigma);
 }
+
+// Simple Gaussian fit: use mean and std as mu and sigma
+// void fit_gaussian(float *data, int n, float *mu, float *sigma) {
+//     float sum = 0.0f, sum_sq = 0.0f;
+//     int i;
+//     for (i = 0; i < n; i++) {
+//         sum += data[i];
+//         sum_sq += data[i] * data[i];
+//     }
+//     *mu = sum / n;
+//     *sigma = sqrtf((sum_sq / n) - (*mu * *mu));
+// }
 
 // New function for amplitude-included Gaussian
 float gaus_with_amplitude(float x, float amplitude, float mean, float sigma)
@@ -187,32 +353,6 @@ int gsl_gaussian_fit(float *x, float *y, int n, float fixed_amplitude,
     return success;
 }
 
-float simple_curve_fit(float *x, float *y, int n, float med)
-{
-    int i;
-    float best_sigma = 1.0f;
-    float min_error = FLT_MAX;
-    float sigma;
-
-    for (sigma = 0.1f; sigma <= 5.0f; sigma += 0.1f)
-    {
-        float error = 0.0f;
-        for (i = 0; i < n; i++)
-        {
-            float diff = y[i] - gaus(x[i], med, sigma);
-            error += diff * diff;
-        }
-
-        if (error < min_error)
-        {
-            min_error = error;
-            best_sigma = sigma;
-        }
-    }
-
-    return best_sigma;
-}
-
 /**
  * Subtract the median value from each frequency channel
  * @param data: Input data array (nsamp * nchan)
@@ -235,7 +375,6 @@ void subtractChannelMedians(float *data, int nsamp, int nchan)
     }
     
     // Subtract median from each channel
-    // #pragma omp parallel for
     for (i = 0; i < nchan; i++) {
         for (j = 0; j < nsamp; j++) {
             data[i * nsamp + j] -= channel_medians[i];
@@ -567,7 +706,7 @@ void sumthreshold_2d(
 // For each time sample (column), values are sampled from unflagged channels at the same time
 // channelMask[j] == 1 -> this channel's pixels will be replaced; 0 -> used as source pool only
 // If pointMask is provided (non-NULL), only unmasked pixels (pointMask[k*nsamp+i]==0) are allowed in the source pool
-void randomReplaceRFIPixels(float *data, const int *channelMask, const int *pointMask, int nsamp, int nchan)
+void outChanSubstitution(float *data, const int *channelMask, const int *pointMask, int nsamp, int nchan)
 {
     int i, j;
 
@@ -606,31 +745,6 @@ void randomReplaceRFIPixels(float *data, const int *channelMask, const int *poin
     }
 }
 
-// void randomReplaceRFIPixels1(float *data, const int *flaggedChans, const int *pointMask, int nsamp, int nchan)
-// {
-//     int i, j;
-//     float *validPixels = (float *)malloc(nchan * sizeof(float));
-//     for (i = 0; i < nsamp; i++) {
-//         int validCnt = 0;
-//         for (j = 0; j < nchan; j++) {
-//             if (flaggedChans[j] == 0 && pointMask[j * nsamp + i] == 0) {
-//                 validPixels[validCnt] = data[j * nsamp + i];
-//                 validCnt++;
-//             }
-//         }
-//         for (j = 0; j < nchan; j++) {
-//             int randIdx = rand() % validCnt;
-//             if (flaggedChans[j] != 0) {
-//                 data[j * nsamp + i] = validPixels[randIdx];
-//             }
-//         }
-//     }
-//     free(validPixels);
-// }
-
-// moved to mask.c: writeIndexMaskPNG
-
-// moved to mask.c: mergeMask2D
 
 /// @brief Substitute masked elements in a 1D array with random samples from unmasked elements.
 /// Core implementation that handles the actual pixel substitution logic.
@@ -657,7 +771,8 @@ void substPixels(float *data, int size, int *mask, int *goodSamps, int *randIdx)
 
     // Prepare random indices for replacement
     // Use thread-safe random number generation with unique seed per thread
-    unsigned int seed = (unsigned int)(time(NULL) + omp_get_thread_num() * 1000 + size);
+    // unsigned int seed = (unsigned int)(time(NULL) + omp_get_thread_num() * 1000 + size);
+    unsigned int seed = (unsigned int)(time(NULL) + size);
     for (i = 0; i < size; i++) {
         randIdx[i] = rand_r(&seed) % goodCnt;
     }
@@ -669,45 +784,6 @@ void substPixels(float *data, int size, int *mask, int *goodSamps, int *randIdx)
         }
     }
 }
-
-/// @brief Substitute masked pixels in each channel with random samples from good pixels in the same channel.
-/// This is a wrapper function that uses the core 1D implementation for each channel.
-/// @param data Data array to be processed, time samples from same channel are stored contiguously.
-/// @param nsamp Number of time samples in each channel.
-/// @param nchan Number of frequency channels.
-/// @param mask Mask array indicating which pixels are masked (1 for masked, 0 for good).
-void substPixels2D(float *data, int nsamp, int nchan, int *mask)
-{
-    int i;
-    
-    // Process each channel separately using the core 1D implementation
-    // Each thread will have its own private temporary arrays
-    #pragma omp parallel for private(i)
-    for (i = 0; i < nchan; i++)
-    {
-        // Allocate thread-private temporary arrays
-        int *good_samples = (int *)malloc(nsamp * sizeof(int));
-        int *random_indices = (int *)malloc(nsamp * sizeof(int));
-        
-        // Check memory allocation
-        if (!good_samples || !random_indices) {
-            fprintf(stderr, "Error: Memory allocation failed in thread %d\n", omp_get_thread_num());
-            free(good_samples);
-            free(random_indices);
-            continue; // Skip this channel and continue with others
-        }
-
-        int chan_offset = i * nsamp;
-        substPixels(data + chan_offset, nsamp, mask + chan_offset,
-                            good_samples, random_indices);
-        
-        // Free thread-private arrays
-        free(good_samples);
-        free(random_indices);
-    }
-}
-
-
 
 void binarySIR(
     int *mask, int nsamp, int nchan,
@@ -726,7 +802,6 @@ void binarySIR(
     const int rad_chan = win_chan / 2;
     int i, j, di, dj;
 
-    #pragma omp parallel for collapse(2)
     for (i = 0; i < nsamp; i++) {
         for (j = 0; j < nchan; j++) {
             int count = 0, total = 0;
@@ -828,9 +903,10 @@ int meanOutlierDetection(float *data, int nsamp, int nchan, int *channelFlagged)
 void outChanDetection(float *data, int nsamp, int nchan, int *channelFlagged,
                               float *channel_stds, float *channel_stds_temp, float channel_std_threshold, float nsigma_in, int plot)
 {
-    const int MAX_ITERATIONS = 20;   // Reduced maximum iterations for faster convergence
+    const int MAX_ITERATIONS = 30;   // Reduced maximum iterations for faster convergence
     const float STD_CHANGE_THRESHOLD = 0.01f;  // Relaxed standard deviation change rate threshold (1%)
-    const float MEDIAN_CHANGE_THRESHOLD = 1e-4f;  // Relaxed median change threshold
+    const float MEDIAN_CHANGE_THRESHOLD = 1e-6f;  // Relaxed median change threshold
+    const int MIN_ITERATIONS = 15;  // Minimum iterations before allowing early stop
     
     int i;
     
@@ -844,7 +920,6 @@ void outChanDetection(float *data, int nsamp, int nchan, int *channelFlagged,
     }
     
     // Calculate standard deviation for each channel
-    // #pragma omp parallel for
     for (i = 0; i < nchan; i++)
     {
         float channel_mean, channel_std;
@@ -852,6 +927,10 @@ void outChanDetection(float *data, int nsamp, int nchan, int *channelFlagged,
         channel_stds[i] = channel_std;
         initial_channel_stds[i] = channel_std; // Save initial value for comparison
     }
+    
+    // Fit Gaussian to initial channel stds to get mu and sigma
+    // float fitted_mu, fitted_sigma;
+    // fit_gaussian(initial_channel_stds, nchan, &fitted_mu, &fitted_sigma);  // Assume fit_gaussian is implemented
     
     // Create a mask for channels (0 = valid, 1 = flagged)
     int *channel_mask = (int *)calloc(nchan, sizeof(int));
@@ -887,13 +966,13 @@ void outChanDetection(float *data, int nsamp, int nchan, int *channelFlagged,
         current_std = stdFromMedian(valid_stds, valid_count);
         
         // Check convergence conditions after first iteration
-        int converged = 0;
         if (iter > 0) {
             median_change = fabsf(current_median - last_median);
             std_change_rate = (last_std > 0) ? fabsf(current_std - last_std) / last_std : 0.0f;
             
             if (median_change < MEDIAN_CHANGE_THRESHOLD && std_change_rate < STD_CHANGE_THRESHOLD) {
-                converged = 1;
+                printf("Converged at iter %d (median_change=%.6f, std_change=%.6f)\n", iter, median_change, std_change_rate);
+                break;  // Stop iterating if converged
             }
         }
         
@@ -906,7 +985,6 @@ void outChanDetection(float *data, int nsamp, int nchan, int *channelFlagged,
         int new_outliers = 0;
         valid_count = 0;  // Reset and rebuild
         
-        // #pragma omp parallel for reduction(+:new_outliers)
         for (i = 0; i < nchan; i++) {
             if (channel_mask[i] == 0) {  // Currently valid
                 if (channel_stds[i] > upper_bound || channel_stds[i] < lower_bound) {
@@ -928,7 +1006,7 @@ void outChanDetection(float *data, int nsamp, int nchan, int *channelFlagged,
         total_flagged += new_outliers;
         
         // Break if no new outliers found (algorithm has converged)
-        if (new_outliers == 0) {
+        if (new_outliers == 0 && iter >= MIN_ITERATIONS) {
             break;
         }
         
@@ -938,6 +1016,44 @@ void outChanDetection(float *data, int nsamp, int nchan, int *channelFlagged,
         iter++;
     }
     
+    // === 特别保底循环：如果 median 和 fitted_mu 距离 > fitted_sigma，判定为严重漏检 ===
+    // if (fabsf(current_median - fitted_mu) > 0.3f * fitted_sigma) {
+    //     printf(" [FALLBACK] Severe under-detection detected (median=%.4f, mu=%.4f, sigma=%.4f), entering fallback loop\n", 
+    //            current_median, fitted_mu, fitted_sigma);
+    //     
+    //     float fallback_threshold = channel_std_threshold;
+    //     int fallback_iter = 0;
+    //     const int MAX_FALLBACK_ITER = 20;  // 防止无限循环
+    //     
+    //     while (fallback_iter < MAX_FALLBACK_ITER) {
+    //         fallback_threshold -= 0.05f;  // 以0.05步长降低阈值
+    //         if (fallback_threshold <= 0.0f) break;  // 防止阈值过低
+    //         
+    //         // 重新计算界限
+    //         float upper_bound = current_median + fallback_threshold * current_std;
+    //         float lower_bound = current_median - fallback_threshold * current_std;
+    //         lower_bound = (lower_bound < 0) ? 0 : lower_bound;
+    //         
+    //         // 标记新异常
+    //         int new_outliers = 0;
+    //         for (i = 0; i < nchan; i++) {
+    //             if (channel_mask[i] == 0 && (channel_stds[i] > upper_bound || channel_stds[i] < lower_bound)) {
+    //                 channel_mask[i] = 1;
+    //                 channelFlagged[i] = 1;
+    //                 new_outliers++;
+    //             }
+    //         }
+    //         
+    //         total_flagged += new_outliers;
+    //         printf(" [FALLBACK] iter=%d, threshold=%.3f, new_outliers=%d\n", fallback_iter, fallback_threshold, new_outliers);
+    //         
+    //         // 如果有新标记，停止保底循环
+    //         if (new_outliers > 0) break;
+    //         
+    //         fallback_iter++;
+    //     }
+    // }
+    
     // Count final flagged channels
     int final_flagged_count = 0;
     for (i = 0; i < nchan; i++) {
@@ -945,6 +1061,16 @@ void outChanDetection(float *data, int nsamp, int nchan, int *channelFlagged,
     }
     
     printf("outChannel detection completed (%d iterations, %d channels flagged)\n", iter, final_flagged_count);
+    
+    // Smooth the mask to remove isolated flagged channels
+    smoothOutChanMask(channelFlagged, nchan, 2);
+    
+    // Recount after smoothing
+    final_flagged_count = 0;
+    for (i = 0; i < nchan; i++) {
+        if (channelFlagged[i]) final_flagged_count++;
+    }
+    printf("After smoothing: %d channels flagged\n", final_flagged_count);
     
     // === 兜底均值检测 ===
     int additional_flagged = meanOutlierDetection(data, nsamp, nchan, channelFlagged);
@@ -954,7 +1080,6 @@ void outChanDetection(float *data, int nsamp, int nchan, int *channelFlagged,
     
     // Create final statistics array (mark flagged channels with negative values)
     float *final_channel_stds = (float *)malloc(nchan * sizeof(float));
-    // #pragma omp parallel for
     for (i = 0; i < nchan; i++) {
         if (channelFlagged[i]) {
             final_channel_stds[i] = -1.0f; // Mark as flagged
@@ -966,8 +1091,8 @@ void outChanDetection(float *data, int nsamp, int nchan, int *channelFlagged,
     // Display comparison histogram if significant changes occurred and plotting is enabled
     if (total_flagged > 0 && plot) {
         printf("\n=== Displaying outChannel Detection Comparison ===\n");
-        drawOutChannelComparisonHist(initial_channel_stds, final_channel_stds, nchan, 
-                                   0, initial_flagged_count, final_flagged_count, iter, channel_std_threshold, nsigma_in); // Using STD (0)
+        drawOutChannelComparisonHist_new(initial_channel_stds, final_channel_stds, nchan, 
+                      0, initial_flagged_count, final_flagged_count, iter, channel_std_threshold, nsigma_in); // Using STD (0)
         printf("=== OutChannel Comparison Complete ===\n");
     }
     
@@ -1577,14 +1702,12 @@ int inChanDetection(float *data, int nsamp, int nchan, float Nsigma,
     int totalOutliers = 0;
     
     // Allocate temporary arrays for each thread
-    #pragma omp parallel reduction(+:totalOutliers)
     {
         float *median_temp = (float *)malloc(nsamp * sizeof(float));
         int *good_samples = (int *)malloc(nsamp * sizeof(int));
         int *random_indices = (int *)malloc(nsamp * sizeof(int));
         int i;
         
-        #pragma omp for
         for (i = 0; i < nchan; i++)
         {
             // Perform iterative outlier detection for this channel
@@ -1633,7 +1756,6 @@ void applyKillThresh(const int *pointMask, int *channelFlagged, int nsamp, int n
     int localKilledChannels = 0;
     int localRFISkipped = 0;
     
-    #pragma omp parallel for reduction(+:localKilledChannels,localRFISkipped)
     for (i = 0; i < nchan; i++) {
         int maskedCount = 0;
         int firstFlagged = -1, lastFlagged = -1;
@@ -1709,7 +1831,7 @@ void applyKillThresh(const int *pointMask, int *channelFlagged, int nsamp, int n
  * @param nchan Number of channels
  * @param pixelsSubstituted Output: number of pixels substituted
  */
-void applySubstitution(float *data, int *globalMask, int nsamp, int nchan, int *pixelsSubstituted)
+void inChanSubstitution(float *data, int *globalMask, int nsamp, int nchan, int *pixelsSubstituted)
 {
     *pixelsSubstituted = 0;
     printf("\n=== Pixel Substitution ===\n");
@@ -1717,7 +1839,6 @@ void applySubstitution(float *data, int *globalMask, int nsamp, int nchan, int *
     int i;
     int localPixelsSubstituted = 0;
     
-    #pragma omp parallel for reduction(+:localPixelsSubstituted)
     for (i = 0; i < nchan; i++) {
         // Count masked pixels in this channel
         int channelMaskedCount = 0;
@@ -1771,15 +1892,17 @@ void applySubstitution(float *data, int *globalMask, int nsamp, int nchan, int *
  * @param complexMask Output mask for complex channels (set to 1 for entire complex flagged channels)
  */
 void classifyChannels(float *data, int nsamp, int nchan, int *flaggedChans, int *brightMask, int *darkMask, int *complexMask) {
-    if (!(brightMask || darkMask || complexMask) || nchan <= 0) return;
+    if (!(brightMask || darkMask || complexMask) || nchan <= 0 || !flaggedChans) return;
+
+    const float eps = 1e-5f;
 
     float *channelMeans = (float *)malloc(nchan * sizeof(float));
     if (!channelMeans) {
-        fprintf(stderr, "Memory allocation failed in classifyBrightDarkChannels\n");
+        fprintf(stderr, "Memory allocation failed in classifyChannels\n");
         return;
     }
 
-    float overallChannelMean = 0.0f;
+    double sumMeans = 0.0;
     for (int i = 0; i < nchan; i++) {
         double sum = 0.0;
         int base = i * nsamp;
@@ -1788,44 +1911,54 @@ void classifyChannels(float *data, int nsamp, int nchan, int *flaggedChans, int 
         }
         float mean = (nsamp > 0) ? (float)(sum / nsamp) : 0.0f;
         channelMeans[i] = mean;
-        overallChannelMean += mean;
+        sumMeans += mean;
     }
-    overallChannelMean /= (float)nchan;
 
-    // Find contiguous blocks of flagged channels
-    int minConsecutive = 3; // Minimum consecutive channels to classify as bright/dark
-    int i = 0;
-    while (i < nchan) {
-        if (!flaggedChans[i]) {
-            i++;
+    float overallChannelMean = (nchan > 0) ? (float)(sumMeans / nchan) : 0.0f;
+
+    int idx = 0;
+    while (idx < nchan) {
+        if (!flaggedChans[idx]) {
+            idx++;
             continue;
         }
-        // Start of a block
-        int start = i;
-        while (i < nchan && flaggedChans[i]) i++;
-        int end = i - 1; // end inclusive
-        int blockLength = end - start + 1;
 
-        // Classify the block
-        int allAbove = 1;
-        int allBelow = 1;
-        for (int k = start; k <= end; k++) {
-            if (channelMeans[k] <= overallChannelMean) allAbove = 0;
-            if (channelMeans[k] >= overallChannelMean) allBelow = 0;
+        int start = idx;
+        float blockSum = 0.0f;
+        while (idx < nchan && flaggedChans[idx]) {
+            blockSum += channelMeans[idx];
+            idx++;
         }
+        int end = idx - 1;
+        int blockLen = end - start + 1;
 
         int *targetMask = NULL;
-        if (blockLength >= minConsecutive) {
-            if (allAbove) {
+        if (blockLen <= 2) {
+            float blockMean = blockSum / (float)blockLen;
+            if (blockMean > overallChannelMean + eps && brightMask) {
                 targetMask = brightMask;
-            } else if (allBelow) {
+            } else if (blockMean < overallChannelMean - eps && darkMask) {
                 targetMask = darkMask;
             } else {
                 targetMask = complexMask;
             }
         } else {
-            if (allAbove) targetMask = brightMask;
-            else if (allBelow) targetMask = darkMask;
+            int allAbove = 1;
+            int allBelow = 1;
+            for (int k = start; k <= end; k++) {
+                float mean = channelMeans[k];
+                if (!(mean > overallChannelMean + eps)) allAbove = 0;
+                if (!(mean < overallChannelMean - eps)) allBelow = 0;
+                if (!allAbove && !allBelow) break;
+            }
+
+            if (allAbove && brightMask) {
+                targetMask = brightMask;
+            } else if (allBelow && darkMask) {
+                targetMask = darkMask;
+            } else {
+                targetMask = complexMask;
+            }
         }
 
         if (targetMask) {
@@ -1856,6 +1989,11 @@ void identSubstNSigma(
     int *darkMask = masks->chanDarkMask;
     int *complexMask = masks->chanComplexMask;
 
+    // 方案A: 每次调用开头清空 flaggedChans，避免跨迭代残留影响 killThresh 和后续逻辑
+    if (flaggedChans) {
+        memset(flaggedChans, 0, sizeof(int) * nchan);
+    }
+
     memset(horizontalMask, 0, nsamp * nchan * sizeof(int));
     memset(verticalMask, 0, nsamp * nchan * sizeof(int));
     memset(globalMask, 0, nsamp * nchan * sizeof(int));
@@ -1884,20 +2022,23 @@ void identSubstNSigma(
     printf("=== Performing point-level (pixel) outlier detection ===\n");
     double inchan_start = omp_get_wtime();
     int pixelOutliers = 0;
-    pixelOutliers = inChanDetection(data, nsamp, nchan, NSigmaInChan, 
-                                                pointMask, flaggedChans);
+    pixelOutliers = inChanDetection(data, nsamp, nchan, NSigmaInChan, pointMask, flaggedChans);
+    
     double inchan_time = omp_get_wtime() - inchan_start;
     printf("Point-level detection: flagged %d outlier pixels (%.4f seconds)\n", pixelOutliers, inchan_time);
+    int isolated_removed = eraseIsolatedPixels(pointMask, nsamp, nchan, 3);
+    int dilated_added = dilateMask(pointMask, nsamp, nchan, 1, 1);
+    printf("Post-processing: pointMask delta is %d\n", (dilated_added - isolated_removed));
     // Accumulate point-wise mask into global
     logicalOR(globalMask, pointMask, nsamp, nchan);
     
     // === 2. inChannel Pixel Substitution ===
     double subst_start = omp_get_wtime();
     int inChanPixelsSubstituted;
-    applySubstitution(data, pointMask, nsamp, nchan, &inChanPixelsSubstituted);
+    // inChanSubstitution(data, pointMask, nsamp, nchan, &inChanPixelsSubstituted);
     double subst_time = omp_get_wtime() - subst_start;
     printf("inChannel substitution: replaced %d pixels (%.4f seconds)\n", inChanPixelsSubstituted, subst_time);
-    
+
     // === 3. killThresh Analysis ===
     double killthresh_start = omp_get_wtime();
     // Count flagged pixels before killThresh
@@ -1933,7 +2074,7 @@ void identSubstNSigma(
     int flaggedChanCount = 0;
     for (i = 0; i < nchan; i++) if (flaggedChans[i]) flaggedChanCount++;
     if (flaggedChanCount > 0) {
-        randomReplaceRFIPixels(data, flaggedChans, pointMask, nsamp, nchan);
+        // outChanSubstitution(data, flaggedChans, pointMask, nsamp, nchan);
         outChanPixelsSubstituted = flaggedChanCount * nsamp;
     }
     printf("outChannel substitution: replaced %d pixels\n", outChanPixelsSubstituted);
@@ -1986,6 +2127,7 @@ void identSubstNSigma(
     *finalMedian = finalMedian_value;
     *finalStd = finalStd_temp;
 
+
     // Clean up allocated memory
     free(good_samples);
     free(random_indices);
@@ -2028,6 +2170,7 @@ void drawOutChannelComparisonHist(float *initial_stats, float *final_stats, int 
     memcpy(temp_data, initial_stats, nchan * sizeof(float));
     float initial_median = median(temp_data, nchan);
     float initial_dispersion = use_mad ? mad(initial_stats, nchan) : stdFromMedian(initial_stats, nchan);
+    (void)initial_dispersion; // 当前版本未显示该值，如需展示可加入图例
     
     // Final statistics (only for non-flagged channels)
     int valid_count = 0;
@@ -2397,4 +2540,137 @@ void drawOutChannelComparisonHist(float *initial_stats, float *final_stats, int 
     free(temp_data);
     free(initial_hist);
     free(final_hist);
+}
+
+/* -------------------------------------------------------------------------
+ * New version: consistent-shape histogram (initial shape fixed)
+ * Keeps original function above; this one only highlights removed vs kept
+ * ------------------------------------------------------------------------- */
+void drawOutChannelComparisonHist_new(float *initial_stats, float *final_stats, int nchan,
+                                      int use_mad, int initial_flagged_count, int final_flagged_count,
+                                      int iterations, float nsigma_out, float nsigma_in)
+{
+    const char* stat_name  = use_mad ? "MAD" : "STD";
+    const char* stat_label = use_mad ? "Channel MAD M\\dj\\u" : "Channel STD \\gs\\dj\\u";
+
+    printf("\n=== OutChannel Comparison (CONSISTENT SHAPE) %s Histogram ===\n", stat_name);
+    printf("Initial flagged (pre-existing): %d\n", initial_flagged_count);
+    printf("Final flagged total: %d\n", final_flagged_count);
+    printf("Newly flagged this pass: %d\n", final_flagged_count - initial_flagged_count);
+
+    // 1. Compute initial median / dispersion (for reference line only)
+    float *temp_data = (float *)malloc(nchan * sizeof(float));
+    if (!temp_data) return;
+    memcpy(temp_data, initial_stats, nchan * sizeof(float));
+    float initial_median = median(temp_data, nchan);
+
+    // 2. Determine min/max from initial only
+    float overall_min = initial_stats[0], overall_max = initial_stats[0];
+    for (int i = 1; i < nchan; i++) {
+        if (initial_stats[i] < overall_min) overall_min = initial_stats[i];
+        if (initial_stats[i] > overall_max) overall_max = initial_stats[i];
+    }
+    if (overall_max == overall_min) overall_max = overall_min + 1e-6f;
+
+    int nbins = 100; // same bin count
+    float bin_width = (overall_max - overall_min) / nbins;
+    float *total_hist   = (float *)calloc(nbins, sizeof(float));
+    float *kept_hist    = (float *)calloc(nbins, sizeof(float));
+    float *flagged_hist = (float *)calloc(nbins, sizeof(float));
+    if (!total_hist || !kept_hist || !flagged_hist) {
+        free(temp_data);
+        free(total_hist); free(kept_hist); free(flagged_hist);
+        return;
+    }
+
+    // 3. Fill total shape from initial stats
+    for (int i = 0; i < nchan; i++) {
+        int bin = (int)((initial_stats[i] - overall_min) / bin_width);
+        if (bin < 0) bin = 0; if (bin >= nbins) bin = nbins - 1;
+        total_hist[bin]++;
+    }
+
+    // 4. Split into kept / flagged by inspecting final_stats (<0 flagged)
+    for (int i = 0; i < nchan; i++) {
+        int bin = (int)((initial_stats[i] - overall_min) / bin_width);
+        if (bin < 0) bin = 0; if (bin >= nbins) bin = nbins - 1;
+        if (final_stats[i] < 0) flagged_hist[bin]++; else kept_hist[bin]++;
+    }
+
+    // 5. Scaling
+    float max_count = 0.0f;
+    for (int b = 0; b < nbins; b++) if (total_hist[b] > max_count) max_count = total_hist[b];
+    if (max_count <= 0) max_count = 1.0f;
+
+    // 6. Plot
+    cpgpage();
+    cpgvstd();
+    cpgsch(1.2);
+    cpgswin(overall_min, overall_max, 0, max_count * 1.15f);
+    cpgbox("BCNST", 0.0, 0, "BCNST", 0.0, 0);
+    char title[256];
+    sprintf(title, "OutChannel %s Distribution (Shape Fixed)", stat_name);
+    cpgmtxt("T", 1.0, 0.5, 0.5, title);
+    cpgmtxt("B", 2.0, 0.5, 0.5, stat_label);
+    cpgmtxt("L", 2.0, 0.5, 0.5, "Number of Channels");
+
+    // Outline of total distribution
+    cpgsci(7); // grey
+    cpgsls(2);
+    for (int b = 0; b < nbins; b++) {
+        if (total_hist[b] > 0) {
+            float x1 = overall_min + b * bin_width;
+            float x2 = overall_min + (b + 1) * bin_width;
+            float y  = total_hist[b];
+            cpgmove(x1, 0); cpgdraw(x1, y); cpgdraw(x2, y); cpgdraw(x2, 0);
+        }
+    }
+
+    // Kept channels (red filled bars)
+    cpgsci(2); cpgsls(1);
+    for (int b = 0; b < nbins; b++) {
+        if (kept_hist[b] > 0) {
+            float x1 = overall_min + b * bin_width;
+            float x2 = overall_min + (b + 1) * bin_width;
+            cpgrect(x1, x2, 0, kept_hist[b]);
+        }
+    }
+
+    // Flagged channels (green outline)
+    cpgsci(3);
+    for (int b = 0; b < nbins; b++) {
+        if (flagged_hist[b] > 0) {
+            float x1 = overall_min + b * bin_width;
+            float x2 = overall_min + (b + 1) * bin_width;
+            float y  = flagged_hist[b];
+            cpgmove(x1, 0); cpgdraw(x1, y); cpgdraw(x2, y); cpgdraw(x2, 0);
+        }
+    }
+
+    // Initial median line
+    cpgsci(1);
+    cpgmove(initial_median, 0); cpgdraw(initial_median, max_count * 1.15f);
+    cpgptxt(initial_median, max_count * 1.08f, 0.0, 0.0, "Initial Median");
+
+    // Legend & stats
+    float lx = overall_min + (overall_max - overall_min) * 0.65f;
+    float ly = max_count * 1.05f;
+    float dy = max_count * 0.05f;
+    cpgsci(7); cpgptxt(lx, ly, 0.0, 0.0, "Outline: Total (initial)");
+    cpgsci(2); cpgptxt(lx, ly - dy, 0.0, 0.0, "Red: Kept");
+    cpgsci(3); cpgptxt(lx, ly - 2*dy, 0.0, 0.0, "Green: Removed");
+    cpgsci(1);
+    char stats_text[160];
+    sprintf(stats_text, "Removed: %d  Kept: %d  Iter=%d", final_flagged_count - initial_flagged_count,
+            nchan - final_flagged_count, iterations);
+    cpgptxt(lx, ly - 3*dy, 0.0, 0.0, stats_text);
+    sprintf(stats_text, "T_chan=%.2f  T_point=%.2f", nsigma_out, nsigma_in);
+    cpgptxt(lx, ly - 4*dy, 0.0, 0.0, stats_text);
+
+    // Cleanup
+    free(temp_data);
+    free(total_hist);
+    free(kept_hist);
+    free(flagged_hist);
+    printf("Consistent-shape %s histogram (new) completed!\n", stat_name);
 }

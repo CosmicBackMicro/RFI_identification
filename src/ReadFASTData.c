@@ -284,7 +284,7 @@ void downsamp2D(float *array, int nsamp, int nchan,
 void convertToFloat(unsigned char *rawData, float *data, int size)
 {
     int i;
-    // #pragma omp parallel for
+    #pragma omp parallel for
     for (i = 0; i < size; i++)
     {
         data[i] = (float)rawData[i];
@@ -311,7 +311,6 @@ void getProfile(float *array, int nsamp, int nchan, float *freqProfile, float *t
 
     if (isTranspose)
     {
-        // #pragma omp parallel for
         for (i = 0; i < nchan; i++)
         {
             float sum = 0.0f;
@@ -328,7 +327,6 @@ void getProfile(float *array, int nsamp, int nchan, float *freqProfile, float *t
             freqProfile[i] = (validCount > 0) ? sum / validCount : 0.0f;
         }
 
-        // #pragma omp parallel for
         for (i = 0; i < nsamp; i++)
         {
             float sum = 0.0f;
@@ -347,7 +345,6 @@ void getProfile(float *array, int nsamp, int nchan, float *freqProfile, float *t
     }
     else
     {
-        // #pragma omp parallel for
         for (i = 0; i < nchan; i++)
         {
             float sum = 0.0f;
@@ -364,7 +361,6 @@ void getProfile(float *array, int nsamp, int nchan, float *freqProfile, float *t
             freqProfile[i] = (validCount > 0) ? sum / validCount : 0.0f;
         }
 
-        // #pragma omp parallel for
         for (i = 0; i < nsamp; i++)
         {
             float sum = 0.0f;
@@ -389,7 +385,6 @@ void getProfileStd(float *array, int nsamp, int nchan, float *freqProfile, float
 
     if (isTranspose)
     {
-        // #pragma omp parallel for
         for (i = 0; i < nchan; i++)
         {
             float sum = 0.0f;
@@ -420,7 +415,6 @@ void getProfileStd(float *array, int nsamp, int nchan, float *freqProfile, float
             }
         }
 
-        // #pragma omp parallel for
         for (i = 0; i < nsamp; i++)
         {
             float sum = 0.0f;
@@ -452,7 +446,6 @@ void getProfileStd(float *array, int nsamp, int nchan, float *freqProfile, float
     }
     else
     {
-        // #pragma omp parallel for
         for (i = 0; i < nchan; i++)
         {
             float sum = 0.0f;
@@ -482,7 +475,6 @@ void getProfileStd(float *array, int nsamp, int nchan, float *freqProfile, float
             }
         }
 
-        // #pragma omp parallel for
         for (i = 0; i < nsamp; i++)
         {
             float sum = 0.0f;
@@ -518,7 +510,7 @@ void getProfileStd(float *array, int nsamp, int nchan, float *freqProfile, float
 void calcCompress(float *data, int nchan, int nsamp, float *scale, float *offset)
 {
     int ch;
-    #pragma omp parallel for
+    // #pragma omp parallel for
     for (ch = 0; ch < nchan; ch++)
     {
         float *channel_data = data + ch * nsamp;
@@ -737,6 +729,8 @@ int setup_cuda(Metadata *m) {
 
 int main(int argc, char *argv[])
 {
+    double global_start_time = omp_get_wtime();
+
     Metadata m;
     int status = parseCommandLineArguments(argc, argv, &m);
     if (status != 0) return status;
@@ -795,7 +789,6 @@ int main(int argc, char *argv[])
     int numReads = naxis2 / blocksPerRead;
 
     // Allocate output buffers
-    // unsigned char *outRawData = malloc(sizeof(unsigned char) * nchanBinned * nsampBinned);
     unsigned char *outRawData = malloc(sizeof(unsigned char) * nchan * nsamp);
     float *outData = fftwf_malloc(sizeof(float) * nchanBinned * nsampBinned);
     float *outDataT = fftwf_malloc(sizeof(float) * nchanBinned * nsampBinned);
@@ -865,7 +858,7 @@ int main(int argc, char *argv[])
         
         if (m.generateMasks)
         {
-
+            clearIdentNSigmaMasks(&maskSet, nsampBinned, nchanBinned);
 
             // Plot the unprocessed raw data
             if (m.plot)
@@ -877,11 +870,37 @@ int main(int argc, char *argv[])
 
 
             // =======================Subtract Channel Median========================================================
-            int subtractChanMed = 0; 
+            int subtractChanMed = 1; 
             if (subtractChanMed)
             {
                 subtractChannelMedians(outDataT, nsampBinned, nchanBinned);
+            } else {
+                printf("Warning: Median subtraction disabled. If channel RFI is severe, consider lowering outChanNSigma threshold.\n");
             }
+
+            // 在这里写出
+            {
+                // 设置固定的 scale 和 offset
+                float *scale_const = malloc(sizeof(float) * nchanBinned);
+                float *offset_const = malloc(sizeof(float) * nchanBinned);
+                for (int i = 0; i < nchanBinned; i++) {
+                    scale_const[i] = 1.0f;
+                    offset_const[i] = 0.0f;
+                }
+                
+                // 压缩数据
+                // calcCompress(outDataT, nchanBinned, nsampBinned, scale_const, offset_const);
+                transpose(outDataT, nchanBinned, nsampBinned, outData);
+                applyCompress(outData, outRawData, nchanBinned, nsampBinned, scale_const, offset_const);
+                
+                // 写出 FITS 数据集
+                writeFITSDataset(outRawData, scale_const, offset_const, nsampBinned, nchanBinned, ii, &m, &fits_status);
+                
+                // 释放内存
+                free(scale_const);
+                free(offset_const);
+            }
+
             if (m.plot)
             {
                 cpgpage();
@@ -944,7 +963,7 @@ int main(int argc, char *argv[])
 
 
             float NSigmaInChan = 3.0f; // Updated to use 3-sigma threshold for iterative outlier detection
-            float NSigmaOutChan = 2.0f; // When data is severely affected and subtractMedian is turned off, a lower threshold is favored
+            float NSigmaOutChan = 3.0f; // When data is severely affected and subtractMedian is turned off, a lower threshold is favored
             if (m.doSubstitution)
             {
                 double rfi_start = omp_get_wtime();
@@ -964,10 +983,13 @@ int main(int argc, char *argv[])
                 }
                 double rfi_time = omp_get_wtime() - rfi_start;
                 printf("RFI detection time: %.4f seconds\n", rfi_time);
+
             }
             if (m.writeMasks)
             {
-                writeAllMasksPNG(&maskSet, nsampBinned, nchanBinned, m.datasetPath, ii);
+                // merge=0 默认分别输出；如需合并成索引图传 1
+                int merge = 1;
+                writeAllMasksPNG(&maskSet, nsampBinned, nchanBinned, m.datasetPath, ii, merge);
             }
             if (m.plot)
             { // Plot result after NSigma substitution
@@ -1053,19 +1075,34 @@ int main(int argc, char *argv[])
                 }    
             }
 
-            if (writeDastset) {
-                writeFITSDataset(outRawData, scaleBinned, offsetBinned, nsampBinned, nchanBinned, ii, &m, &fits_status);
-            }
+            // if (writeDastset) {
+            //     writeFITSDataset(outRawData, scaleBinned, offsetBinned, nsampBinned, nchanBinned, ii, &m, &fits_status);
+            // }
             double write_time = omp_get_wtime() - write_start;
             printf("Write operations time: %.4f seconds\n", write_time);
         }
 
 
         numiter++;
-        if (numiter >= 3) {
-            m.plot = 0; 
+        if (numiter % 200 == 0) {
+            m.plot = 1; 
             // return 0;
+        } else if (numiter % 200 == 1) {
+            m.plot = 0; 
         }
+
+        // if (numiter == 1) {
+        //     m.plot = 0;
+        // } else if (numiter == 7) {
+        //     m.plot = 1;
+        // } else if (numiter == 9) {
+        //     m.plot = 0;
+        // } else if (numiter == 60) {
+        //     m.plot = 1;
+        // } else if (numiter == 63) {
+        //     m.plot = 0;
+        //     return 0; 
+        // }
         
         double loop_time = omp_get_wtime() - loop_start;
         printf("Total loop %d time: %.4f seconds\n", ii, loop_time);
@@ -1100,6 +1137,8 @@ int main(int argc, char *argv[])
         printf("CUDA resources cleaned up.\n");
     }
     
+    double global_end_time = omp_get_wtime();
+    printf("All done, time taken: %.2f seconds.\n", global_end_time - global_start_time);
     return status;
 }
 

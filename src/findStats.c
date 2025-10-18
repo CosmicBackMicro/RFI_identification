@@ -137,7 +137,6 @@ void findMeanStd(float *arr, int size, float *mean, float *std)
     int i;
     /* === First pass for mean === */
     float sum = 0.0f;
-// #pragma omp parallel for reduction(+ : sum)
     for (i = 0; i < size; i++)
     {
         sum += arr[i];
@@ -152,7 +151,6 @@ void findMeanStd(float *arr, int size, float *mean, float *std)
     if (std == NULL)
         return;
     float variance = 0.0f;
-// #pragma omp parallel for reduction(+ : variance)
     for (i = 0; i < size; i++)
     {
         float diff = arr[i] - calculated_mean;
@@ -166,10 +164,8 @@ void findMeanStd(float *arr, int size, float *mean, float *std)
 void findMinMax(float *arr, int size, float *min, float *max)
 {
     float local_min = arr[0], local_max = arr[0];
-// #pragma omp parallel
     {
         float thread_min = arr[0], thread_max = arr[0];
-// #pragma omp for nowait
         for (int i = 1; i < size; i++)
         {
             if (arr[i] < thread_min)
@@ -177,7 +173,6 @@ void findMinMax(float *arr, int size, float *min, float *max)
             if (arr[i] > thread_max)
                 thread_max = arr[i];
         }
-// #pragma omp critical
         {
             if (thread_min < local_min)
                 local_min = thread_min;

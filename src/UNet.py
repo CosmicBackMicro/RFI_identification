@@ -1,80 +1,187 @@
-import matplotlib.pyplot as plt
-import numpy as np
-import os, re
-import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
-import segmentation_models_pytorch as smp
-from segmentation_models_pytorch.encoders import get_preprocessing_fn
-
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # 设置使用的GPU设备
-os.environ['SMP_HUB_MODE'] = "original"
-
-# 优化Tensor Cores的利用 - 针对RTX 4060等支持Tensor Cores的GPU
-import torch
-torch.set_float32_matmul_precision('medium')  # 在性能和精度之间取得平衡
-
-import numpy as np
-import matplotlib.pyplot as plt
 import cv2
+import os, re
 import fitsio
+import numpy as np
+import matplotlib.pyplot as plt
+from typing import Any, cast
 import albumentations as albu
+
+import torch
+torch.set_float32_matmul_precision('medium')
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
+import segmentation_models_pytorch as smp
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ['SMP_HUB_MODE'] = "original"
+
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class FocalTverskyLoss(nn.Module):
+    """
+    Focal Tversky Loss for multi-class segmentation with probability inputs.
+
+    Features:
+    - Accepts probabilities (from a softmax output)
+    - Handles class imbalance via alpha/beta and optional class_weights
+    - More robust to imperfect labels with focal focusing (gamma) and label smoothing
+
+    Args:
+        num_classes: number of classes (C)
+        alpha: weight for FN in Tversky index (typically 0.7)
+        beta: weight for FP in Tversky index (typically 0.3)
+        gamma: focal parameter (>1 increases focus on hard examples; e.g., 1.333)
+        smooth: numerical stability term
+        reduction: 'mean' | 'sum' | 'none'
+        ignore_index: optional label to ignore in targets
+        label_smoothing: small epsilon to soften one-hot targets, improves noise robustness
+    """
+
+    def __init__(
+        self,
+        num_classes: int,
+        alpha: float = 0.7,
+        beta: float = 0.3,
+        gamma: float = 1.333,
+        smooth: float = 1e-6,
+        reduction: str = 'mean',
+        ignore_index: int | None = None,
+        label_smoothing: float = 0.0,
+    ) -> None:
+        super().__init__()
+        assert 0 <= label_smoothing < 1.0
+        self.num_classes = num_classes
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+        self.smooth = smooth
+        self.reduction = reduction
+        self.ignore_index = ignore_index
+        self.label_smoothing = label_smoothing
+
+    def forward(
+        self,
+        y_pred: torch.Tensor,  # (N, C, H, W) probabilities
+        y_true: torch.Tensor,  # (N, H, W) int64 labels
+        class_weights: torch.Tensor | None = None,  # (C,)
+    ) -> torch.Tensor:
+        if y_true.dtype != torch.long:
+            y_true = y_true.long()
+
+        N, C, H, W = y_pred.shape
+        assert C == self.num_classes, f"num_classes mismatch: {C} vs {self.num_classes}"
+
+        # One-hot encode targets: (N, H, W) -> (N, H, W, C) -> (N, C, H, W)
+        y_true_oh = F.one_hot(y_true.clamp_min(0), num_classes=C).permute(0, 3, 1, 2).float()
+
+        # Handle ignore_index by zeroing contributions
+        if self.ignore_index is not None:
+            ignore_mask = (y_true == self.ignore_index).unsqueeze(1)  # (N,1,H,W)
+            y_true_oh = torch.where(ignore_mask, torch.zeros_like(y_true_oh), y_true_oh)
+            y_pred = torch.where(ignore_mask, torch.zeros_like(y_pred), y_pred)
+
+        # Optional label smoothing: soften hard labels to reduce overconfidence on noisy pixels
+        if self.label_smoothing > 0.0:
+            eps = self.label_smoothing
+            y_true_oh = (1 - eps) * y_true_oh + eps / C
+
+        # Clamp probabilities for numerical stability
+        y_pred = y_pred.clamp(min=0.0, max=1.0)
+
+        # Compute TP, FP, FN per class
+        dims = (0, 2, 3)  # sum over N, H, W
+        TP = (y_true_oh * y_pred).sum(dim=dims)
+        FP = (y_pred * (1 - y_true_oh)).sum(dim=dims)
+        FN = ((1 - y_pred) * y_true_oh).sum(dim=dims)
+
+        # Tversky index per class
+        TI = (TP + self.smooth) / (TP + self.alpha * FN + self.beta * FP + self.smooth)
+
+        # Focal Tversky loss per class
+        loss_c = (1.0 - TI).pow(self.gamma)
+
+        # Apply optional class weights (to reduce background dominance)
+        if class_weights is not None:
+            # Ensure on same device and proper dtype
+            cw = class_weights.to(loss_c.device).float()
+            if cw.numel() == C:
+                loss_c = loss_c * cw
+
+        # Reduction
+        if self.reduction == 'mean':
+            return loss_c.mean()
+        elif self.reduction == 'sum':
+            return loss_c.sum()
+        else:
+            return loss_c  # (C,)
 
 class UNetLightningModule(pl.LightningModule):
-    def __init__(self, encoder_name="resnet50", classes=2, learning_rate=0.0001, weights_path=None, scheduler_type="cosine"):
+    def __init__(self, encoder_name="resnet50", classes=2, learning_rate=0.0001, weights_path=None, scheduler_type="cosine", class_weights=None, focal_gamma: float = 2.0):
         super().__init__()
         self.save_hyperparameters()
-        
-        # 保存调度器类型
         self.scheduler_type = scheduler_type
+        self.num_classes = classes
         
-        # 初始化模型
-        # self.model = smp.UnetPlusPlus(
-        #     encoder_name=encoder_name,
-        #     encoder_weights=None,
-        #     in_channels=1,  # 单通道射电图像
-        #     decoder_channels=(256, 128, 64, 32, 16),  # ResNet50需要5个解码器通道
-        #     decoder_use_norm="batchnorm",
-        #     decoder_attention_type="scse",  # 添加注意力机制
-        #     decoder_interpolation="bilinear",  # 更好的上采样
-        #     classes=classes,
-        #     activation=None  # 移除激活函数，在损失函数中处理
-        # )
         self.model = smp.Unet(
             encoder_name=encoder_name,
             encoder_weights=None,
-            in_channels=1,  # 单通道射电图像
-            decoder_channels=(256, 128, 64, 32, 16),  # ResNet50需要5个解码器通道
+            in_channels=1,
+            decoder_channels=(256, 128, 64, 32, 16),
             decoder_use_norm="batchnorm",
-            decoder_attention_type="scse",  # 添加注意力机制
-            decoder_interpolation="bilinear",  # 更好的上采样
+            decoder_attention_type="scse",
+            decoder_interpolation="bilinear",
             classes=classes,
-            activation=None  # 移除激活函数，在损失函数中处理
+            activation='softmax2d'  # 显式在通道维度做softmax，直接输出概率，避免警告
         )
         
         # 如果有预训练权重，加载它们
         if weights_path and os.path.exists(weights_path):
             state_dict = torch.load(weights_path, map_location='cpu', weights_only=True)
-            self.model.load_state_dict(state_dict, strict=False)
+            missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
             print(f"Loaded weights from {weights_path}")
+            if missing:
+                print(f"Missing keys: {len(missing)} (e.g., {missing[:5]})")
+            if unexpected:
+                print(f"Unexpected keys: {len(unexpected)} (e.g., {unexpected[:5]})")
         
-        # 定义损失函数
-        # self.dice_loss = smp.losses.DiceLoss(mode='multiclass')
-        # self.ce_loss = smp.losses.SoftCrossEntropyLoss(smooth_factor=0.1)
-        self.loss_fn = smp.losses.DiceLoss(smp.losses.MULTICLASS_MODE, from_logits=True)
+        # 类别权重（用于缓解类别不平衡）
+        if class_weights is not None:
+            self.register_buffer("class_weights", torch.as_tensor(class_weights, dtype=torch.float32))
+        else:
+            self.class_weights = None
+
+        # 新的损失函数：Focal Tversky（接受概率输入，类别不平衡友好，抗噪）
+        # 可调整 alpha/beta 控制 FP/FN 权衡；gamma>1 聚焦难例；label_smoothing 提升噪声鲁棒
+        self.focal_tversky = FocalTverskyLoss(
+            num_classes=self.num_classes,
+            alpha=0.8,
+            beta=0.2,
+            gamma=1.5,
+            smooth=1e-6,
+            reduction='mean',
+            ignore_index=None,
+            label_smoothing=0.05,
+        )
+
+        # 现阶段按你的要求先使用 DiceLoss（多类、概率输入），便于与常见基线对照
+        self.dice_loss = smp.losses.DiceLoss(
+            mode='multiclass',
+            from_logits=False,
+            ignore_index=None,
+            smooth=1e-6,
+        )
 
         self.learning_rate = learning_rate
         
     def joint_loss(self, y_pred, y_true):
-        """联合损失函数"""
-        # 对于多分类，需要将 y_true 转换为正确的格式
+        """统一的损失入口：直接使用 Focal Tversky Loss（带类别权重）。"""
         if y_true.dtype != torch.long:
             y_true = y_true.long()
-        
-        dice_weight = 0.7
-        ce_weight = 0.3
-        return dice_weight * self.dice_loss(y_pred, y_true) + ce_weight * self.ce_loss(y_pred, y_true)
+        return self.focal_tversky(y_pred, y_true, class_weights=self.class_weights)
     
     def forward(self, x):
         return self.model(x)
@@ -83,20 +190,21 @@ class UNetLightningModule(pl.LightningModule):
         images, masks = batch
         outputs = self(images)
         
-        # loss = self.joint_loss(outputs, masks)
-        loss = self.loss_fn(outputs, masks)
+        loss = self.joint_loss(outputs, masks)
 
-        # 将输出转换为概率并计算预测
-        probs = torch.softmax(outputs, dim=1)
+        # outputs 已经是概率（由于 activation='softmax'）
+        probs = outputs
         preds = torch.argmax(probs, dim=1)
         
-        # 计算指标 - 多类格式
-        tp, fp, fn, tn = smp.metrics.get_stats(preds, masks.long(), mode='multiclass', num_classes=3)
+        preds_long = cast(torch.LongTensor, preds.long())
+        masks_long = cast(torch.LongTensor, masks.long())
+        tp, fp, fn, tn = smp.metrics.get_stats(
+            preds_long, masks_long, mode='multiclass', num_classes=self.num_classes
+        )
         iou = smp.metrics.iou_score(tp, fp, fn, tn, reduction="micro")
         f1 = smp.metrics.f1_score(tp, fp, fn, tn, reduction="micro")
         accuracy = smp.metrics.accuracy(tp, fp, fn, tn, reduction="micro")
         
-        # 记录指标
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
         self.log('train_iou', iou, on_step=True, on_epoch=True, prog_bar=True)
         self.log('train_f1', f1, on_step=True, on_epoch=True)
@@ -107,27 +215,27 @@ class UNetLightningModule(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         images, masks = batch
         
-        # 调试：检查masks的值范围
-        if torch.any(masks < 0) or torch.any(masks >= 3):
+        if torch.any(masks < 0) or torch.any(masks >= self.num_classes):
             print(f"Invalid mask values found: min={masks.min()}, max={masks.max()}")
-            masks = torch.clamp(masks, 0, 2)  # 临时修复
+            masks = torch.clamp(masks, 0, self.num_classes - 1)
         
         outputs = self(images)
         
-        # loss = self.joint_loss(outputs, masks)
-        loss = self.loss_fn(outputs, masks)
+        loss = self.joint_loss(outputs, masks)
 
-        # 将输出转换为概率并计算预测
-        probs = torch.softmax(outputs, dim=1)
+        # outputs 已经是概率（由于 activation='softmax'）
+        probs = outputs
         preds = torch.argmax(probs, dim=1)
         
-        # 计算指标 - 多类格式
-        tp, fp, fn, tn = smp.metrics.get_stats(preds, masks.long(), mode='multiclass', num_classes=3)
+        preds_long = cast(torch.LongTensor, preds.long())
+        masks_long = cast(torch.LongTensor, masks.long())
+        tp, fp, fn, tn = smp.metrics.get_stats(
+            preds_long, masks_long, mode='multiclass', num_classes=self.num_classes
+        )
         iou = smp.metrics.iou_score(tp, fp, fn, tn, reduction="micro")
         f1 = smp.metrics.f1_score(tp, fp, fn, tn, reduction="micro")
         accuracy = smp.metrics.accuracy(tp, fp, fn, tn, reduction="micro")
         
-        # 记录指标
         self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log('val_iou', iou, on_step=False, on_epoch=True, prog_bar=True)
         self.log('val_f1', f1, on_step=False, on_epoch=True, prog_bar=True)
@@ -135,26 +243,19 @@ class UNetLightningModule(pl.LightningModule):
         
         return loss
     
-    def configure_optimizers(self):
-        # 使用AdamW优化器，通常比Adam表现更好
+    def configure_optimizers(self) -> Any:  # type: ignore[override]
         optimizer = torch.optim.AdamW(
             self.parameters(), 
             lr=self.learning_rate,
-            weight_decay=1e-4,  # 添加权重衰减正则化
+            weight_decay=1e-4,
             betas=(0.9, 0.999),
             eps=1e-8
         )
         
-        # 选择学习率调度策略：
-        # "cosine" - 余弦退火（推荐，适合长时间训练）
-        # "plateau" - 基于验证损失的自适应调整（保守但可靠）
-        # "step" - 固定步长降低（简单直接）
-        # "exponential" - 指数衰减（平滑下降）
         scheduler_config = self.get_scheduler_config(optimizer, scheduler_type=self.scheduler_type)
-        
         return {
             'optimizer': optimizer,
-            'lr_scheduler': scheduler_config
+            'lr_scheduler': scheduler_config,
         }
     
     def get_scheduler_config(self, optimizer, scheduler_type="cosine"):
@@ -270,7 +371,12 @@ class FITSDataset(Dataset):
             preprocessing = None,
             normalization_method = "percentile",  # 新增参数
     ):
-        self.ids = os.listdir(image_dir)
+        # 获取文件名并按 block 编号排序
+        all_files = os.listdir(image_dir)
+        def _block_key(x: str) -> int:
+            m = re.search(r'block(\d+)', x)
+            return int(m.group(1)) if m else 0
+        self.ids = sorted(all_files, key=_block_key)
         self.image_list = [os.path.join(image_dir, fid) for fid in self.ids]
         self.mask_list = []
         self.normalization_method = normalization_method  # 保存归一化方法
@@ -280,7 +386,7 @@ class FITSDataset(Dataset):
         for fid in self.ids:
             file_id = self.extract_id(fid)
             if file_id:
-                mask_path = os.path.join(mask_dir, f"mask_Subst_{file_id}.png")
+                mask_path = os.path.join(mask_dir, f"mask_merged_{file_id}.png")
                 image_path = os.path.join(image_dir, fid)
                 
                 # 检查文件是否存在且可读
@@ -313,21 +419,129 @@ class FITSDataset(Dataset):
         self.preprocessing = preprocessing
 
     @staticmethod
-    def load_fits_image(fits_path):
+    def normalize_image_with_mask(image, mask):
         """
-        从FITS文件加载并处理射电天文图像
+        使用掩码来安全地归一化图像，避免数据泄露。
+        只使用背景像素来计算统计量。
+        """
+        # 只含背景像素的掩码
+        background_mask = (mask == 0)
+        
+        # 没有背景像素，则使用整张图
+        if not np.any(background_mask):
+            background_pixels = image
+        else:
+            background_pixels = image[background_mask]
+        
+        # 在背景像素上计算统计量
+        median = np.median(background_pixels)
+        std = np.std(background_pixels)
+        
+        if std > 0:
+            lower_bound = median - 5 * std
+            upper_bound = median + 5 * std
+            # 根据背景统计量进行归一化
+            image = np.clip((image - lower_bound) / (upper_bound - lower_bound), 0, 1)
+        else:
+            # 如果背景没有变化，则将整个图像设为中间值
+            image = np.full_like(image, 0.5)
+            
+        return image.astype(np.float32)
+
+    @staticmethod
+    def normalize_image_mean_std(image: np.ndarray, k: float = 5.0) -> np.ndarray:
+        """
+        按照全图均值和±k倍标准差进行归一化到[0,1]，避免依赖任何标签信息。
+        先将超出±kσ的像素值clamp到±kσ，然后线性缩放到[0,1]。
+        当标准差为0时，返回常数0.5的图像以避免数值问题。
+        """
+        img = image.astype(np.float32)
+        mean = float(img.mean())
+        std = float(img.std())
+        if std <= 0:
+            return np.full_like(img, 0.5, dtype=np.float32)
+        lo = mean - k * std
+        hi = mean + k * std
+        # 先clamp到[lo, hi]
+        img_clamped = np.clip(img, lo, hi)
+        # 然后线性缩放到[0,1]
+        scaled = (img_clamped - lo) / (hi - lo)
+        return scaled.astype(np.float32)
+
+    @staticmethod
+    def compute_class_weights(image_dir, mask_dir, classes, num_samples=100):
+        """
+        计算训练集的类别权重，用于平衡类别不平衡。
         
         Args:
-            fits_path (str): FITS文件路径
-            normalization_method (str): 归一化方法
-                - "percentile": 基于百分位数的robust归一化
-                - "median_sigma": 基于中值±5σ的归一化（您提出的方法）
-                - "zscore": Z-score标准化后sigmoid映射
-                - "minmax": 传统最小-最大值归一化
-                - "log": 对数变换后归一化
-            
+            image_dir: 图像目录路径
+            mask_dir: 掩码目录路径
+            classes: 类别列表
+            num_samples: 采样数量，避免加载所有数据
+        
         Returns:
-            np.ndarray: 处理后的归一化图像 (nchan, nsamp)，值范围[0,1]
+            class_weights: 类别权重列表
+        """
+        import random
+        
+        # 获取所有图像文件
+        image_files = [f for f in os.listdir(image_dir) if f.endswith('.fits')]
+        if len(image_files) > num_samples:
+            image_files = random.sample(image_files, num_samples)
+        
+        class_counts = np.zeros(len(classes))
+        total_pixels = 0
+        
+        for image_file in image_files:
+            file_id = FITSDataset.extract_id(image_file)
+            if not file_id:
+                continue
+                
+            mask_path = os.path.join(mask_dir, f"mask_merged_{file_id}.png")
+            if not os.path.exists(mask_path):
+                continue
+            
+            # 加载掩码
+            mask = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
+            if mask is None:
+                continue
+            
+            # 调试：打印掩码的唯一值
+            # unique_vals = np.unique(mask)
+            # if len(unique_vals) > 0:
+            #     print(f"文件 {image_file} 的掩码唯一值: {unique_vals}")
+            
+            # 统计每个类别的像素数
+            for i, cls in enumerate(classes):
+                class_value = FITSDataset.CLASSES.index(cls.lower())
+                class_pixels = np.sum(mask == class_value)
+                class_counts[i] += class_pixels
+            
+            total_pixels += mask.size
+        
+        # 计算权重：权重 = 总像素 / (类别像素 * 类别数)
+        # 这样少数类别的权重更高
+        class_weights = []
+        for count in class_counts:
+            if count > 0:
+                weight = total_pixels / (count * len(classes))
+            else:
+                weight = 1.0  # 避免除零
+            class_weights.append(weight)
+        
+        # 归一化权重，使其和为类别数
+        class_weights = np.array(class_weights)
+        class_weights = class_weights * len(classes) / np.sum(class_weights)
+        
+        print(f"类别像素分布: {dict(zip(classes, class_counts.astype(int)))}")
+        print(f"计算的类别权重: {class_weights}")
+        
+        return class_weights.tolist()
+
+    @staticmethod
+    def load_fits_image(fits_path):
+        """
+        从FITS文件加载原始图像数据，不进行归一化。
         """
         # 使用更安全的FITS文件读取方式
         with fitsio.FITS(fits_path, 'r') as fits:
@@ -337,51 +551,43 @@ class FITSDataset(Dataset):
         nsamp = fits_header["NBLOCKS"] * fits_header["NSBLK"]
         nchan = fits_header["NCHAN"]
         
-        # 优化1: 直接读取并应用缩放偏移，减少中间变量
+        # 直接读取并应用缩放偏移，减少中间变量
         data = fits_data[0]["DATA"].reshape(nsamp, nchan).astype(np.float32)
         dat_scl = fits_data[0]["DAT_SCL"]
         dat_offs = fits_data[0]["DAT_OFFS"]
         
-        # 优化2: 原地操作，减少内存分配
+        # 原地操作，减少内存分配
         data += dat_offs[np.newaxis, :]  # 原地加法
         data *= dat_scl[np.newaxis, :]   # 原地乘法
         
-        # 优化3: 合并转置和翻转操作
+        # 合并转置和翻转操作
         image = np.flipud(data.T)
-        
-        # 归一化
-        median = np.median(image)
-        std = np.std(image)
-        if std > 0:
-            # 定义5-sigma范围
-            lower_bound = median - 5 * std
-            upper_bound = median + 5 * std
-            # 将5-sigma范围映射到[0,1]，其他值clip掉
-            image = np.clip((image - lower_bound) / (upper_bound - lower_bound), 0, 1)
-        else:
-            image = np.full_like(image, 0.5)  # 如果没有变化，设为中间值
                      
         return image
 
     def __getitem__(self, i):
         try:
-            # 使用指定的归一化方法加载FITS图像
-            image = self.load_fits_image(self.image_list[i])
+            # 1. 加载原始FITS图像 (未归一化)
+            raw_image = FITSDataset.load_fits_image(self.image_list[i])
 
+            # 2. 加载掩码
             masks = cv2.imread(self.mask_list[i], cv2.IMREAD_UNCHANGED)
-            # 移除不正确的归一化逻辑 - masks已经是类标签
-            # if masks.dtype == np.uint8 and masks.max() > 1:
-            #     masks = masks // 255
 
+            # 3. 使用基于全图均值与±5σ的归一化（无标签依赖）
+            image = FITSDataset.normalize_image_mean_std(raw_image, k=5.0)
+
+            # 4. 创建用于训练的标签掩码
             mask_labels = np.zeros(masks.shape[:2], dtype=np.uint8)
             if self.class_values:
                 for idx, cls_val in enumerate(self.class_values):
                     mask_labels[masks == cls_val] = idx
 
+            # 5. 应用数据增强
             if self.augmentation:
                 sample = self.augmentation(image=image, mask=mask_labels)
                 image, mask_labels = sample['image'], sample['mask']
 
+            # 6. 应用预处理 (to_tensor)
             if self.preprocessing:
                 sample = self.preprocessing(image=image, mask=mask_labels)
                 image, mask_labels = sample['image'], sample['mask']
@@ -400,16 +606,27 @@ def get_stable_training_augmentation():
     稳定的射电天文数据增强策略 - 平衡性能和质量的版本
     """
     train_transform = [
+        albu.RandomScale(scale_limit=(0.8, 1.2), p=0.3),  # 以30%概率随机缩放，引入不同大小
         albu.Resize(512, 512),  # 回到512x512以提高训练速度
-        
-        # 基础的亮度对比度调整 - 最稳定的增强
+
+        # 几何变换 - 增加多样性
+        # albu.Rotate(limit=15, p=0.3),  # 轻微旋转，±15度
+        albu.Affine(
+            scale=(0.9, 1.1),
+            translate_percent=0,
+            rotate=0,
+            p=0.25
+        ),
+        albu.HorizontalFlip(p=0.5),
+        albu.VerticalFlip(p=0.15),
+
+        # 颜色和噪声变换 - 增强鲁棒性
         albu.RandomBrightnessContrast(
             brightness_limit=0.15,
             contrast_limit=0.2,
             p=0.5
         ),
-        
-        # 高斯噪声 - 数值稳定
+        albu.RandomGamma(gamma_limit=(90, 110), p=0.3),  # 轻微gamma调整
         albu.GaussNoise(
             std_range=(0.005, 0.025), # 更保守的标准差范围
             mean_range=(0, 0),        # 均值保持为0
@@ -417,35 +634,22 @@ def get_stable_training_augmentation():
             p=0.3
         ),
         
-        # 轻微缩放 - 保守参数
-        albu.Affine(
-            scale=(0.9, 1.1),
-            translate_percent=0,
-            rotate=0,
-            p=0.25
-        ),
-        
-        # 频率轴翻转 - 在某些情况下合理
-        albu.VerticalFlip(p=0.15),
-        
-        # 轻微模糊 - 模拟分辨率变化
+        # 模糊 - 模拟分辨率变化
         albu.GaussianBlur(blur_limit=(1, 2), p=0.2),
     ]
     return albu.Compose(train_transform)
 
 def to_tensor(x, **kwargs):
-    # 对于图像：确保输入是灰度图像
-    if len(x.shape) == 2:
-        # 灰度图像或标签掩码
-        if x.dtype == np.uint8:  # 标签掩码
-            return x.astype('int64')  # 不添加通道维度
-        else:
-            # 灰度图像，添加通道维度
-            x = np.expand_dims(x, axis=0)  # Shape is now (1, H, W)
-    elif len(x.shape) == 3:
-        # 3D数组，从 (H, W, C) 转换为 (C, H, W)
-        x = x.transpose((2, 0, 1))  # Shape is now (C, H, W)
-    return x.astype('float32')      # Convert to float32
+    # 检查数据类型来区分图像和掩码
+    if x.dtype in [np.uint8, np.int32, np.int64]:  # 标签掩码
+        return torch.from_numpy(x.astype(np.int64))
+    else:  # 图像
+        if len(x.shape) == 2:  # 灰度图 (H, W) -> (1, H, W)
+            x = np.expand_dims(x, axis=0)
+        # Note: SMP Unet expects (C, H, W) format
+        # If your data is (H, W, C), you might need to transpose it here.
+        # However, the current load_fits_image returns (H, W) which is handled above.
+        return torch.from_numpy(x.astype(np.float32))
 
 def get_preprocessing(preprocessing_fn):
     """Construct preprocessing transform"""
@@ -469,6 +673,7 @@ def visualize_augmentations(dataset, samples=3, cols=3):
     figure, ax = plt.subplots(nrows=rows, ncols=cols, figsize=(15, 8))
     
     for i in range(samples):
+        print(f"可视化样本 {i}: {dataset.image_list[i]}")
         # 获取原始图像和掩码（经过预处理的）
         image, mask = dataset[i]  # 使用固定索引而非随机
         
@@ -500,7 +705,7 @@ def visualize_augmentations(dataset, samples=3, cols=3):
         ax[i, 1].axis('off')
         
         # 第三列：图像与mask的叠加
-        # 直接在伪彩色图像上叠加mask，不转换为RGB
+        # 直接在伔彩色图像上叠加mask，不转换为RGB
         
         # 先显示伔彩色的图像作为背景
         ax[i, 2].imshow(image, cmap='gist_heat', vmin=0, vmax=1.5, alpha=1.0)
@@ -521,8 +726,74 @@ def visualize_augmentations(dataset, samples=3, cols=3):
     plt.tight_layout()
     plt.show()
 
+def visualize_raw_fits(dataset, indices=None):
+    """
+    可视化原始 FITS 文件（未预处理），在一个图窗中展示所有图像。
+    
+    Args:
+        dataset: FITSDataset 实例
+        indices: 要可视化的索引列表，默认前5个
+    """
+    if indices is None:
+        indices = list(range(min(5, len(dataset))))  # 默认前5个
+    
+    num_images = len(indices)
+    cols = min(5, num_images)  # 每行最多5个
+    rows = (num_images + cols - 1) // cols  # 计算行数
+    
+    fig, axes = plt.subplots(rows, cols, figsize=(4*cols, 3*rows))
+    if rows == 1:
+        axes = [axes] if cols == 1 else axes
+    elif cols == 1:
+        axes = [axes] if rows == 1 else axes.flatten()
+    else:
+        axes = axes.flatten()
+    
+    for i, idx in enumerate(indices):
+        if idx >= len(dataset):
+            print(f"索引 {idx} 超出数据集大小 {len(dataset)}，跳过")
+            continue
+        
+        print(f"可视化原始样本 {idx}: {dataset.image_list[idx]}")
+        
+        # 加载原始 FITS 数据
+        raw_image = FITSDataset.load_fits_image(dataset.image_list[idx])
+        
+        # 调试：打印图像统计信息
+        print(f"  图像形状: {raw_image.shape}, 最小值: {raw_image.min():.6f}, 最大值: {raw_image.max():.6f}, 均值: {raw_image.mean():.6f}, 标准差: {raw_image.std():.6f}")
+        
+        # 计算 vmin, vmax 为 ±5σ
+        mean_val = np.mean(raw_image)
+        std_val = np.std(raw_image)
+        vmin = mean_val - 5 * std_val
+        vmax = mean_val + 5 * std_val
+        
+        print(f"  vmin: {vmin:.6f}, vmax: {vmax:.6f}")
+        
+        # 可视化
+        ax = axes[i]
+        im = ax.imshow(raw_image, cmap='gist_heat', vmin=vmin, vmax=vmax, aspect='auto')
+        ax.set_title(f"Sample {idx}: {os.path.basename(dataset.image_list[idx])}")
+        ax.set_xlabel("Channel")
+        ax.set_ylabel("Time Sample")
+        plt.colorbar(im, ax=ax, label="Intensity", shrink=0.8)
+    
+    # 隐藏多余的子图
+    for j in range(num_images, len(axes)):
+        axes[j].axis('off')
+    
+    plt.tight_layout()
+    plt.show()
+
 if __name__ == "__main__":
-    dataset_top_dir = "/home/cbm/deRFI/Datasets/dataset"
+    print("=" * 60)
+    print("🚀 开始 U-Net 射电干扰分割训练脚本")
+    print("=" * 60)
+    
+    # 解析命令行参数
+    print("📋 解析命令行参数...")
+    # ...existing code...
+    dataset_top_dir = "/home/cbm/deRFI/Datasets/Dataset_G200.48+2.54_5978_2classes_NoSubMed_FITSCorrected"
     image_dir = os.path.join(dataset_top_dir, "image")
     mask_dir = os.path.join(dataset_top_dir, "mask")
 
@@ -534,19 +805,20 @@ if __name__ == "__main__":
 
     # 超参数配置 - 平衡性能和质量的版本
     # ENCODER = "resnet50"
-    ENCODER = "mit_b0"  # 使用支持的Transformer-based encoder: Mix Transformer
+    ENCODER = "mit_b2"  # 使用稍大一点的Transformer-based encoder: Mix Transformer B2
     # CLASSES = ["background", "rfi"]
     CLASSES = ["bkg", "chan_rfi", "point_rfi"]
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-    LEARNING_RATE = 3e-4  
-    BATCH_SIZE = 3  # 增加batch size提高训练效率
+    LEARNING_RATE = 1e-4  
+    BATCH_SIZE = 8  # 增加batch size提高训练效率
     NUM_WORKERS = 8  # 增加worker数量加速数据加载
-    MAX_EPOCHS = 30  # 减少epoch数
+    MAX_EPOCHS = 50  # 减少epoch数
     
     # 预训练权重路径
-    weights_path = '/home/cbm/deRFI/pretrained_weights/cent_resnet50.pth'
+    # weights_path = '/home/cbm/deRFI/pretrained_weights/cent_resnet50.pth'
     
     # 创建数据集 - 使用稳定的增强策略
+    print("📊 创建训练和验证数据集...")
     train_dataset = FITSDataset(
         train_image_dir,
         train_mask_dir,
@@ -555,6 +827,16 @@ if __name__ == "__main__":
         preprocessing=get_preprocessing(None),
         normalization_method="median_sigma",  # 推荐：percentile, median_sigma, zscore, log, minmax
     )
+
+    print(f"✅ 训练数据集: {len(train_dataset)} 个样本")
+
+    # 可视化前几个原始 FITS 文件
+    print("🔍 可视化前几个原始 FITS 文件...")
+    visualize_raw_fits(train_dataset, indices=[0, 1, 2, 3, 4])
+
+    # 计算类别权重
+    print("⚖️ 计算类别权重...")
+    class_weights = FITSDataset.compute_class_weights(train_image_dir, train_mask_dir, CLASSES, num_samples=50)
 
     val_dataset = FITSDataset(
         val_image_dir,
@@ -565,11 +847,14 @@ if __name__ == "__main__":
         normalization_method="median_sigma",  # 验证集使用相同的归一化方法
     )
     
+    print(f"✅ 验证数据集: {len(val_dataset)} 个样本")
+    
     # 可视化数据增强效果
-    # print("可视化数据增强效果...")
-    # visualize_augmentations(train_dataset, samples=3, cols=3)
+    print("可视化数据增强效果...")
+    visualize_augmentations(train_dataset, samples=3, cols=3)
 
     # 创建数据加载器 - 优化性能设置
+    print("🔄 创建数据加载器...")
     train_loader = DataLoader(
         train_dataset, 
         batch_size=BATCH_SIZE, 
@@ -582,7 +867,7 @@ if __name__ == "__main__":
     )
     val_loader = DataLoader(
         val_dataset, 
-        batch_size=1, 
+        batch_size=4,  # 设置为4以获得更平滑的验证度量
         shuffle=False, 
         # num_workers=min(4, os.cpu_count()),  # 验证集使用较少worker
         num_workers=NUM_WORKERS,
@@ -590,14 +875,25 @@ if __name__ == "__main__":
         persistent_workers=True
     )
 
+    print(f"✅ 训练数据加载器: {len(train_loader)} 个批次 (batch_size={BATCH_SIZE})")
+    print(f"✅ 验证数据加载器: {len(val_loader)} 个批次 (batch_size=1)")
+
     # 创建模型
+    print("🏗️ 创建 U-Net 模型...")
     model = UNetLightningModule(
         encoder_name=ENCODER,
         classes=len(CLASSES),  # 多类分割，输出通道数等于类别数
         learning_rate=LEARNING_RATE,
-        weights_path=weights_path,
-        scheduler_type="cosine"  # 可选: "cosine", "plateau", "step", "exponential"
+        # weights_path=None,  # 随机初始化，不加载预训练权重
+        scheduler_type="cosine",  # 可选: "cosine", "plateau", "step", "exponential"
+        class_weights=class_weights,  # 自动计算的类别权重
+        focal_gamma=2.0
     )
+    
+    print(f"✅ 模型配置: {ENCODER} 编码器, {len(CLASSES)} 个类别 ({CLASSES})")
+    print(f"✅ 学习率: {LEARNING_RATE}, 批次大小: {BATCH_SIZE}, 最大轮次: {MAX_EPOCHS}")
+    print(f"✅ 类别权重: {class_weights}")
+    print(f"✅ 设备: {DEVICE}")
     
     # 设置示例输入数组以便 TensorBoard 记录计算图
     # 使用与训练数据相同的尺寸: (batch_size, channels, height, width)
@@ -615,9 +911,9 @@ if __name__ == "__main__":
             verbose=True
         ),
         EarlyStopping(
-            monitor='val_loss',
+            monitor='val_iou',
             patience=10,
-            mode='min',
+            mode='max',
             verbose=True
         ),
         LearningRateMonitor(logging_interval='epoch')
@@ -634,6 +930,7 @@ if __name__ == "__main__":
     )
     
     # 配置训练器 - 性能优化版本
+    print("⚙️ 配置训练器...")
     trainer = pl.Trainer(
         max_epochs=MAX_EPOCHS,
         accelerator='gpu' if torch.cuda.is_available() else 'cpu',
@@ -651,13 +948,102 @@ if __name__ == "__main__":
         strategy='auto',
     )
     
+    print("🚀 开始训练...")
+    print("=" * 60)
+    
     # 开始训练
     trainer.fit(
         model,
         train_dataloaders=train_loader,
         val_dataloaders=val_loader,
+        ckpt_path=None,  # 设置为 None 以从头开始训练，不加载 checkpoint
     )
     
     # 保存最终模型
     trainer.save_checkpoint("final_model.ckpt")
-    print("训练完成！模型已保存。")
+    print("=" * 60)
+    print("🎉 训练完成！模型已保存为 final_model.ckpt")
+
+
+def visualize_inference_results(model_path, dataset, num_samples=3, save_dir="inference_results"):
+    """
+    可视化推理结果：显示原始图像、真实掩码、预测掩码和叠加结果。
+    
+    Args:
+        model_path (str): 模型 checkpoint 路径
+        dataset (Dataset): 验证数据集
+        num_samples (int): 要可视化的样本数量
+        save_dir (str): 保存图像的目录
+    """
+    import os
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # 加载模型
+    model = UNetLightningModule.load_from_checkpoint(model_path)
+    model.eval()
+    model.to('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    device = next(model.parameters()).device
+    
+    for i in range(min(num_samples, len(dataset))):
+        image, mask = dataset[i]
+        
+        # 转换为 tensor 并添加 batch 维度
+        image_tensor = torch.tensor(image, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(device)
+        
+        with torch.no_grad():
+            outputs = model(image_tensor)
+            preds = torch.argmax(outputs, dim=1).squeeze(0).cpu().numpy()
+        
+        # 转换为 numpy
+        image_np = image  # 已经是 (H, W)
+        mask_np = mask
+        pred_np = preds
+        
+        # 创建可视化
+        fig, axes = plt.subplots(2, 4, figsize=(20, 10), gridspec_kw={'height_ratios': [4, 1]})
+        
+        # 原始图像
+        axes[0, 0].imshow(image_np, cmap='gray' if image.shape[0] == 1 else None)
+        axes[0, 0].set_title('Original Image')
+        axes[0, 0].axis('off')
+        
+        # 真实掩码
+        im1 = axes[0, 1].imshow(mask_np, cmap='viridis', vmin=0, vmax=model.num_classes-1)
+        axes[0, 1].set_title('Ground Truth Mask')
+        axes[0, 1].axis('off')
+        
+        # 预测掩码
+        im2 = axes[0, 2].imshow(pred_np, cmap='viridis', vmin=0, vmax=model.num_classes-1)
+        axes[0, 2].set_title('Predicted Mask')
+        axes[0, 2].axis('off')
+        
+        # 叠加：原始图像 + 预测掩码轮廓
+        axes[0, 3].imshow(image_np, cmap='gray' if image.shape[0] == 1 else None)
+        axes[0, 3].contour(pred_np, colors='red', linewidths=1)
+        axes[0, 3].set_title('Overlay (Image + Pred Contour)')
+        axes[0, 3].axis('off')
+        
+        # 创建类别标签
+        classes = ["bkg", "chan_rfi", "point_rfi"]  # 从FITSDataset.CLASSES获取
+        
+        # 在底部添加颜色条和类别标签
+        # 为每个类别创建颜色条
+        for j in range(model.num_classes):
+            # 创建一个小的颜色条
+            cbar_data = np.full((1, 100), j, dtype=int)
+            im_cbar = axes[1, j].imshow(cbar_data, cmap='viridis', vmin=0, vmax=model.num_classes-1, aspect='auto')
+            axes[1, j].set_title(f'{classes[j]} (Class {j})', fontsize=10)
+            axes[1, j].axis('off')
+        
+        # 隐藏多余的子图
+        for j in range(model.num_classes, 4):
+            axes[1, j].axis('off')
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, f'inference_sample_{i+1}.png'), dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        print(f"✅ 保存推理可视化结果: {os.path.join(save_dir, f'inference_sample_{i+1}.png')}")
+    
+    print(f"🎉 推理可视化完成！共处理 {min(num_samples, len(dataset))} 个样本，结果保存至 {save_dir}/")

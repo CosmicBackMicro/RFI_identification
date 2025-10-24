@@ -870,7 +870,7 @@ int main(int argc, char *argv[])
 
 
             // =======================Subtract Channel Median========================================================
-            int subtractChanMed = 1; 
+            int subtractChanMed = 0; 
             if (subtractChanMed)
             {
                 subtractChannelMedians(outDataT, nsampBinned, nchanBinned);
@@ -963,7 +963,7 @@ int main(int argc, char *argv[])
 
 
             float NSigmaInChan = 3.0f; // Updated to use 3-sigma threshold for iterative outlier detection
-            float NSigmaOutChan = 3.0f; // When data is severely affected and subtractMedian is turned off, a lower threshold is favored
+            float NSigmaOutChan = 2.0f; // When data is severely affected and subtractMedian is turned off, a lower threshold is favored
             if (m.doSubstitution)
             {
                 double rfi_start = omp_get_wtime();

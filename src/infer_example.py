@@ -52,24 +52,26 @@ def visualize_inference_results(model_path, dataset, num_samples=3, save_dir="in
         fig, axes = plt.subplots(2, 4, figsize=(20, 10), gridspec_kw={'height_ratios': [4, 1]})
         
         # 原始图像
-        axes[0, 0].imshow(image_np, cmap='gray' if image.shape[0] == 1 else None)
+        axes[0, 0].imshow(image_np, cmap='gist_heat')
         axes[0, 0].set_title('Original Image')
         axes[0, 0].axis('off')
         
-        # 真实掩码
-        im1 = axes[0, 1].imshow(mask_np, cmap='viridis', vmin=0, vmax=model.num_classes-1)
-        axes[0, 1].set_title('Ground Truth Mask')
+        # 叠加：原始图像 + 预测掩码透明叠加 + 轮廓
+        axes[0, 1].imshow(image_np, cmap='gist_heat')
+        axes[0, 1].imshow(pred_np, cmap='viridis', alpha=0.5, vmin=0, vmax=model.num_classes-1)
+        # 添加细轮廓线
+        axes[0, 1].contour(pred_np, colors='white', linewidths=0.1, alpha=0.8)
+        axes[0, 1].set_title('Overlay (Image + Pred Mask + Contour)')
         axes[0, 1].axis('off')
         
-        # 预测掩码
-        im2 = axes[0, 2].imshow(pred_np, cmap='viridis', vmin=0, vmax=model.num_classes-1)
-        axes[0, 2].set_title('Predicted Mask')
+        # 真实掩码
+        im1 = axes[0, 2].imshow(mask_np, cmap='viridis', vmin=0, vmax=model.num_classes-1)
+        axes[0, 2].set_title('Ground Truth Mask')
         axes[0, 2].axis('off')
         
-        # 叠加：原始图像 + 预测掩码轮廓
-        axes[0, 3].imshow(image_np, cmap='gray' if image.shape[0] == 1 else None)
-        axes[0, 3].contour(pred_np, colors='red', linewidths=1)
-        axes[0, 3].set_title('Overlay (Image + Pred Contour)')
+        # 预测掩码
+        im2 = axes[0, 3].imshow(pred_np, cmap='viridis', vmin=0, vmax=model.num_classes-1)
+        axes[0, 3].set_title('Predicted Mask')
         axes[0, 3].axis('off')
         
         # 创建类别标签
@@ -89,7 +91,7 @@ def visualize_inference_results(model_path, dataset, num_samples=3, save_dir="in
             axes[1, j].axis('off')
         
         plt.tight_layout()
-        plt.savefig(os.path.join(save_dir, f'inference_sample_{i+1}.png'), dpi=150, bbox_inches='tight')
+        plt.savefig(os.path.join(save_dir, f'inference_sample_{i+1}.png'), dpi=600, bbox_inches='tight')
         plt.close()
         
         print(f"✅ 保存推理可视化结果: {os.path.join(save_dir, f'inference_sample_{i+1}.png')}")
@@ -100,9 +102,9 @@ def visualize_inference_results(model_path, dataset, num_samples=3, save_dir="in
 if __name__ == "__main__":
     # ============ 配置参数 ============
     # 数据集路径（根据你的数据集调整）
-    dataset_top_dir = "/home/cbm/deRFI/Datasets/Dataset_G200.48+2.54_5978_2classes_NoSubMed_PointMaskSmoothed"
+    dataset_top_dir = "/home/cbm/deRFI/Datasets/Dataset_G200.48+2.54_5978_2classes_NoSubMed_ThreshCorrected"
     # 模型路径
-    model_path = "/home/cbm/deRFI/checkpoints/best_model-epoch=17-val_iou=0.7759.ckpt"
+    model_path = "/home/cbm/deRFI/checkpoints/best_model-epoch=66-val_iou=0.8297.ckpt"
     # 保存目录
     save_dir = "/home/cbm/deRFI/IntermediateResults"
     # =================================
@@ -131,6 +133,6 @@ if __name__ == "__main__":
     visualize_inference_results(
         model_path=model_path,
         dataset=val_dataset,
-        num_samples=5,  # 可视化前5个样本
+        num_samples=50,  # 可视化前5个样本
         save_dir=save_dir
     )

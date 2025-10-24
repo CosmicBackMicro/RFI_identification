@@ -1,5 +1,8 @@
-#pragma once
-#include "identification.h" // for IdentNSigmaMasks
+ #pragma once
+ #include "identification.h" // for IdentNSigmaMasks
+
+// 清空所有掩码数组
+void clearIdentNSigmaMasks(IdentNSigmaMasks *m, int nsamp, int nchan);
 
 // Mask-only utility APIs
 // - writeIndexMaskPNG: save a 2D mask (nchan x nsamp) as grayscale PNG
@@ -18,7 +21,10 @@ void logicalOR(int *globalMask, const int *mask, int nsamp, int nchan);
 // Convenience API: write all masks in IdentNSigmaMasks to PNGs with consistent naming
 // Filenames will be written to: `${datasetPath}mask_<name>_<index>.png`
 void writeAllMasksPNG(const IdentNSigmaMasks *masks, int nsamp, int nchan,
-					  const char *datasetPath, int index);
+					  const char *datasetPath, int index, int merge);
+
+// Smooth outChannel mask by removing isolated flagged channels
+void smoothOutChanMask(int *channelFlagged, int nchan, int N);
 
 // Allocation helpers for IdentNSigmaMasks
 void allocIdentNSigmaMasks(IdentNSigmaMasks *m, int nsamp, int nchan);

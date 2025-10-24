@@ -120,7 +120,7 @@ class FocalTverskyLoss(nn.Module):
             return loss_c  # (C,)
 
 class UNetLightningModule(pl.LightningModule):
-    def __init__(self, encoder_name="resnet50", classes=2, learning_rate=0.0001, weights_path=None, scheduler_type="cosine", class_weights=None, focal_gamma: float = 2.0):
+    def __init__(self, encoder_name="resnet50", classes=2, learning_rate=0.0001, weights_path=None, scheduler_type="cosine", class_weights=None, focal_gamma: float = 2.0, loss_alpha: float = 0.7, loss_beta: float = 0.3):
         super().__init__()
         self.save_hyperparameters()
         self.scheduler_type = scheduler_type
@@ -158,9 +158,9 @@ class UNetLightningModule(pl.LightningModule):
         # 可调整 alpha/beta 控制 FP/FN 权衡；gamma>1 聚焦难例；label_smoothing 提升噪声鲁棒
         self.focal_tversky = FocalTverskyLoss(
             num_classes=self.num_classes,
-            alpha=0.8,
-            beta=0.2,
-            gamma=1.5,
+            alpha=loss_alpha,
+            beta=loss_beta,
+            gamma=focal_gamma,
             smooth=1e-6,
             reduction='mean',
             ignore_index=None,
@@ -412,8 +412,10 @@ class FITSDataset(Dataset):
         
         print(f"加载了 {len(valid_pairs)} 个有效的图像-掩码对")
 
-        # Read multi-class mask according to string names
-        self.class_values = [self.CLASSES.index(cls.lower()) for cls in classes] if classes else None
+        # Read multi-class mask according to actual mask values from C code
+        # From mask.c: horizontal=1, point=5 (chan_rfi related commented out)
+        # Map to our classes: bkg=0 (background), chan_rfi=1 (horizontal), point_rfi=5 (point)
+        self.class_values = [0, 1, 5]  # 直接使用实际的mask编号
         
         self.augmentation = augmentation
         self.preprocessing = preprocessing
@@ -511,10 +513,11 @@ class FITSDataset(Dataset):
             # if len(unique_vals) > 0:
             #     print(f"文件 {image_file} 的掩码唯一值: {unique_vals}")
             
-            # 统计每个类别的像素数
+            # 统计每个类别的像素数 - 使用实际的mask编号
+            # bkg=0 (background), chan_rfi=1 (horizontal), point_rfi=5 (point)
+            actual_class_values = [0, 1, 5]
             for i, cls in enumerate(classes):
-                class_value = FITSDataset.CLASSES.index(cls.lower())
-                class_pixels = np.sum(mask == class_value)
+                class_pixels = np.sum(mask == actual_class_values[i])
                 class_counts[i] += class_pixels
             
             total_pixels += mask.size
@@ -793,7 +796,7 @@ if __name__ == "__main__":
     # 解析命令行参数
     print("📋 解析命令行参数...")
     # ...existing code...
-    dataset_top_dir = "/home/cbm/deRFI/Datasets/Dataset_G200.48+2.54_5978_2classes_NoSubMed_FITSCorrected"
+    dataset_top_dir = "/home/cbm/deRFI/Datasets/Dataset_G200.48+2.54_5978_2classes_NoSubMed_ThreshCorrected"
     image_dir = os.path.join(dataset_top_dir, "image")
     mask_dir = os.path.join(dataset_top_dir, "mask")
 
@@ -803,20 +806,32 @@ if __name__ == "__main__":
     val_image_dir = os.path.join(image_dir, "val")
     val_mask_dir = os.path.join(mask_dir, "val")
 
-    # 超参数配置 - 平衡性能和质量的版本
-    # ENCODER = "resnet50"
+    # ============ 超参数配置 ============
+    # 模型架构
     ENCODER = "mit_b2"  # 使用稍大一点的Transformer-based encoder: Mix Transformer B2
-    # CLASSES = ["background", "rfi"]
-    CLASSES = ["bkg", "chan_rfi", "point_rfi"]
+    # 数据集配置
+    CLASSES = ["bkg", "chan_rfi", "point_rfi"]  # 对应mask编号: 0, 1, 5
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-    LEARNING_RATE = 1e-4  
-    BATCH_SIZE = 8  # 增加batch size提高训练效率
-    NUM_WORKERS = 8  # 增加worker数量加速数据加载
-    MAX_EPOCHS = 50  # 减少epoch数
-    
-    # 预训练权重路径
-    # weights_path = '/home/cbm/deRFI/pretrained_weights/cent_resnet50.pth'
-    
+    # 训练参数 - RTX 4060 Laptop 8GB 优化配置
+    LEARNING_RATE = 1e-4
+    BATCH_SIZE = 6  # RTX 4060 Laptop 8GB: 减小到6以节省显存
+    NUM_WORKERS = min(8, os.cpu_count() or 8)  # 减少worker避免CPU瓶颈
+    MAX_EPOCHS = 100
+    ACCUMULATE_GRAD_BATCHES = 2  # 每2步累积，相当于有效batch_size=12
+    # 调度器配置
+    SCHEDULER_TYPE = "cosine"  # 可选: "cosine", "plateau", "step", "exponential"
+    SCHEDULER_T_0 = 15  # Cosine调度器的初始周期
+    SCHEDULER_T_MULT = 1  # 周期倍数
+    # 损失函数配置
+    FOCAL_GAMMA = 2.0  # Focal Loss的gamma参数
+    LOSS_ALPHA = 0.7  # FocalTverskyLoss的alpha参数
+    LOSS_BETA = 0.3   # FocalTverskyLoss的beta参数
+    # 数据增强配置
+    NORMALIZATION_METHOD = "median_sigma"  # 推荐：percentile, median_sigma, zscore, log, minmax
+    # 预训练权重路径 (None表示随机初始化)
+    WEIGHTS_PATH = None  # '/home/cbm/deRFI/pretrained_weights/cent_resnet50.pth'
+    # ====================================
+
     # 创建数据集 - 使用稳定的增强策略
     print("📊 创建训练和验证数据集...")
     train_dataset = FITSDataset(
@@ -825,7 +840,7 @@ if __name__ == "__main__":
         classes=CLASSES,
         augmentation=get_stable_training_augmentation(),  # 改为稳定版本
         preprocessing=get_preprocessing(None),
-        normalization_method="median_sigma",  # 推荐：percentile, median_sigma, zscore, log, minmax
+        normalization_method=NORMALIZATION_METHOD,  # 使用配置参数
     )
 
     print(f"✅ 训练数据集: {len(train_dataset)} 个样本")
@@ -844,11 +859,35 @@ if __name__ == "__main__":
         classes=CLASSES,
         augmentation=get_validation_augmentation(512, 512),  # 指定大小以匹配训练
         preprocessing=get_preprocessing(None),
-        normalization_method="median_sigma",  # 验证集使用相同的归一化方法
+        normalization_method=NORMALIZATION_METHOD,  # 使用配置参数
     )
     
     print(f"✅ 验证数据集: {len(val_dataset)} 个样本")
-    
+
+    # 检查第一个验证样本的mask类别编号
+    print("🔍 检查第一个验证样本的mask类别编号...")
+    if len(val_dataset) > 0:
+        image, mask = val_dataset[0]
+        
+        # 将mask转换为numpy array（如果它是tensor）
+        if isinstance(mask, torch.Tensor):
+            mask_np = mask.numpy()
+        else:
+            mask_np = mask
+            
+        unique_values = np.unique(mask_np)
+        print(f"第一个验证样本的mask唯一值（类别编号）: {unique_values}")
+        print(f"对应的类别名称: {[CLASSES[i] if i < len(CLASSES) else f'unknown_{i}' for i in unique_values]}")
+        
+        # 统计每个类别的像素数
+        for val in unique_values:
+            count = np.sum(mask_np == val)
+            percentage = (count / mask_np.size) * 100
+            class_name = CLASSES[val] if val < len(CLASSES) else f'unknown_{val}'
+            print(f"  {class_name} (编号{val}): {count} 像素 ({percentage:.2f}%)")
+    else:
+        print("验证数据集为空")
+
     # 可视化数据增强效果
     print("可视化数据增强效果...")
     visualize_augmentations(train_dataset, samples=3, cols=3)
@@ -859,7 +898,6 @@ if __name__ == "__main__":
         train_dataset, 
         batch_size=BATCH_SIZE, 
         shuffle=True, 
-        # num_workers=min(8, os.cpu_count()),  # 使用多个worker提高数据加载速度
         num_workers=NUM_WORKERS,
         pin_memory=True,  # 加速GPU数据传输
         persistent_workers=True,  # 保持worker进程，减少启动开销
@@ -869,7 +907,6 @@ if __name__ == "__main__":
         val_dataset, 
         batch_size=4,  # 设置为4以获得更平滑的验证度量
         shuffle=False, 
-        # num_workers=min(4, os.cpu_count()),  # 验证集使用较少worker
         num_workers=NUM_WORKERS,
         pin_memory=True,
         persistent_workers=True
@@ -884,16 +921,18 @@ if __name__ == "__main__":
         encoder_name=ENCODER,
         classes=len(CLASSES),  # 多类分割，输出通道数等于类别数
         learning_rate=LEARNING_RATE,
-        # weights_path=None,  # 随机初始化，不加载预训练权重
-        scheduler_type="cosine",  # 可选: "cosine", "plateau", "step", "exponential"
+        weights_path=WEIGHTS_PATH,  # 使用配置参数
+        scheduler_type=SCHEDULER_TYPE,  # 使用配置参数
         class_weights=class_weights,  # 自动计算的类别权重
-        focal_gamma=2.0
+        focal_gamma=FOCAL_GAMMA,  # 使用配置参数
+        loss_alpha=LOSS_ALPHA,  # FocalTverskyLoss参数
+        loss_beta=LOSS_BETA,  # FocalTverskyLoss参数
     )
     
     print(f"✅ 模型配置: {ENCODER} 编码器, {len(CLASSES)} 个类别 ({CLASSES})")
-    print(f"✅ 学习率: {LEARNING_RATE}, 批次大小: {BATCH_SIZE}, 最大轮次: {MAX_EPOCHS}")
-    print(f"✅ 类别权重: {class_weights}")
-    print(f"✅ 设备: {DEVICE}")
+    print(f"✅ 学习率: {LEARNING_RATE}, 批次大小: {BATCH_SIZE}, 梯度累积: {ACCUMULATE_GRAD_BATCHES}步")
+    print(f"✅ 有效批次大小: {BATCH_SIZE * ACCUMULATE_GRAD_BATCHES}, 最大轮次: {MAX_EPOCHS}")
+    print(f"✅ GPU: RTX 4060 Laptop 8GB - 已优化显存使用")
     
     # 设置示例输入数组以便 TensorBoard 记录计算图
     # 使用与训练数据相同的尺寸: (batch_size, channels, height, width)
@@ -912,7 +951,7 @@ if __name__ == "__main__":
         ),
         EarlyStopping(
             monitor='val_iou',
-            patience=10,
+            patience=20,
             mode='max',
             verbose=True
         ),
@@ -946,6 +985,7 @@ if __name__ == "__main__":
         gradient_clip_val=1.0,  # 添加梯度裁剪防止训练不稳定
         deterministic=False,  # 允许非确定性操作以提高性能
         strategy='auto',
+        accumulate_grad_batches=ACCUMULATE_GRAD_BATCHES,  # 梯度累积
     )
     
     print("🚀 开始训练...")
@@ -963,87 +1003,3 @@ if __name__ == "__main__":
     trainer.save_checkpoint("final_model.ckpt")
     print("=" * 60)
     print("🎉 训练完成！模型已保存为 final_model.ckpt")
-
-
-def visualize_inference_results(model_path, dataset, num_samples=3, save_dir="inference_results"):
-    """
-    可视化推理结果：显示原始图像、真实掩码、预测掩码和叠加结果。
-    
-    Args:
-        model_path (str): 模型 checkpoint 路径
-        dataset (Dataset): 验证数据集
-        num_samples (int): 要可视化的样本数量
-        save_dir (str): 保存图像的目录
-    """
-    import os
-    os.makedirs(save_dir, exist_ok=True)
-    
-    # 加载模型
-    model = UNetLightningModule.load_from_checkpoint(model_path)
-    model.eval()
-    model.to('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    device = next(model.parameters()).device
-    
-    for i in range(min(num_samples, len(dataset))):
-        image, mask = dataset[i]
-        
-        # 转换为 tensor 并添加 batch 维度
-        image_tensor = torch.tensor(image, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(device)
-        
-        with torch.no_grad():
-            outputs = model(image_tensor)
-            preds = torch.argmax(outputs, dim=1).squeeze(0).cpu().numpy()
-        
-        # 转换为 numpy
-        image_np = image  # 已经是 (H, W)
-        mask_np = mask
-        pred_np = preds
-        
-        # 创建可视化
-        fig, axes = plt.subplots(2, 4, figsize=(20, 10), gridspec_kw={'height_ratios': [4, 1]})
-        
-        # 原始图像
-        axes[0, 0].imshow(image_np, cmap='gray' if image.shape[0] == 1 else None)
-        axes[0, 0].set_title('Original Image')
-        axes[0, 0].axis('off')
-        
-        # 真实掩码
-        im1 = axes[0, 1].imshow(mask_np, cmap='viridis', vmin=0, vmax=model.num_classes-1)
-        axes[0, 1].set_title('Ground Truth Mask')
-        axes[0, 1].axis('off')
-        
-        # 预测掩码
-        im2 = axes[0, 2].imshow(pred_np, cmap='viridis', vmin=0, vmax=model.num_classes-1)
-        axes[0, 2].set_title('Predicted Mask')
-        axes[0, 2].axis('off')
-        
-        # 叠加：原始图像 + 预测掩码轮廓
-        axes[0, 3].imshow(image_np, cmap='gray' if image.shape[0] == 1 else None)
-        axes[0, 3].contour(pred_np, colors='red', linewidths=1)
-        axes[0, 3].set_title('Overlay (Image + Pred Contour)')
-        axes[0, 3].axis('off')
-        
-        # 创建类别标签
-        classes = ["bkg", "chan_rfi", "point_rfi"]  # 从FITSDataset.CLASSES获取
-        
-        # 在底部添加颜色条和类别标签
-        # 为每个类别创建颜色条
-        for j in range(model.num_classes):
-            # 创建一个小的颜色条
-            cbar_data = np.full((1, 100), j, dtype=int)
-            im_cbar = axes[1, j].imshow(cbar_data, cmap='viridis', vmin=0, vmax=model.num_classes-1, aspect='auto')
-            axes[1, j].set_title(f'{classes[j]} (Class {j})', fontsize=10)
-            axes[1, j].axis('off')
-        
-        # 隐藏多余的子图
-        for j in range(model.num_classes, 4):
-            axes[1, j].axis('off')
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(save_dir, f'inference_sample_{i+1}.png'), dpi=150, bbox_inches='tight')
-        plt.close()
-        
-        print(f"✅ 保存推理可视化结果: {os.path.join(save_dir, f'inference_sample_{i+1}.png')}")
-    
-    print(f"🎉 推理可视化完成！共处理 {min(num_samples, len(dataset))} 个样本，结果保存至 {save_dir}/")

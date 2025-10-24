@@ -108,23 +108,23 @@ void writeAllMasksPNG(const IdentNSigmaMasks *masks, int nsamp, int nchan,
          * 低优先级先写入获得较小类号, 高优先级后写入覆盖并拥有较大类号。
          * 类号分配: 1:horizontal 2:complex 3:dark 4:bright 5:point
          */
-        int classIndex = 0;
+        int classIndex = 1;
 
         if (masks->horizontalMask) {
             for (int i = 0; i < total; i++) if (masks->horizontalMask[i]) indexMask[i] = classIndex;
         }
         classIndex++;
-        if (masks->chanComplexMask) {
-            for (int i = 0; i < total; i++) if (masks->chanComplexMask[i]) indexMask[i] = classIndex;
-        }
+        // if (masks->chanComplexMask) {
+        //     for (int i = 0; i < total; i++) if (masks->chanComplexMask[i]) indexMask[i] = classIndex;
+        // }
         classIndex++;
-        if (masks->chanDarkMask) {
-            for (int i = 0; i < total; i++) if (masks->chanDarkMask[i]) indexMask[i] = classIndex;
-        }
+        // if (masks->chanDarkMask) {
+        //     for (int i = 0; i < total; i++) if (masks->chanDarkMask[i]) indexMask[i] = classIndex;
+        // }
         classIndex++;
-        if (masks->chanBrightMask) {
-            for (int i = 0; i < total; i++) if (masks->chanBrightMask[i]) indexMask[i] = classIndex;
-        }
+        // if (masks->chanBrightMask) {
+        //     for (int i = 0; i < total; i++) if (masks->chanBrightMask[i]) indexMask[i] = classIndex;
+        // }
         classIndex++;
         if (masks->pointMask) {
             for (int i = 0; i < total; i++) if (masks->pointMask[i]) indexMask[i] = classIndex;

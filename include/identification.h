@@ -18,7 +18,10 @@ void substPixels2D(float *data, int nsamp, int nchan, int *mask);
 // Function to randomly replace flagged pixels with unflagged pixels from the same time sample
 // Replace pixels for channels flagged in channelMask using values from unflagged channels at the same time
 // If pointMask is non-NULL, only unmasked pixels are used as source
-void randomReplaceRFIPixels(float *data, const int *channelMask, const int *pointMask, int nsamp, int nchan);
+void outChanSubstitution(float *data, const int *channelMask, const int *pointMask, int nsamp, int nchan);
+
+// Substitute in-channel outliers using local statistics
+void inChanSubstitution(float *data, int *globalMask, int nsamp, int nchan, int *pixelsSubstituted);
 void substPixels(float *data, int size, int *mask, int *goodSamps, int *randIdx);
 void binarySIR(int *mask, int nsamp, int nchan, int win_samp, int win_chan, float thrup, float thrdown);
 
@@ -74,3 +77,8 @@ void drawSimpleChannelSTDHistWithMask(float *channel_stds, int nchan, int *chann
 void drawOutChannelComparisonHist(float *initial_stats, float *final_stats, int nchan, 
                                   int use_mad, int initial_flagged_count, int final_flagged_count,
                                   int iterations, float nsigma_out, float nsigma_in);
+
+// New consistent-shape version (keeps initial histogram shape fixed)
+void drawOutChannelComparisonHist_new(float *initial_stats, float *final_stats, int nchan,
+                                      int use_mad, int initial_flagged_count, int final_flagged_count,
+                                      int iterations, float nsigma_out, float nsigma_in);

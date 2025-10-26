@@ -5,6 +5,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <libgen.h>
 #include "cmd.h"
 
 // Ensure path ends with '/'
@@ -157,6 +158,29 @@ int parseCommandLineArguments(int argc, char *argv[], Metadata *m) {
     // Verify required parameters
     if (m->filename == NULL) {
         fprintf(stderr, "Error: Input filename is required\n");
+        return -1;
+    }
+
+    // Check if the parent directory exists
+    char *filename_copy = strdup(m->filename);
+    char *parent_dir = dirname(filename_copy);
+    struct stat dir_st;
+    if (stat(parent_dir, &dir_st) == -1) {
+        fprintf(stderr, "Error: Parent directory '%s' does not exist\n", parent_dir);
+        free(filename_copy);
+        return -1;
+    }
+    if (!S_ISDIR(dir_st.st_mode)) {
+        fprintf(stderr, "Error: '%s' is not a directory\n", parent_dir);
+        free(filename_copy);
+        return -1;
+    }
+    free(filename_copy);
+
+    // Check if the input file exists
+    struct stat st;
+    if (stat(m->filename, &st) == -1) {
+        fprintf(stderr, "Error: Input file '%s' does not exist\n", m->filename);
         return -1;
     }
 

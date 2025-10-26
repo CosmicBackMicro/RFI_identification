@@ -239,7 +239,7 @@ help:
 	@echo "  quick/debug  - Fast compilation, full debug info, no optimization"
 	@echo "  profile      - Moderate optimization + profiling support"
 	@echo "  release      - High optimization for production use"
-	@echo "  turbo        - Maximum optimization for scientific computing"
+	@echo "  turbo        - Maximum performance for scientific computing"
 	@echo ""
 	@echo "Usage examples:"
 	@echo "  make quick          # Fast build for development"
@@ -247,6 +247,7 @@ help:
 	@echo "  make turbo          # Maximum performance build"
 	@echo "  make info MODE=turbo # Show compile flags for turbo mode"
 	@echo "  make check-deps     # Check required libraries"
+	@echo "  make test-median    # Build and run median correctness tests"
 
 # 安装到系统路径 (可选)
 install: $(TARGET)

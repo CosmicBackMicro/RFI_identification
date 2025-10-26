@@ -535,7 +535,7 @@ void applyCompress(float *outData, unsigned char *target_data, int nchan, int ns
                    float *scale, float *offset)
 {
     int i, j;
-    #pragma omp parallel for collapse(2)
+    // #pragma omp parallel for collapse(2)
     for (i = 0; i < nchan; i++)
     {
         for (j = 0; j < nsamp; j++)
@@ -891,7 +891,7 @@ int main(int argc, char *argv[])
                 // 压缩数据
                 // calcCompress(outDataT, nchanBinned, nsampBinned, scale_const, offset_const);
                 transpose(outDataT, nchanBinned, nsampBinned, outData);
-                applyCompress(outData, outRawData, nchanBinned, nsampBinned, scale_const, offset_const);
+                // applyCompress(outData, outRawData, nchanBinned, nsampBinned, scale_const, offset_const);
                 
                 // 写出 FITS 数据集
                 writeFITSDataset(outRawData, scale_const, offset_const, nsampBinned, nchanBinned, ii, &m, &fits_status);
@@ -1090,6 +1090,7 @@ int main(int argc, char *argv[])
         } else if (numiter % 200 == 1) {
             m.plot = 0; 
         }
+        if (numiter == 200) {return 0;}
 
         // if (numiter == 1) {
         //     m.plot = 0;

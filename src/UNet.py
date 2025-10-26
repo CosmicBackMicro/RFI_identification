@@ -154,20 +154,7 @@ class UNetLightningModule(pl.LightningModule):
         else:
             self.class_weights = None
 
-        # 新的损失函数：Focal Tversky（接受概率输入，类别不平衡友好，抗噪）
-        # 可调整 alpha/beta 控制 FP/FN 权衡；gamma>1 聚焦难例；label_smoothing 提升噪声鲁棒
-        self.focal_tversky = FocalTverskyLoss(
-            num_classes=self.num_classes,
-            alpha=loss_alpha,
-            beta=loss_beta,
-            gamma=focal_gamma,
-            smooth=1e-6,
-            reduction='mean',
-            ignore_index=None,
-            label_smoothing=0.05,
-        )
-
-        # 现阶段按你的要求先使用 DiceLoss（多类、概率输入），便于与常见基线对照
+        # 暂时使用简单的DiceLoss，避免复杂损失函数导致的问题
         self.dice_loss = smp.losses.DiceLoss(
             mode='multiclass',
             from_logits=False,
@@ -175,21 +162,41 @@ class UNetLightningModule(pl.LightningModule):
             smooth=1e-6,
         )
 
+        # 注释掉复杂的FocalTverskyLoss，后续可以取消注释
+        # self.focal_tversky = FocalTverskyLoss(
+        #     num_classes=self.num_classes,
+        #     alpha=loss_alpha,
+        #     beta=loss_beta,
+        #     gamma=focal_gamma,
+        #     smooth=1e-6,
+        #     reduction='mean',
+        #     ignore_index=None,
+        #     label_smoothing=0.05,
+        # )
+
         self.learning_rate = learning_rate
         
     def joint_loss(self, y_pred, y_true):
-        """统一的损失入口：直接使用 Focal Tversky Loss（带类别权重）。"""
+        """使用简单的DiceLoss，避免复杂损失函数的问题。"""
         if y_true.dtype != torch.long:
             y_true = y_true.long()
-        return self.focal_tversky(y_pred, y_true, class_weights=self.class_weights)
+        # 暂时移除类别权重，使用简单的DiceLoss
+        return self.dice_loss(y_pred, y_true)
+        # 注释掉复杂的FocalTverskyLoss，后续可以取消注释
+        # return self.focal_tversky(y_pred, y_true, class_weights=self.class_weights)
     
     def forward(self, x):
         return self.model(x)
     
     def training_step(self, batch, batch_idx):
         images, masks = batch
-        outputs = self(images)
         
+        # 调试：检查mask值是否正确
+        if batch_idx == 0:  # 只在第一个batch打印
+            unique_vals = torch.unique(masks)
+            print(f"Training batch {batch_idx}: mask unique values = {unique_vals}")
+        
+        outputs = self(images)
         loss = self.joint_loss(outputs, masks)
 
         # outputs 已经是概率（由于 activation='softmax'）
@@ -380,13 +387,29 @@ class FITSDataset(Dataset):
         self.image_list = [os.path.join(image_dir, fid) for fid in self.ids]
         self.mask_list = []
         self.normalization_method = normalization_method  # 保存归一化方法
+        self.classes = classes if classes is not None else self.CLASSES
+        
+        # 定义从掩码文件中的实际像素值到模型类别索引（0, 1, 2...）的映射
+        # 这里的键是掩码中的值，值是模型期望的类别索引
+        # 暂时只使用有数据的类别，后续可以取消注释
+        self.class_mapping = {
+            0: 0,  # bkg
+            3: 1,  # chan_bright
+            4: 2,  # chan_dark
+            6: 3,  # point_random
+            7: 4,  # point_periodic
+            # 以下类别暂时无数据，注释掉以简化训练
+            # 5: 5,  # chan_complex (暂时无数据)
+            # 8: 6,  # point_block (暂时无数据)
+        }
+        print(f"Using class mapping: {self.class_mapping}")
         
         # 验证文件完整性
         valid_pairs = []
         for fid in self.ids:
             file_id = self.extract_id(fid)
             if file_id:
-                mask_path = os.path.join(mask_dir, f"mask_merged_{file_id}.png")
+                mask_path = os.path.join(mask_dir, f"mask_{file_id}.png")
                 image_path = os.path.join(image_dir, fid)
                 
                 # 检查文件是否存在且可读
@@ -412,11 +435,6 @@ class FITSDataset(Dataset):
         
         print(f"加载了 {len(valid_pairs)} 个有效的图像-掩码对")
 
-        # Read multi-class mask according to actual mask values from C code
-        # From mask.c: horizontal=1, point=5 (chan_rfi related commented out)
-        # Map to our classes: bkg=0 (background), chan_rfi=1 (horizontal), point_rfi=5 (point)
-        self.class_values = [0, 1, 5]  # 直接使用实际的mask编号
-        
         self.augmentation = augmentation
         self.preprocessing = preprocessing
 
@@ -471,7 +489,7 @@ class FITSDataset(Dataset):
         return scaled.astype(np.float32)
 
     @staticmethod
-    def compute_class_weights(image_dir, mask_dir, classes, num_samples=100):
+    def compute_class_weights(image_dir, mask_dir, classes, class_mapping, num_samples=100):
         """
         计算训练集的类别权重，用于平衡类别不平衡。
         
@@ -479,6 +497,7 @@ class FITSDataset(Dataset):
             image_dir: 图像目录路径
             mask_dir: 掩码目录路径
             classes: 类别列表
+            class_mapping: 从掩码值到类别索引的映射
             num_samples: 采样数量，避免加载所有数据
         
         Returns:
@@ -499,7 +518,8 @@ class FITSDataset(Dataset):
             if not file_id:
                 continue
                 
-            mask_path = os.path.join(mask_dir, f"mask_merged_{file_id}.png")
+            # 修正掩码文件名
+            mask_path = os.path.join(mask_dir, f"mask_{file_id}.png")
             if not os.path.exists(mask_path):
                 continue
             
@@ -507,18 +527,12 @@ class FITSDataset(Dataset):
             mask = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
             if mask is None:
                 continue
-            
-            # 调试：打印掩码的唯一值
-            # unique_vals = np.unique(mask)
-            # if len(unique_vals) > 0:
-            #     print(f"文件 {image_file} 的掩码唯一值: {unique_vals}")
-            
-            # 统计每个类别的像素数 - 使用实际的mask编号
-            # bkg=0 (background), chan_rfi=1 (horizontal), point_rfi=5 (point)
-            actual_class_values = [0, 1, 5]
-            for i, cls in enumerate(classes):
-                class_pixels = np.sum(mask == actual_class_values[i])
-                class_counts[i] += class_pixels
+
+            # 根据映射关系统计每个最终类别索引的像素数
+            for mask_val, class_idx in class_mapping.items():
+                if class_idx < len(classes):  # 确保索引在范围内
+                    class_pixels = np.sum(mask == mask_val)
+                    class_counts[class_idx] += class_pixels
             
             total_pixels += mask.size
         
@@ -529,13 +543,17 @@ class FITSDataset(Dataset):
             if count > 0:
                 weight = total_pixels / (count * len(classes))
             else:
-                weight = 1.0  # 避免除零
+                weight = 0.0  # 对于像素数为零的类别，权重设为0
             class_weights.append(weight)
         
         # 归一化权重，使其和为类别数
         class_weights = np.array(class_weights)
-        class_weights = class_weights * len(classes) / np.sum(class_weights)
-        
+        # 避免除以0
+        if np.sum(class_weights) > 0:
+            class_weights = class_weights * len(classes) / np.sum(class_weights)
+        else:
+            class_weights = np.ones(len(classes))
+
         print(f"类别像素分布: {dict(zip(classes, class_counts.astype(int)))}")
         print(f"计算的类别权重: {class_weights}")
         
@@ -573,17 +591,18 @@ class FITSDataset(Dataset):
             # 1. 加载原始FITS图像 (未归一化)
             raw_image = FITSDataset.load_fits_image(self.image_list[i])
 
-            # 2. 加载掩码
-            masks = cv2.imread(self.mask_list[i], cv2.IMREAD_UNCHANGED)
+            # 2. 加载原始掩码
+            raw_mask = cv2.imread(self.mask_list[i], cv2.IMREAD_UNCHANGED)
+            if raw_mask is None:
+                raise IOError(f"无法读取掩码文件: {self.mask_list[i]}")
 
-            # 3. 使用基于全图均值与±5σ的归一化（无标签依赖）
+            # 3. 创建一个新的掩码，用于存放映射后的类别索引
+            mask_labels = np.zeros_like(raw_mask, dtype=np.uint8)
+            for mask_val, class_idx in self.class_mapping.items():
+                mask_labels[raw_mask == mask_val] = class_idx
+
+            # 4. 使用基于全图均值与±5σ的归一化（无标签依赖）
             image = FITSDataset.normalize_image_mean_std(raw_image, k=5.0)
-
-            # 4. 创建用于训练的标签掩码
-            mask_labels = np.zeros(masks.shape[:2], dtype=np.uint8)
-            if self.class_values:
-                for idx, cls_val in enumerate(self.class_values):
-                    mask_labels[masks == cls_val] = idx
 
             # 5. 应用数据增强
             if self.augmentation:
@@ -639,6 +658,9 @@ def get_stable_training_augmentation():
         
         # 模糊 - 模拟分辨率变化
         albu.GaussianBlur(blur_limit=(1, 2), p=0.2),
+
+        # 确保mask保持为整数类型
+        albu.Lambda(mask=lambda x, **kwargs: x.astype(np.uint8)),
     ]
     return albu.Compose(train_transform)
 
@@ -796,7 +818,8 @@ if __name__ == "__main__":
     # 解析命令行参数
     print("📋 解析命令行参数...")
     # ...existing code...
-    dataset_top_dir = "/home/cbm/deRFI/Datasets/Dataset_G200.48+2.54_5978_2classes_NoSubMed_ThreshCorrected"
+    # dataset_top_dir = "/home/cbm/deRFI/Datasets/Dataset_G200.48+2.54_5978_2classes_NoSubMed_ThreshCorrected"
+    dataset_top_dir = "/home/cbm/deRFI/Datasets/Dataset_Simulation_5000+1000_6classes"
     image_dir = os.path.join(dataset_top_dir, "image")
     mask_dir = os.path.join(dataset_top_dir, "mask")
 
@@ -810,10 +833,13 @@ if __name__ == "__main__":
     # 模型架构
     ENCODER = "mit_b2"  # 使用稍大一点的Transformer-based encoder: Mix Transformer B2
     # 数据集配置
-    CLASSES = ["bkg", "chan_rfi", "point_rfi"]  # 对应mask编号: 0, 1, 5
+    # CLASSES = ["bkg", "chan_rfi", "point_rfi"]  # 对应mask编号: 0, 1, 5
+    # CLASSES = ["bkg", "chan_bright", "chan_dark", "chan_complex", "point_random", "point_periodic", "point_block"]  # 完整类别，后续添加缺失类别时取消注释
+    # 暂时只使用有数据的类别，后续可以取消注释添加缺失类别
+    CLASSES = ["bkg", "chan_bright", "chan_dark", "point_random", "point_periodic"]
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     # 训练参数 - RTX 4060 Laptop 8GB 优化配置
-    LEARNING_RATE = 1e-4
+    LEARNING_RATE = 1e-5  # 降低学习率以提高稳定性
     BATCH_SIZE = 6  # RTX 4060 Laptop 8GB: 减小到6以节省显存
     NUM_WORKERS = min(8, os.cpu_count() or 8)  # 减少worker避免CPU瓶颈
     MAX_EPOCHS = 100
@@ -851,7 +877,13 @@ if __name__ == "__main__":
 
     # 计算类别权重
     print("⚖️ 计算类别权重...")
-    class_weights = FITSDataset.compute_class_weights(train_image_dir, train_mask_dir, CLASSES, num_samples=50)
+    class_weights = FITSDataset.compute_class_weights(
+        train_image_dir, 
+        train_mask_dir, 
+        CLASSES, 
+        class_mapping=train_dataset.class_mapping,  # 传递映射关系
+        num_samples=50
+    )
 
     val_dataset = FITSDataset(
         val_image_dir,

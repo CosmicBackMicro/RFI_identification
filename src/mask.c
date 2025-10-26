@@ -89,6 +89,7 @@ void logicalOR(int *globalMask, const int *mask, int nsamp, int nchan)
     for (int idx = 0; idx < total; idx++) {
         if (mask[idx]) globalMask[idx] = 1;
     }
+
 }
 
 void writeAllMasksPNG(const IdentNSigmaMasks *masks, int nsamp, int nchan,

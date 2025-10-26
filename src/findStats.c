@@ -26,6 +26,9 @@ float percentile(const float *arr, int m, float p) {
 
 #define ELEM_SWAP(a,b) { register float t=(a);(a)=(b);(b)=t; }
 
+/*
+ * Median selection (Wirth/Hoare-style). In-place, returns lower median for even n.
+ */
 float median(float *arr, int n)
 {
     int low, high;
@@ -127,6 +130,42 @@ float stdFromMedian(float *arr, int n) {
     
     float mean_squared_dev = sum_squared_dev / n;
     return sqrtf(mean_squared_dev);
+}
+
+// Compute standard deviation from a provided median (no extra allocations)
+float stdFromKnownMedian(const float *arr, int n, float median_value) {
+    if (n <= 1) return 0.0f;
+    double sum_sq = 0.0; // use double accumulator for better precision
+    for (int i = 0; i < n; ++i) {
+        float d = arr[i] - median_value;
+        sum_sq += (double)d * (double)d;
+    }
+    return (float)sqrt(sum_sq / (double)n);
+}
+
+// Compute both median (lower-median for even n) and STD from that median in one function.
+// This reorders 'arr' in-place (same behavior as median()).
+void findMedianStd(float *arr, int n, float *outMedian, float *outStd)
+{
+    if (!outMedian || !outStd) return;
+    if (n <= 0) {
+        *outMedian = 0.0f;
+        *outStd = 0.0f;
+        return;
+    }
+    if (n == 1) {
+        *outMedian = arr[0];
+        *outStd = 0.0f;
+        return;
+    }
+    float m = median(arr, n);
+    double sum_sq = 0.0;
+    for (int i = 0; i < n; ++i) {
+        double d = (double)arr[i] - (double)m;
+        sum_sq += d * d;
+    }
+    *outMedian = m;
+    *outStd = (float)sqrt(sum_sq / (double)n);
 }
 
 #undef ELEM_SWAP

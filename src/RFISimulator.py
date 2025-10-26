@@ -382,6 +382,7 @@ def save_image_mask(data: np.ndarray, mask: np.ndarray, fits_path: str, mask_png
         from PIL import Image
         # 转置回原始 (nsamp, nchan) 布局 -> PNG 期望 (width, height) 对应 (nchan, nsamp)
         mask_img = (mask.T).astype(np.uint8)
+        mask_img = np.flipud(mask_img)
         # 直接保存灰度图（每个像素为类标）。如果你想使用调色板，可在这里添加 palette 支持。
         im = Image.fromarray(mask_img, mode='L')
         im.save(mask_png_path, format='PNG')
@@ -389,7 +390,9 @@ def save_image_mask(data: np.ndarray, mask: np.ndarray, fits_path: str, mask_png
     except Exception:
         # 回退到 matplotlib 的 imsave（不会有轴或标题）
         import matplotlib.image as mpimg
-        mpimg.imsave(mask_png_path, mask.T, cmap='gray', vmin=0, vmax=8)
+        # 对mask进行垂直翻转，以匹配FITS图像加载后的方向
+        flipped_mask = np.flipud(mask)
+        mpimg.imsave(mask_png_path, flipped_mask.T, cmap='gray', vmin=0, vmax=8)
         print(f"Raw mask PNG saved (matplotlib): {mask_png_path}")
 
 
@@ -475,7 +478,7 @@ def generate_single_sample(args):
 
 def main():
     # === 批量生成参数 ===
-    num_samples = 1000
+    num_samples = 6000
     base_seed = 98765 # 哼！哼！哼！啊啊啊啊啊啊
     plot_interval = 50  # 每50个样本绘制一张图
     
@@ -496,9 +499,9 @@ def main():
         current_seed = base_seed + i
         
         # 为每个样本创建唯一的文件名
-        plot_out = f'{output_dir}/plot_{i+5000}.png'
-        fits_out = f'{output_dir}/data_{i+5000}.fits'
-        mask_png_out = f'{output_dir}/mask_{i+5000}.png'
+        plot_out = f'{output_dir}/plot_{i}.png'
+        fits_out = f'{output_dir}/data_{i}.fits'
+        mask_png_out = f'{output_dir}/mask_{i}.png'
 
         # 控制是否绘图
         do_plot = (i % plot_interval == 0)

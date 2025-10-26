@@ -472,32 +472,56 @@ float ksigma_1d(float *data, int n, int bins, float *hist, float *x_val, float *
     }
 }
 
-float ksigma_2d(const float *dataT, const int *mask_chanRFI, int nsamp, int nchan)
+/*
+ * ksigma_2d: estimate sigma by flattening unmasked data and calling ksigma_1d.
+ * To avoid repeated large heap allocations, caller may provide two pre-allocated
+ * buffers: `unmasked_buf` (length at least nsamp*nchan) and `median_temp_buf`
+ * (length at least nsamp*nchan). If either is NULL, function will allocate/free
+ * locally as before.
+ */
+float ksigma_2d(const float *dataT, const int *mask_chanRFI, int nsamp, int nchan,
+                float *unmasked_buf, float *median_temp_buf)
 {
-    // Flatten the unmasked data
     int i;
     int total_size = nsamp * nchan;
-    float *unmasked_data = (float *)malloc(total_size * sizeof(float));
+
+    /* prepare unmasked buffer (either caller-provided or locally allocated) */
+    float *unmasked_data = unmasked_buf;
+    int allocated_local_unmasked = 0;
+    if (!unmasked_data) {
+        unmasked_data = (float *)malloc(total_size * sizeof(float));
+        if (!unmasked_data) return 0.0f;
+        allocated_local_unmasked = 1;
+    }
+
     int unmasked_count = 0;
-    for (i = 0; i < total_size; i++)
-    {
-        if (mask_chanRFI == NULL || mask_chanRFI[i] == 0)
-        {
+    for (i = 0; i < total_size; i++) {
+        if (mask_chanRFI == NULL || mask_chanRFI[i] == 0) {
             unmasked_data[unmasked_count++] = dataT[i];
         }
     }
 
-    // Use `ksigma_1d` on the flattened array
-    int bins = 50; // Number of bins for histogram
-    float *hist = (float *)calloc(bins, sizeof(float));
-    float *x_val = (float *)malloc(bins * sizeof(float));
-    float *median_temp = (float *)malloc(unmasked_count * sizeof(float));
+    /* Use `ksigma_1d` on the flattened array */
+    int bins = 50; /* small; safe on stack */
+    float hist[bins];
+    float x_val[bins];
+    memset(hist, 0, sizeof(hist));
+
+    float *median_temp = median_temp_buf;
+    int allocated_local_mtemp = 0;
+    if (!median_temp) {
+        median_temp = (float *)malloc((unmasked_count > 0 ? unmasked_count : 1) * sizeof(float));
+        if (!median_temp) {
+            if (allocated_local_unmasked) free(unmasked_data);
+            return 0.0f;
+        }
+        allocated_local_mtemp = 1;
+    }
+
     float sigma = ksigma_1d(unmasked_data, unmasked_count, bins, hist, x_val, median_temp);
-    
-    free(unmasked_data);
-    free(hist);
-    free(x_val);
-    free(median_temp);
+
+    if (allocated_local_unmasked) free(unmasked_data);
+    if (allocated_local_mtemp) free(median_temp);
     return sigma;
 }
 
@@ -586,11 +610,14 @@ void sumthreshold_2d(
     // Determine max dimension needed
     int max_dim = (nsamp > nchan) ? nsamp : nchan;
     
-    // Allocate reusable buffers
-    float *temp_data_1d = (float*)malloc(max_dim * sizeof(float));
-    int *local_mask_1d = (int*)malloc(max_dim * sizeof(int));
-    float *M = (float*)malloc(M_len * sizeof(float));
-    float *chi_i = (float*)malloc(M_len * sizeof(float));
+     // Allocate reusable buffers
+     float *temp_data_1d = (float*)malloc(max_dim * sizeof(float));
+     int *local_mask_1d = (int*)malloc(max_dim * sizeof(int));
+     /* Small arrays used as parameters to the 1D routine: allocate on stack (VLA)
+         to avoid frequent malloc/free. M_len is expected to be small (few elements).
+         These decay to pointers when passed to functions. */
+     float M[M_len];
+     float chi_i[M_len];
     
     // Original 2D buffers
     float *temp_dataT = (float *)malloc(nsamp * nchan * sizeof(float));
@@ -621,7 +648,8 @@ void sumthreshold_2d(
     
     // Pre-compute Gaussian kernel for time axis (sigma_m)
     int half_kernel_m = kernel_m / 2;
-    float *gaussian_kernel_m = (float *)malloc(kernel_m * sizeof(float));
+    /* Gaussian kernel is small (kernel_m typically ~40) — allocate on stack */
+    float gaussian_kernel_m[kernel_m];
     float kernel_sum_m = 0.0f;
     for (int k = 0; k < kernel_m; k++) {
         int offset = k - half_kernel_m;
@@ -651,7 +679,7 @@ void sumthreshold_2d(
         }
     }
     
-    free(gaussian_kernel_m);
+    /* gaussian_kernel_m is on the stack now, no free needed */
     
     // Use residual data for thresholding
     #pragma omp parallel for collapse(2)
@@ -664,7 +692,13 @@ void sumthreshold_2d(
     free(smoothed_data);
     
     // Calculate chi_1 after background removal
-    float chi_1 = timesOfSigma * ksigma_2d(temp_dataT, mask_chanRFI, nsamp, nchan);
+    /* Allocate buffers once and pass into ksigma_2d to avoid large per-call allocs */
+    float *ksigma_unmasked = (float *)malloc(nsamp * nchan * sizeof(float));
+    float *ksigma_mtemp = (float *)malloc(nsamp * nchan * sizeof(float));
+    float chi_1 = timesOfSigma * ksigma_2d(temp_dataT, mask_chanRFI, nsamp, nchan,
+                                           ksigma_unmasked, ksigma_mtemp);
+    free(ksigma_unmasked);
+    free(ksigma_mtemp);
 
     // Time-axis processing with optimized 1D
     #pragma omp parallel for
@@ -698,8 +732,7 @@ void sumthreshold_2d(
     free(transposed_data);
     free(temp_data_1d);
     free(local_mask_1d);
-    free(M);
-    free(chi_i);
+    /* M, chi_i and gaussian_kernel_m were allocated on the stack (VLA) */
 }
 
 // Function to randomly replace pixels of channels flagged in a 1D channel mask
@@ -710,10 +743,13 @@ void outChanSubstitution(float *data, const int *channelMask, const int *pointMa
 {
     int i, j;
 
+    /* Allocate source_values once and reuse across time samples to avoid
+       allocating/freeing in every iteration of the inner loop. */
+    float *source_values = (float*)malloc(nchan * sizeof(float));
+    if (!source_values) return;
+
     for (i = 0; i < nsamp; i++) {
         // For each time sample (column), collect values from unflagged channels (channelMask==0)
-        float *source_values = (float*)malloc(nchan * sizeof(float));
-        if (!source_values) return;
         int source_count = 0;
 
         for (j = 0; j < nchan; j++) {
@@ -740,9 +776,9 @@ void outChanSubstitution(float *data, const int *channelMask, const int *pointMa
                 }
             }
         }
-
-        free(source_values);
     }
+
+    free(source_values);
 }
 
 
@@ -959,11 +995,8 @@ void outChanDetection(float *data, int nsamp, int nchan, int *channelFlagged,
     
     while (iter < MAX_ITERATIONS && valid_count >= 3)
     {
-        // Calculate current median of channel standard deviations
-        current_median = median(valid_stds, valid_count);
-        
-        // Calculate standard deviation of channel standard deviations using stdFromMedian
-        current_std = stdFromMedian(valid_stds, valid_count);
+    // Calculate current median and std from that median in one pass
+    findMedianStd(valid_stds, valid_count, &current_median, &current_std);
         
         // Check convergence conditions after first iteration
         if (iter > 0) {
@@ -1632,11 +1665,8 @@ int inChanOutlierIter(float *data, int nsamp, float Nsigma,
     
     while (iter < MAX_ITERATIONS && valid_count >= 3 && !converged)
     {
-        // Calculate current median
-        current_median = median(median_temp, valid_count);
-        
-        // Calculate standard deviation from median (robust approach) using stdFromMedian
-        current_std = stdFromMedian(median_temp, valid_count);
+    // Calculate current median and std from that median in one pass
+    findMedianStd(median_temp, valid_count, &current_median, &current_std);
         
         // Check convergence conditions after first iteration
         if (iter > 0) {

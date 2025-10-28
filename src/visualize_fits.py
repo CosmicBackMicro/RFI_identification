@@ -26,8 +26,8 @@ def load_fits_image(fits_path):
     dat_offs = fits_data[0]["DAT_OFFS"]
     
     # 原地操作，减少内存分配
-    data += dat_offs[np.newaxis, :]  # 原地加法
     data *= dat_scl[np.newaxis, :]   # 原地乘法
+    data += dat_offs[np.newaxis, :]  # 原地加法
     
     # 合并转置和翻转操作
     image = np.flipud(data.T)
@@ -37,7 +37,7 @@ def load_fits_image(fits_path):
 def test_load_fits_image():
     """测试load_fits_image函数，直接可视化输出"""
     # 使用找到的FITS文件
-    fits_path = "/home/cbm/deRFI/output/G200.14+2.80_20251026_block3.fits"
+    fits_path = "/home/cbm/deRFI/output/G200.14+2.80_20251027_block0.fits"
     
     if not os.path.exists(fits_path):
         print(f"Test FITS file not found: {fits_path}")

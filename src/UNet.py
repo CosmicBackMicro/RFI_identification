@@ -577,9 +577,9 @@ class FITSDataset(Dataset):
         dat_scl = fits_data[0]["DAT_SCL"]
         dat_offs = fits_data[0]["DAT_OFFS"]
         
-        # 原地操作，减少内存分配
-        data += dat_offs[np.newaxis, :]  # 原地加法
-        data *= dat_scl[np.newaxis, :]   # 原地乘法
+        # 注意！！！是先乘后加！！！
+        data *= dat_scl[np.newaxis, :]
+        data += dat_offs[np.newaxis, :]
         
         # 合并转置和翻转操作
         image = np.flipud(data.T)

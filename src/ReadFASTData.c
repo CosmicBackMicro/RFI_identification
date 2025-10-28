@@ -548,11 +548,19 @@ void applyCompress(float *outData, unsigned char *target_data, int nchan, int ns
 
 void applyScaleOffset(float *data, float *scale, float *offset, int lenx, int nchanBinned) {
     int i, j;
-    #pragma omp parallel for collapse(2)
-    for (i = 0; i < nchanBinned; i++) {
-        for (j = 0; j < lenx; j++) {
-            data[j * nchanBinned + i] = 
-                data[j * nchanBinned + i] * scale[i] + offset[i];
+    /*
+     * Iterate over time samples (lenx) in the outer loop and channels in the
+     * inner loop so inner loop accesses are contiguous in memory
+     * (data + j*nchanBinned). Parallelize over time slices (j) to give each
+     * thread contiguous blocks to work on and enable inner-loop vectorization.
+     */
+    #pragma omp parallel for schedule(static)
+    for (j = 0; j < lenx; j++) {
+        float *row = data + (size_t)j * (size_t)nchanBinned;
+        /* hint to vectorize inner loop */
+        #pragma omp simd
+        for (i = 0; i < nchanBinned; i++) {
+            row[i] = row[i] * scale[i] + offset[i];
         }
     }
 }
@@ -820,6 +828,11 @@ int main(int argc, char *argv[])
         double loop_start = omp_get_wtime();
         printf("Processing block %d of %d, %d subints per block, %.3f%% done.\n", ii, numReads, blocksPerRead, (ii * 100.0f / numReads));
         
+        // Reset flaggedChans, finalMedian, and finalStd to avoid accumulation/residual data across loops
+        memset(flaggedChans, 0, nchanBinned * sizeof(int));
+        memset(finalMedian, 0, nsampBinned * nchanBinned * sizeof(float));
+        memset(finalStd, 0, nsampBinned * nchanBinned * sizeof(float));
+        
         // Read a raw data block of `blocksPerRead` subints with its scale and offset
         double read_start = omp_get_wtime();
         readRawBlock(fptr, ii, blocksPerRead, nchan, blockSize, scale, offset, outRawData, &fits_status);
@@ -879,36 +892,36 @@ int main(int argc, char *argv[])
             }
 
             // 在这里写出
-            {
-                // 设置固定的 scale 和 offset
-                float *scale_const = malloc(sizeof(float) * nchanBinned);
-                float *offset_const = malloc(sizeof(float) * nchanBinned);
-                for (int i = 0; i < nchanBinned; i++) {
-                    scale_const[i] = 1.0f;
-                    offset_const[i] = 0.0f;
-                }
+            // {
+            //     // 设置固定的 scale 和 offset
+            //     float *scale_const = malloc(sizeof(float) * nchanBinned);
+            //     float *offset_const = malloc(sizeof(float) * nchanBinned);
+            //     for (int i = 0; i < nchanBinned; i++) {
+            //         scale_const[i] = 1.0f;
+            //         offset_const[i] = 0.0f;
+            //     }
                 
-                // 压缩数据
-                // calcCompress(outDataT, nchanBinned, nsampBinned, scale_const, offset_const);
-                transpose(outDataT, nchanBinned, nsampBinned, outData);
-                // applyCompress(outData, outRawData, nchanBinned, nsampBinned, scale_const, offset_const);
+            //     // 压缩数据
+            //     // calcCompress(outDataT, nchanBinned, nsampBinned, scale_const, offset_const);
+            //     transpose(outDataT, nchanBinned, nsampBinned, outData);
+            //     // applyCompress(outData, outRawData, nchanBinned, nsampBinned, scale_const, offset_const);
                 
-                // 写出 FITS 数据集
-                writeFITSDataset(outRawData, scale_const, offset_const, nsampBinned, nchanBinned, ii, &m, &fits_status);
+            //     // 写出 FITS 数据集
+            //     writeFITSDataset(outRawData, scale_const, offset_const, nsampBinned, nchanBinned, ii, &m, &fits_status);
                 
-                // 释放内存
-                free(scale_const);
-                free(offset_const);
-            }
+            //     // 释放内存
+            //     free(scale_const);
+            //     free(offset_const);
+            // }
 
-            if (m.plot)
-            {
-                cpgpage();
-                char text2[100];
-                snprintf(text2, sizeof(text2), "Result after subtracting channel median");
-                cpgmtxt("T", 3.5, 0.5, 0.5, text2);
-                plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, NULL, NULL);
-            }
+            // if (m.plot)
+            // {
+            //     cpgpage();
+            //     char text2[100];
+            //     snprintf(text2, sizeof(text2), "Result after subtracting channel median");
+            //     cpgmtxt("T", 3.5, 0.5, 0.5, text2);
+            //     plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, NULL, NULL);
+            // }
 
             // =====================Channel IQR + IQRM（合并，一次可视化，封装调用）============================
             // {
@@ -1075,9 +1088,9 @@ int main(int argc, char *argv[])
                 }    
             }
 
-            // if (writeDastset) {
-            //     writeFITSDataset(outRawData, scaleBinned, offsetBinned, nsampBinned, nchanBinned, ii, &m, &fits_status);
-            // }
+            if (writeDastset) {
+                writeFITSDataset(outRawData, scaleBinned, offsetBinned, nsampBinned, nchanBinned, ii, &m, &fits_status);
+            }
             double write_time = omp_get_wtime() - write_start;
             printf("Write operations time: %.4f seconds\n", write_time);
         }

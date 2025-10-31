@@ -10,13 +10,13 @@ void clearIdentNSigmaMasks(IdentNSigmaMasks *m, int nsamp, int nchan);
 // - expandChannelMask: expand 1D channel flags to 2D mask (whole channel to 1)
 // - logicalOR: element-wise OR from mask into globalMask
 
-void writeIndexMaskPNG(int *mask, int nsamp, int nchan, char *filename);
+void writeIndexMaskPNG(const bool *mask, int nsamp, int nchan, char *filename);
 
 void mergeMask2D(int *masks[], int nmasks, int nsamp, int nchan, int *result);
 
-void expandChannelMask(const int *channelFlagged, int *mask2D, int nsamp, int nchan);
+void expandChannelMask(const int *channelFlagged, bool *mask2D, int nsamp, int nchan);
 
-void logicalOR(int *globalMask, const int *mask, int nsamp, int nchan);
+void logicalOR(bool *globalMask, const bool *mask, int nsamp, int nchan);
 
 // Convenience API: write all masks in IdentNSigmaMasks to PNGs with consistent naming
 // Filenames will be written to: `${datasetPath}mask_<name>_<index>.png`

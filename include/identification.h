@@ -1,5 +1,5 @@
 #pragma once
-
+#include <stdbool.h>
 void sumthreshold_2d(
     const float *dataT, 
     int nsamp, 
@@ -30,31 +30,27 @@ void outChanDetection(float *data, int nsamp, int nchan, int *channelFlagged,
 int meanOutlierDetection(float *data, int nsamp, int nchan, int *channelFlagged);
 
 
-void subtractChannelMedians(float *data, int nsamp, int nchan);
+void subChanMed(float *data, int nsamp, int nchan, float *channel_medians, float *temp_data);
 
 typedef struct IdentNSigmaMasks {
-    int *horizontalMask;
-    int *verticalMask;
-    int *globalMask;
-    int *pointMask;
-    int *chanBrightMask;
-    int *chanDarkMask;
-    int *chanComplexMask;
+    bool *horizontalMask;
+    bool *verticalMask;
+    bool *globalMask;
+    bool *pointMask;
+    bool *chanBrightMask;
+    bool *chanDarkMask;
+    bool *chanComplexMask;
 } IdentNSigmaMasks;
 
 void identSubstNSigma(
     float *data, int nsamp, int nchan,
     float NSigmaInChan, float NSigmaOutChan, int iterationIndex, int plot,
     IdentNSigmaMasks *masks,
-    float *finalMedian, float *finalStd, int cudaReady, int *flaggedChans);
+    float *finalMedian, float *finalStd, int cudaReady, int *flaggedChans,
+    int *identSubst_goodSamps, int *identSubst_randIdxs, float *identSubst_medTemp);
 
 // Histogram functions
 // OutChannel comparison histogram function
 void drawOutChannelComparisonHist(float *initial_stats, float *final_stats, int nchan, 
-                                  int use_mad, int initial_flagged_count, int final_flagged_count,
+                                  int initial_flagged_count, int final_flagged_count,
                                   int iterations, float nsigma_out, float nsigma_in);
-
-// New consistent-shape version (keeps initial histogram shape fixed)
-void drawOutChannelComparisonHist_new(float *initial_stats, float *final_stats, int nchan,
-                                      int use_mad, int initial_flagged_count, int final_flagged_count,
-                                      int iterations, float nsigma_out, float nsigma_in);

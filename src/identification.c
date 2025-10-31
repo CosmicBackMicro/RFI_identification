@@ -28,7 +28,7 @@
 #define PI 3.14159265358979323846
 #endif
 
-int eraseIsolatedPixels(int *mask, int width, int height, int N)
+int eraseIsolatedPixels(bool *restrict mask, int width, int height, int N)
 {
     if (!mask || width <= 0 || height <= 0) {
         return 0;
@@ -44,7 +44,6 @@ int eraseIsolatedPixels(int *mask, int width, int height, int N)
         N = (min_wh % 2 == 1) ? min_wh : (min_wh - 1);
         if (N < 1) N = 1;
     }
-    const size_t pixels = (size_t)W * (size_t)H;
 
     // Build a padded integral image S of size (H+1) x (W+1), zero-initialized
     const int SW = W + 1;
@@ -63,19 +62,13 @@ int eraseIsolatedPixels(int *mask, int width, int height, int N)
         }
     }
 
-    // Work buffer marking isolated pixels
-    unsigned char *to_zero = (unsigned char *)calloc(pixels, sizeof(unsigned char));
-    if (!to_zero) {
-        free(S);
-        return 0;
-    }
-
     const int half = N / 2;
     int suppressed = 0;
+    #pragma omp parallel for reduction(+:suppressed) schedule(static)
     for (int y = 0; y < H; ++y) {
         for (int x = 0; x < W; ++x) {
             const int idx = y * W + x;
-            if (mask[idx] == 0) continue;
+            if (!mask[idx]) continue;
 
             int x0 = x - half; if (x0 < 0) x0 = 0;
             int y0 = y - half; if (y0 < 0) y0 = 0;
@@ -90,18 +83,13 @@ int eraseIsolatedPixels(int *mask, int width, int height, int N)
                                  - S[Y1 * SW + X0]
                                  + S[Y0 * SW + X0] );
             if (sum == 1) {
-                to_zero[idx] = 1u;
+                mask[idx] = false;
                 ++suppressed;
             }
         }
     }
 
-    for (int i = 0; i < (int)pixels; ++i) {
-        if (to_zero[i]) mask[i] = 0;
-    }
-
     free(S);
-    free(to_zero);
     return suppressed;
 }
 
@@ -114,7 +102,7 @@ int eraseIsolatedPixels(int *mask, int width, int height, int N)
  *
  * Returns the count of newly activated pixels compared to the original mask.
  */
-int dilateMask(int *mask, int width, int height, int radius, int iterations)
+int dilateMask(bool *restrict mask, int width, int height, int radius, int iterations)
 {
     if (!mask || width <= 0 || height <= 0) {
         return 0;
@@ -123,25 +111,24 @@ int dilateMask(int *mask, int width, int height, int radius, int iterations)
     if (iterations < 1) iterations = 1;
 
     const size_t total = (size_t)width * (size_t)height;
-    int *src = (int *)malloc(total * sizeof(int));
-    int *dst = (int *)malloc(total * sizeof(int));
+    bool *src = (bool *)malloc(total * sizeof(bool));
+    bool *dst = (bool *)malloc(total * sizeof(bool));
     if (!src || !dst) {
         free(src);
         free(dst);
         return 0;
     }
 
-    for (size_t i = 0; i < total; ++i) {
-        src[i] = (mask[i] != 0) ? 1 : 0;
-    }
+    // Copy input mask to src
+    memcpy(src, mask, total * sizeof(bool));
 
     for (int iter = 0; iter < iterations; ++iter) {
-        memset(dst, 0, total * sizeof(int));
+        memset(dst, 0, total * sizeof(bool));
 
         for (int y = 0; y < height; ++y) {
             const int row_off = y * width;
             for (int x = 0; x < width; ++x) {
-                if (src[row_off + x] == 0) {
+                if (!src[row_off + x]) {
                     continue;
                 }
                 const int y_min = (y - radius < 0) ? 0 : (y - radius);
@@ -152,7 +139,7 @@ int dilateMask(int *mask, int width, int height, int radius, int iterations)
                     const int base = ny * width;
                     for (int nx = x_min; nx <= x_max; ++nx) {
                         if (abs(nx - x) + abs(ny - y) <= radius) {
-                            dst[base + nx] = 1;
+                            dst[base + nx] = true;
                         }
                     }
                 }
@@ -160,19 +147,19 @@ int dilateMask(int *mask, int width, int height, int radius, int iterations)
         }
 
         if (iter + 1 < iterations) {
-            int *tmp = src;
+            bool *tmp = src;
             src = dst;
             dst = tmp;
         }
     }
 
     int newly_activated = 0;
-    int *final_mask = dst; // dst holds the latest result after the loop
+    bool *final_mask = dst; // dst holds the latest result after the loop
     for (size_t i = 0; i < total; ++i) {
-        if (final_mask[i] && mask[i] == 0) {
+        if (final_mask[i] && !mask[i]) {
             ++newly_activated;
         }
-        mask[i] = final_mask[i] ? 1 : 0;
+        mask[i] = final_mask[i];
     }
 
     free(src);
@@ -353,39 +340,63 @@ int gsl_gaussian_fit(float *x, float *y, int n, float fixed_amplitude,
     return success;
 }
 
-/**
- * Subtract the median value from each frequency channel
- * @param data: Input data array (nsamp * nchan)
- * @param nsamp: Number of time samples per channel
- * @param nchan: Number of frequency channels
- */
-void subtractChannelMedians(float *data, int nsamp, int nchan)
+void subChanMed(float *data, int nsamp, int nchan, float *channel_medians, float *temp_data)
 {
     printf("=== Subtracting channel medians from data ===\n");
-    
-    float *channel_medians = (float *)malloc(nchan * sizeof(float));
-    float *temp_data = (float *)malloc(nsamp * sizeof(float));
-    
-    // Calculate median for each channel
-    int i, j;
-    for (i = 0; i < nchan; i++) {
-        // Copy channel data for median calculation
-        memcpy(temp_data, data + i * nsamp, nsamp * sizeof(float));
-        channel_medians[i] = median(temp_data, nsamp);
+
+    if (nchan <= 0 || nsamp <= 0) {
+        printf("Channel median subtraction completed for %d channels\n", nchan);
+        return;
     }
-    
-    // Subtract median from each channel
-    for (i = 0; i < nchan; i++) {
-        for (j = 0; j < nsamp; j++) {
-            data[i * nsamp + j] -= channel_medians[i];
+
+    // 1) Compute per-channel median. Prefer parallel execution with per-thread scratch.
+    int nthreads = omp_get_max_threads();
+    float **thread_bufs = (float**)malloc((size_t)nthreads * sizeof(float*));
+    int alloc_ok = (thread_bufs != NULL);
+    if (alloc_ok) {
+        for (int t = 0; t < nthreads; ++t) {
+            thread_bufs[t] = (float*)malloc((size_t)nsamp * sizeof(float));
+            if (!thread_bufs[t]) {
+                alloc_ok = 0;
+                // cleanup partially allocated
+                for (int k = 0; k < t; ++k) free(thread_bufs[k]);
+                free(thread_bufs);
+                thread_bufs = NULL;
+                break;
+            }
         }
     }
-    
+
+    if (alloc_ok && thread_bufs) {
+        #pragma omp parallel for schedule(static)
+        for (int i = 0; i < nchan; i++) {
+            int tid = omp_get_thread_num();
+            float *tmp = thread_bufs[tid];
+            // Copy channel data for median calculation (median() reorders data)
+            memcpy(tmp, data + (size_t)i * nsamp, (size_t)nsamp * sizeof(float));
+            channel_medians[i] = median(tmp, nsamp);
+        }
+        for (int t = 0; t < nthreads; ++t) free(thread_bufs[t]);
+        free(thread_bufs);
+    } else {
+        // Fallback: serial computation using caller-provided temp_data
+        for (int i = 0; i < nchan; i++) {
+            memcpy(temp_data, data + (size_t)i * nsamp, (size_t)nsamp * sizeof(float));
+            channel_medians[i] = median(temp_data, nsamp);
+        }
+    }
+
+    // 2) Subtract median from each channel (safe to parallelize; each channel slice is independent)
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < nchan; i++) {
+        const float med = channel_medians[i];
+        float *row = data + (size_t)i * nsamp;
+        for (int j = 0; j < nsamp; j++) {
+            row[j] -= med;
+        }
+    }
+
     printf("Channel median subtraction completed for %d channels\n", nchan);
-    
-    // Clean up temporary arrays
-    free(channel_medians);
-    free(temp_data);
 }
 
 float ksigma_1d(float *data, int n, int bins, float *hist, float *x_val, float *median_temp)
@@ -948,6 +959,10 @@ void outChanDetection(float *data, int nsamp, int nchan, int *channelFlagged,
     
     // Save initial channel statistics for comparison
     float *initial_channel_stds = (float *)malloc(nchan * sizeof(float));
+    if (!initial_channel_stds) {
+        fprintf(stderr, "Memory allocation failed for initial_channel_stds in outChanDetection\n");
+        return;
+    }
     int initial_flagged_count = 0;
     
     // Count initially flagged channels
@@ -1049,44 +1064,6 @@ void outChanDetection(float *data, int nsamp, int nchan, int *channelFlagged,
         iter++;
     }
     
-    // === 特别保底循环：如果 median 和 fitted_mu 距离 > fitted_sigma，判定为严重漏检 ===
-    // if (fabsf(current_median - fitted_mu) > 0.3f * fitted_sigma) {
-    //     printf(" [FALLBACK] Severe under-detection detected (median=%.4f, mu=%.4f, sigma=%.4f), entering fallback loop\n", 
-    //            current_median, fitted_mu, fitted_sigma);
-    //     
-    //     float fallback_threshold = channel_std_threshold;
-    //     int fallback_iter = 0;
-    //     const int MAX_FALLBACK_ITER = 20;  // 防止无限循环
-    //     
-    //     while (fallback_iter < MAX_FALLBACK_ITER) {
-    //         fallback_threshold -= 0.05f;  // 以0.05步长降低阈值
-    //         if (fallback_threshold <= 0.0f) break;  // 防止阈值过低
-    //         
-    //         // 重新计算界限
-    //         float upper_bound = current_median + fallback_threshold * current_std;
-    //         float lower_bound = current_median - fallback_threshold * current_std;
-    //         lower_bound = (lower_bound < 0) ? 0 : lower_bound;
-    //         
-    //         // 标记新异常
-    //         int new_outliers = 0;
-    //         for (i = 0; i < nchan; i++) {
-    //             if (channel_mask[i] == 0 && (channel_stds[i] > upper_bound || channel_stds[i] < lower_bound)) {
-    //                 channel_mask[i] = 1;
-    //                 channelFlagged[i] = 1;
-    //                 new_outliers++;
-    //             }
-    //         }
-    //         
-    //         total_flagged += new_outliers;
-    //         printf(" [FALLBACK] iter=%d, threshold=%.3f, new_outliers=%d\n", fallback_iter, fallback_threshold, new_outliers);
-    //         
-    //         // 如果有新标记，停止保底循环
-    //         if (new_outliers > 0) break;
-    //         
-    //         fallback_iter++;
-    //     }
-    // }
-    
     // Count final flagged channels
     int final_flagged_count = 0;
     for (i = 0; i < nchan; i++) {
@@ -1124,8 +1101,8 @@ void outChanDetection(float *data, int nsamp, int nchan, int *channelFlagged,
     // Display comparison histogram if significant changes occurred and plotting is enabled
     if (total_flagged > 0 && plot) {
         printf("\n=== Displaying outChannel Detection Comparison ===\n");
-        drawOutChannelComparisonHist_new(initial_channel_stds, final_channel_stds, nchan, 
-                      0, initial_flagged_count, final_flagged_count, iter, channel_std_threshold, nsigma_in); // Using STD (0)
+        drawOutChannelComparisonHist(initial_channel_stds, final_channel_stds, nchan,
+              initial_flagged_count, final_flagged_count, iter, channel_std_threshold, nsigma_in);
         printf("=== OutChannel Comparison Complete ===\n");
     }
     
@@ -1138,21 +1115,30 @@ void outChanDetection(float *data, int nsamp, int nchan, int *channelFlagged,
 
 
 
-void drawChanStatHist(float *data, int nsamp, int nchan, int plot, int use_mad)
+void drawChanStatHist(float *data, int nsamp, int nchan, int plot)
 {
-    int i, j;
+    int i;
     
-    // Select appropriate statistical method
-    const char* stat_name = use_mad ? "MAD" : "STD";
-    const char* stat_symbol = use_mad ? "M" : "\\gs";
-    const char* stat_label = use_mad ? "Channel MAD M\\dj\\u" : "Channel STD \\gs\\dj\\u";
+    const char* stat_name = "STD";
+    const char* stat_symbol = "\\gs";
+    const char* stat_label = "Channel STD \\gs\\dj\\u";
     
     printf("\n=== %s Histogram Analysis ===\n", stat_name);
     
     // Allocate memory for channel statistics
     float *channel_stat = (float *)malloc(nchan * sizeof(float));
-    float *channel_median = (float *)malloc(nchan * sizeof(float));
-    float *temp_data = (float *)malloc(nsamp * sizeof(float));
+    if (!channel_stat) {
+        fprintf(stderr, "Memory allocation failed for channel_stat in drawChanStatHist\n");
+        return;
+    }
+     float *channel_median = (float *)malloc(nchan * sizeof(float));
+     /* temp_data is used both for per-channel sample buffers (nsamp) and
+         later as a workspace to hold nchan values (e.g. copying channel_stat
+         into it). Allocate the maximum of the two to avoid out-of-bounds
+         accesses when nchan > nsamp (observed when channel count grows).
+     */
+     int temp_len = (nsamp > nchan) ? nsamp : nchan;
+     float *temp_data = (float *)malloc((size_t)temp_len * sizeof(float));
     
     // Calculate statistics for each channel
     for (i = 0; i < nchan; i++)
@@ -1164,20 +1150,7 @@ void drawChanStatHist(float *data, int nsamp, int nchan, int plot, int use_mad)
         channel_median[i] = median(temp_data, nsamp);
         
         if (nsamp > 1) {
-            if (use_mad) {
-                // Calculate MAD (Mean Absolute Deviation from median)
-                float sum_abs_dev = 0.0f;
-                for (j = 0; j < nsamp; j++)
-                {
-                    float abs_dev = fabsf(data[i * nsamp + j] - channel_median[i]);
-                    temp_data[j] = abs_dev;
-                    sum_abs_dev += abs_dev;
-                }
-                channel_stat[i] = sum_abs_dev / nsamp;
-            } else {
-                // Calculate STD (Standard Deviation from median) using stdFromMedian function
-                channel_stat[i] = stdFromMedian(data + i * nsamp, nsamp);
-            }
+            channel_stat[i] = stdFromMedian(data + i * nsamp, nsamp);
         } else {
             channel_stat[i] = 0.0f;
         }
@@ -1190,38 +1163,29 @@ void drawChanStatHist(float *data, int nsamp, int nchan, int plot, int use_mad)
     findMeanStd(channel_stat, nchan, &stat_mad, &stat_std); // Note: stat_mad here is actually mean
     
     // Calculate dispersion based on method (to match original functions exactly)
-    float dispersion_value;
-    if (use_mad) {
-        // For MAD: use MAD function exactly like original visualizeChannelMAD
-        // This calculates median of absolute deviations * 1.4826
-        dispersion_value = mad(channel_stat, nchan);
-        stat_mad = dispersion_value; // Keep stat_mad for display
-    } else {
-        // For STD: use median of absolute deviations (like original visualizeChannelStd)
-        for (i = 0; i < nchan; i++) {
-            temp_data[i] = fabsf(channel_stat[i] - stat_median);
-        }
-        dispersion_value = median(temp_data, nchan);
-        stat_mad = dispersion_value; // Update stat_mad to show the correct dispersion
+    for (i = 0; i < nchan; i++) {
+        temp_data[i] = fabsf(channel_stat[i] - stat_median);
     }
+    float dispersion_value = median(temp_data, nchan);
+    stat_mad = dispersion_value;
     
     // Print statistics in original format
-    if (use_mad) {
-        printf("=== Channel MAD M_j Statistics ===\n");
-        printf("Total channels: %d\n", nchan);
-        printf("MAD Mean: %.6f\n", stat_mad);   // stat_mad is actually the mean from findMeanStd
-        printf("MAD Std:  %.6f\n", stat_std);   // stat_std is the standard deviation from findMeanStd
-        printf("MAD Median: %.6f\n", stat_median);
-        printf("MAD MAD: %.6f\n", dispersion_value);
-    } else {
-        printf("\n=== Channel STD σ_j Statistics ===\n");
-        printf("Total channels: %d\n", nchan);
-        printf("STD Median: %.6f\n", stat_median);
-        printf("STD STD: %.6f\n", dispersion_value);
-    }
+    printf("\n=== Channel STD σ_j Statistics ===\n");
+    printf("Total channels: %d\n", nchan);
+    printf("STD Median: %.6f\n", stat_median);
+    printf("STD STD: %.6f\n", dispersion_value);
     
     if (!plot) {
         printf("%s histogram plotting disabled, skipping visualization.\n", stat_name);
+        free(channel_stat);
+        free(channel_median);
+        free(temp_data);
+        return;
+    }
+
+    // Ensure PGPLOT device available before any drawing
+    if (!ensure_pgplot_device(NULL)) {
+        printf("PGPLOT unavailable, skip visualization.\n");
         free(channel_stat);
         free(channel_median);
         free(temp_data);
@@ -1236,23 +1200,12 @@ void drawChanStatHist(float *data, int nsamp, int nchan, int plot, int use_mad)
     }
     
     // Print statistics in original format
-    if (use_mad) {
-        printf("=== Channel MAD M_j Statistics ===\n");
-        printf("Total channels: %d\n", nchan);
-        printf("MAD Mean: %.6f\n", stat_mad);   // stat_mad is actually the mean from findMeanStd
-        printf("MAD Std:  %.6f\n", stat_std);   // stat_std is the standard deviation from findMeanStd
-        printf("MAD Median: %.6f\n", stat_median);
-        printf("MAD MAD: %.6f\n", dispersion_value);
-        printf("MAD Min: %.6f\n", stat_min);
-        printf("MAD Max: %.6f\n", stat_max);
-    } else {
-        printf("\n=== Channel STD σ_j Statistics ===\n");
-        printf("Total channels: %d\n", nchan);
-        printf("STD Median: %.6f\n", stat_median);
-        printf("STD STD: %.6f\n", dispersion_value);
-        printf("STD Min: %.6f\n", stat_min);
-        printf("STD Max: %.6f\n", stat_max);
-    }
+    printf("\n=== Channel STD σ_j Statistics ===\n");
+    printf("Total channels: %d\n", nchan);
+    printf("STD Median: %.6f\n", stat_median);
+    printf("STD STD: %.6f\n", dispersion_value);
+    printf("STD Min: %.6f\n", stat_min);
+    printf("STD Max: %.6f\n", stat_max);
     
     // Unified 11-threshold line system
     const int NUM_ALL_THRESHOLDS = 11;
@@ -1260,21 +1213,12 @@ void drawChanStatHist(float *data, int nsamp, int nchan, int plot, int use_mad)
     const char* all_threshold_labels[11];
     
     // Set labels based on statistical method
-    if (use_mad) {
-        const char* mad_labels[11] = {
-            "-5*MAD", "-4*MAD", "-3*MAD", "-2*MAD", "-1*MAD", 
-            "Median", 
-            "+1*MAD", "+2*MAD", "+3*MAD", "+4*MAD", "+5*MAD"
-        };
-        for (i = 0; i < 11; i++) all_threshold_labels[i] = mad_labels[i];
-    } else {
-        const char* std_labels[11] = {
-            "-5*STD", "-4*STD", "-3*STD", "-2*STD", "-1*STD",
-            "Median",
-            "1*STD", "2*STD", "3*STD", "4*STD", "5*STD"
-        };
-        for (i = 0; i < 11; i++) all_threshold_labels[i] = std_labels[i];
-    }
+    const char* std_labels[11] = {
+        "-5*STD", "-4*STD", "-3*STD", "-2*STD", "-1*STD",
+        "Median",
+        "1*STD", "2*STD", "3*STD", "4*STD", "5*STD"
+    };
+    for (i = 0; i < 11; i++) all_threshold_labels[i] = std_labels[i];
     
     const int all_threshold_colors[11] = {4, 7, 3, 8, 6, 1, 6, 8, 3, 7, 4};
     const float all_y_positions[11] = {0.15f, 0.25f, 0.35f, 0.45f, 0.75f, 0.65f, 0.85f, 0.90f, 1.05f, 1.00f, 0.95f};
@@ -1345,8 +1289,7 @@ void drawChanStatHist(float *data, int nsamp, int nchan, int plot, int use_mad)
     cpgsch(1.2);
     cpgswin(plot_min, plot_max, 0, max_count * 1.1f);
     cpgbox("BCNST", 0.0, 0, "BCNST", 0.0, 0);
-    cpglab(stat_label, "Number of Channels", 
-           use_mad ? "Channel MAD M\\dj\\u Distribution" : "Channel STD \\gs\\dj\\u Distribution");
+    cpglab(stat_label, "Number of Channels", "Channel STD \\gs\\dj\\u Distribution");
     printf("%s histogram axes set up complete\n", stat_name);
 
     // Draw solid histogram bars
@@ -1633,7 +1576,7 @@ void flagChannelsByDualSumThreshold(
  * @return Total number of outliers detected
  */
 int inChanOutlierIter(float *data, int nsamp, float Nsigma, 
-                                   int *mask, float *median_temp,
+                                   bool *mask, float *median_temp,
                                    int *good_samples, int *random_indices)
 {
     const int MAX_ITERATIONS = 15;   // Increased maximum iterations
@@ -1727,7 +1670,7 @@ int inChanOutlierIter(float *data, int nsamp, float Nsigma,
  * @return Total number of outliers detected across all channels
  */
 int inChanDetection(float *data, int nsamp, int nchan, float Nsigma,
-                               int *horizontalMask, int *channel_fully_flagged)
+    bool *horizontalMask, int *channel_fully_flagged)
 {
     int totalOutliers = 0;
     
@@ -1771,7 +1714,7 @@ int inChanDetection(float *data, int nsamp, int nchan, float Nsigma,
  * @param localRFISkipped Output: number of channels skipped due to localized RFI
  * @param totalFlaggedAfter Output: total flagged pixels after killThresh
  */
-void applyKillThresh(const int *pointMask, int *channelFlagged, int nsamp, int nchan, float killThresh, 
+void applyKillThresh(const bool *pointMask, int *channelFlagged, int nsamp, int nchan, float killThresh, 
                     int flaggedAfterSIR, int *killedChannels, int *localRFISkippedPtr, 
                     int *totalFlaggedAfter)
 {
@@ -1850,7 +1793,6 @@ void applyKillThresh(const int *pointMask, int *channelFlagged, int nsamp, int n
     printf("  - Flagged pixels after: %d/%d (%.2f%%)\n", *totalFlaggedAfter, nsamp*nchan, 
            (float)(*totalFlaggedAfter)/(nsamp*nchan)*100);
     printf("  - Additional pixels flagged: %d\n", *totalFlaggedAfter - flaggedAfterSIR);
-    printf("=== End killThresh Analysis ===\n\n");
 }
 
 /**
@@ -1921,7 +1863,7 @@ void inChanSubstitution(float *data, int *globalMask, int nsamp, int nchan, int 
  * @param darkMask Output mask for dark channels (set to 1 for entire dark flagged channels)
  * @param complexMask Output mask for complex channels (set to 1 for entire complex flagged channels)
  */
-void classifyChannels(float *data, int nsamp, int nchan, int *flaggedChans, int *brightMask, int *darkMask, int *complexMask) {
+void classifyChannels(float *data, int nsamp, int nchan, int *flaggedChans, bool *brightMask, bool *darkMask, bool *complexMask) {
     if (!(brightMask || darkMask || complexMask) || nchan <= 0 || !flaggedChans) return;
 
     const float eps = 1e-5f;
@@ -1962,7 +1904,7 @@ void classifyChannels(float *data, int nsamp, int nchan, int *flaggedChans, int 
         int end = idx - 1;
         int blockLen = end - start + 1;
 
-        int *targetMask = NULL;
+        bool *targetMask = NULL;
         if (blockLen <= 2) {
             float blockMean = blockSum / (float)blockLen;
             if (blockMean > overallChannelMean + eps && brightMask) {
@@ -2009,33 +1951,38 @@ void identSubstNSigma(
     float NSigmaInChan, float NSigmaOutChan,
     int iterationIndex, int plot,
     IdentNSigmaMasks *masks,
-    float *finalMedian, float *finalStd, int cudaReady, int *flaggedChans)
-{    
-    int *horizontalMask = masks->horizontalMask;
-    int *verticalMask = masks->verticalMask;
-    int *globalMask = masks->globalMask;
-    int *pointMask = masks->pointMask;
-    int *brightMask = masks->chanBrightMask;
-    int *darkMask = masks->chanDarkMask;
-    int *complexMask = masks->chanComplexMask;
+    float *finalMedian, float *finalStd, int cudaReady, int *flaggedChans,
+    int *identSubst_goodSamps, int *identSubst_randIdxs, float *identSubst_medTemp)
+{
+    bool *horizontalMask = masks->horizontalMask;
+    bool *verticalMask = masks->verticalMask;
+    bool *globalMask = masks->globalMask;
+    bool *pointMask = masks->pointMask;
+    bool *brightMask = masks->chanBrightMask;
+    bool *darkMask = masks->chanDarkMask;
+    bool *complexMask = masks->chanComplexMask;
 
     // 方案A: 每次调用开头清空 flaggedChans，避免跨迭代残留影响 killThresh 和后续逻辑
     if (flaggedChans) {
         memset(flaggedChans, 0, sizeof(int) * nchan);
     }
 
-    memset(horizontalMask, 0, nsamp * nchan * sizeof(int));
-    memset(verticalMask, 0, nsamp * nchan * sizeof(int));
-    memset(globalMask, 0, nsamp * nchan * sizeof(int));
-    memset(pointMask, 0, nsamp * nchan * sizeof(int));
-    memset(brightMask, 0, nsamp * nchan * sizeof(int));
-    memset(darkMask, 0, nsamp * nchan * sizeof(int));
-    memset(complexMask, 0, nsamp * nchan * sizeof(int));
+    memset(horizontalMask, 0, nsamp * nchan * sizeof(bool));
+    memset(verticalMask, 0, nsamp * nchan * sizeof(bool));
+    memset(globalMask, 0, nsamp * nchan * sizeof(bool));
+    memset(pointMask, 0, nsamp * nchan * sizeof(bool));
+    memset(brightMask, 0, nsamp * nchan * sizeof(bool));
+    memset(darkMask, 0, nsamp * nchan * sizeof(bool));
+    memset(complexMask, 0, nsamp * nchan * sizeof(bool));
 
-    int *good_samples = (int *)malloc(nsamp * sizeof(int));
-    int *random_indices = (int *)malloc(nsamp * sizeof(int));
-    float *median_temp = (float *)malloc(nsamp * nchan * sizeof(float));
-    memcpy(median_temp, data, nsamp * nchan * sizeof(float));
+    // Use external buffers to avoid per-iteration allocation
+    int *good_samples = identSubst_goodSamps;     // Reserved for substitution
+    int *random_indices = identSubst_randIdxs;    // Reserved for substitution
+    // (void)good_samples; (void)random_indices;
+    float *median_temp = identSubst_medTemp;
+    if (median_temp) {
+        memcpy(median_temp, data, (size_t)nsamp * (size_t)nchan * sizeof(float));
+    }
     
     float killThresh = 0.2f;
     int i;
@@ -2044,7 +1991,7 @@ void identSubstNSigma(
     if (plot)
     {
         printf("=== Generating Channel STD sigma_j Histogram (Iteration %d) ===\n", iterationIndex);
-        drawChanStatHist(data, nsamp, nchan, 1, 0);
+        drawChanStatHist(data, nsamp, nchan, 1);
         printf("=== STD sigma_j Histogram Complete ===\n");
     }
     
@@ -2064,7 +2011,7 @@ void identSubstNSigma(
     
     // === 2. inChannel Pixel Substitution ===
     double subst_start = omp_get_wtime();
-    int inChanPixelsSubstituted;
+    int inChanPixelsSubstituted = 0;  // Initialize to 0 since substitution is disabled
     // inChanSubstitution(data, pointMask, nsamp, nchan, &inChanPixelsSubstituted);
     double subst_time = omp_get_wtime() - subst_start;
     printf("inChannel substitution: replaced %d pixels (%.4f seconds)\n", inChanPixelsSubstituted, subst_time);
@@ -2081,7 +2028,7 @@ void identSubstNSigma(
     applyKillThresh(pointMask, flaggedChans, nsamp, nchan, killThresh, flaggedBeforeKillThresh,
                    &killedChannels, &localRFISkipped, &totalFlaggedAfter);
     double killthresh_time = omp_get_wtime() - killthresh_start;
-    printf("killThresh analysis completed (%.4f seconds)\n", killthresh_time);
+    printf("=== End killThresh Analysis (%.4fs) ===\n", killthresh_time);
     
     // === 4. outChannel Detection ===
     printf("=== Performing channel-level outlier detection ===\n");
@@ -2105,7 +2052,7 @@ void identSubstNSigma(
     for (i = 0; i < nchan; i++) if (flaggedChans[i]) flaggedChanCount++;
     if (flaggedChanCount > 0) {
         // outChanSubstitution(data, flaggedChans, pointMask, nsamp, nchan);
-        outChanPixelsSubstituted = flaggedChanCount * nsamp;
+        // outChanPixelsSubstituted = flaggedChanCount * nsamp;  // Disabled - no actual substitution performed
     }
     printf("outChannel substitution: replaced %d pixels\n", outChanPixelsSubstituted);
     
@@ -2158,430 +2105,22 @@ void identSubstNSigma(
     *finalStd = finalStd_temp;
 
 
-    // Clean up allocated memory
-    free(good_samples);
-    free(random_indices);
-    free(median_temp);
+    // Buffers are managed by caller
 
     printf("### DEBUG: identSubstNSigma exiting with finalMedian=%.6f, finalStd=%.6f ###\n", *finalMedian, *finalStd);
     fflush(stdout);  // Ensure immediate output
-}
-
-/**
- * @brief Draw comparison histograms showing before and after channel statistics
- * @param initial_stats Initial channel statistics before outChannel detection
- * @param final_stats Final channel statistics after outChannel detection
- * @param nchan Number of channels
- * @param use_mad Whether to use MAD (1) or STD (0) statistics
- * @param initial_flagged_count Number of initially flagged channels
- * @param final_flagged_count Number of finally flagged channels
- * @param iterations Number of iterations performed
- * @param nsigma_out NSigma threshold value used for outChannel detection (T_chan)
- * @param nsigma_in NSigma threshold value used for inChannel detection (T_point)
- */
-void drawOutChannelComparisonHist(float *initial_stats, float *final_stats, int nchan, 
-                                  int use_mad, int initial_flagged_count, int final_flagged_count,
-                                  int iterations, float nsigma_out, float nsigma_in)
-{
-    const char* stat_name = use_mad ? "MAD" : "STD";
-    const char* stat_label = use_mad ? "Channel MAD M\\dj\\u" : "Channel STD \\gs\\dj\\u";
-    
-    printf("\n=== OutChannel Comparison: %s Histogram Analysis ===\n", stat_name);
-    printf("Initial valid channels: %d/%d (%.1f%%)\n", 
-           nchan - initial_flagged_count, nchan, (float)(nchan - initial_flagged_count)/nchan*100);
-    printf("Final valid channels: %d/%d (%.1f%%)\n", 
-           nchan - final_flagged_count, nchan, (float)(nchan - final_flagged_count)/nchan*100);
-    printf("Flagged by outChannel: %d channels\n", final_flagged_count - initial_flagged_count);
-    
-    // Calculate statistics for both datasets
-    float *temp_data = (float *)malloc(nchan * sizeof(float));
-    
-    // Initial statistics
-    memcpy(temp_data, initial_stats, nchan * sizeof(float));
-    float initial_median = median(temp_data, nchan);
-    float initial_dispersion = use_mad ? mad(initial_stats, nchan) : stdFromMedian(initial_stats, nchan);
-    (void)initial_dispersion; // 当前版本未显示该值，如需展示可加入图例
-    
-    // Final statistics (only for non-flagged channels)
-    int valid_count = 0;
-    for (int i = 0; i < nchan; i++) {
-        if (final_stats[i] >= 0) { // Assuming negative values indicate flagged channels
-            temp_data[valid_count] = final_stats[i];
-            valid_count++;
-        }
-    }
-    
-    float final_median = 0.0f, final_dispersion = 0.0f;
-    if (valid_count > 0) {
-        final_median = median(temp_data, valid_count);
-        final_dispersion = use_mad ? mad(temp_data, valid_count) : stdFromMedian(temp_data, valid_count);
-    }
-    
-    printf("Initial - Median: %.6f, %s: %.6f\n", initial_median, stat_name, initial_dispersion);
-    printf("Final   - Median: %.6f, %s: %.6f (from %d valid channels)\n", 
-           final_median, stat_name, final_dispersion, valid_count);
-    
-    // Find overall min and max for consistent scaling
-    float overall_min = initial_stats[0], overall_max = initial_stats[0];
-    for (int i = 0; i < nchan; i++) {
-        if (initial_stats[i] < overall_min) overall_min = initial_stats[i];
-        if (initial_stats[i] > overall_max) overall_max = initial_stats[i];
-        if (final_stats[i] >= 0) { // Only consider non-flagged
-            if (final_stats[i] < overall_min) overall_min = final_stats[i];
-            if (final_stats[i] > overall_max) overall_max = final_stats[i];
-        }
-    }
-    
-    // Create histograms
-    int nbins = 100;  // Match drawChanStatHist bin count
-    float bin_width = (overall_max - overall_min) / nbins;
-    float *initial_hist = (float *)calloc(nbins, sizeof(float));
-    float *final_hist = (float *)calloc(nbins, sizeof(float));
-    
-    // Fill initial histogram
-    for (int i = 0; i < nchan; i++) {
-        int bin = (int)((initial_stats[i] - overall_min) / bin_width);
-        if (bin < 0) bin = 0;
-        if (bin >= nbins) bin = nbins - 1;
-        initial_hist[bin]++;
-    }
-    
-    // Fill final histogram (only non-flagged channels)
-    for (int i = 0; i < nchan; i++) {
-        if (final_stats[i] >= 0) { // Only non-flagged
-            int bin = (int)((final_stats[i] - overall_min) / bin_width);
-            if (bin < 0) bin = 0;
-            if (bin >= nbins) bin = nbins - 1;
-            final_hist[bin]++;
-        }
-    }
-    
-    // Find maximum count for scaling
-    float max_count = 0;
-    for (int i = 0; i < nbins; i++) {
-        if (initial_hist[i] > max_count) max_count = initial_hist[i];
-        if (final_hist[i] > max_count) max_count = final_hist[i];
-    }
-    
-    // Create comparison plot
-    printf("Creating outChannel comparison %s histogram...\n", stat_name);
-    cpgpage();
-    cpgvstd();
-    cpgsch(1.2);
-    cpgswin(overall_min, overall_max, 0, max_count * 1.1f);
-    cpgbox("BCNST", 0.0, 0, "BCNST", 0.0, 0);
-    
-    char title[200];
-    sprintf(title, "OutChannel Detection: %s Distribution Comparison", stat_name);
-    
-    // Use cpgmtxt for better positioning control - closer to plot
-    cpgmtxt("B", 2.0, 0.5, 0.5, stat_label);           // X-axis label closer
-    cpgmtxt("L", 2.0, 0.5, 0.5, "Number of Channels");  // Y-axis label closer  
-    cpgmtxt("T", 1.0, 0.5, 0.5, title);                 // Title much closer to plot
-    
-    // Draw initial histogram (semi-transparent outline)
-    cpgsci(3); // Green for initial
-    cpgsls(2); // Dashed line
-    for (int i = 0; i < nbins; i++) {
-        if (initial_hist[i] > 0) {
-            float x1 = overall_min + i * bin_width;
-            float x2 = overall_min + (i + 1) * bin_width;
-            float y = initial_hist[i];
-            // Draw outline
-            cpgmove(x1, 0);
-            cpgdraw(x1, y);
-            cpgdraw(x2, y);
-            cpgdraw(x2, 0);
-        }
-    }
-    
-    // Draw final histogram (solid bars)
-    cpgsci(2); // Red for final
-    cpgsls(1); // Solid line
-    for (int i = 0; i < nbins; i++) {
-        if (final_hist[i] > 0) {
-            float x1 = overall_min + i * bin_width;
-            float x2 = overall_min + (i + 1) * bin_width;
-            cpgrect(x1, x2, 0, final_hist[i]);
-        }
-    }
-    
-    // Draw threshold lines
-    cpgsci(1); // White
-    cpgmove(initial_median, 0);
-    cpgdraw(initial_median, max_count * 1.1f);
-    cpgptxt(initial_median, max_count * 0.9f, 0.0, 0.0, "Initial Median");
-    
-    if (valid_count > 0) {
-        cpgmove(final_median, 0);
-        cpgdraw(final_median, max_count * 1.1f);
-        cpgptxt(final_median, max_count * 0.8f, 0.0, 0.0, "Final Median");
-    }
-    
-    // Add legend
-    float legend_x = overall_min + (overall_max - overall_min) * 0.65f;
-    float legend_y_base = max_count * 0.75f;
-    float line_spacing = max_count * 0.05f;
-    
-    cpgsci(3);
-    cpgptxt(legend_x, legend_y_base, 0.0, 0.0, "Initial (before outChannel)");
-    cpgsci(2);
-    cpgptxt(legend_x, legend_y_base - line_spacing, 0.0, 0.0, "Final (after outChannel)");
-    
-    // Add statistics text
-    cpgsci(1);
-    char stats_text[200];
-    sprintf(stats_text, "Flagged: %d/%d channels (%.1f%%)", 
-            final_flagged_count - initial_flagged_count, nchan,
-            (float)(final_flagged_count - initial_flagged_count)/nchan*100);
-    cpgptxt(legend_x, legend_y_base - 3*line_spacing, 0.0, 0.0, stats_text);
-    
-    cpgsci(1); // Restore white color
-    printf("OutChannel comparison %s histogram completed!\n", stat_name);
-
-    // =====================================================================
-    // Second part: Draw zoomed comparison histogram for 0-0.25 range
-    // =====================================================================
-    printf("Creating zoomed outChannel comparison %s histogram for range 0-0.25...\n", stat_name);
-    
-    // Check if there is data in the 0-0.25 range
-    int has_data_in_range = 0;
-    for (int i = 0; i < nchan; i++) {
-        if ((initial_stats[i] >= 0.0f && initial_stats[i] <= 0.25f) ||
-            (final_stats[i] >= 0.0f && final_stats[i] <= 0.25f && final_stats[i] >= 0)) {
-            has_data_in_range = 1;
-            break;
-        }
-    }
-    
-    if (has_data_in_range) {
-        // Create new page for zoomed comparison histogram
-        cpgpage();
-        cpgvstd();
-        cpgsch(1.2);
-        
-        // Create subdivided histograms for 0-0.25 range
-        int zoom_nbins = 50;  // Match drawChanStatHist zoom bin count
-        float zoom_min = 0.0f;
-        float zoom_max = 0.25f;
-        float zoom_bin_width = (zoom_max - zoom_min) / zoom_nbins;
-        float *zoom_initial_hist = (float *)calloc(zoom_nbins, sizeof(float));
-        float *zoom_final_hist = (float *)calloc(zoom_nbins, sizeof(float));
-        
-        // Fill zoomed initial histogram
-        int zoom_initial_count = 0;
-        for (int i = 0; i < nchan; i++) {
-            if (initial_stats[i] >= zoom_min && initial_stats[i] <= zoom_max) {
-                int bin = (int)((initial_stats[i] - zoom_min) / zoom_bin_width);
-                if (bin < 0) bin = 0;
-                if (bin >= zoom_nbins) bin = zoom_nbins - 1;
-                zoom_initial_hist[bin]++;
-                zoom_initial_count++;
-            }
-        }
-        
-        // Fill zoomed final histogram (only non-flagged channels)
-        int zoom_final_count = 0;
-        for (int i = 0; i < nchan; i++) {
-            if (final_stats[i] >= 0 && final_stats[i] >= zoom_min && final_stats[i] <= zoom_max) {
-                int bin = (int)((final_stats[i] - zoom_min) / zoom_bin_width);
-                if (bin < 0) bin = 0;
-                if (bin >= zoom_nbins) bin = zoom_nbins - 1;
-                zoom_final_hist[bin]++;
-                zoom_final_count++;
-            }
-        }
-        
-        // Calculate maximum count in zoomed range
-        float zoom_max_count = 0;
-        for (int i = 0; i < zoom_nbins; i++) {
-            if (zoom_initial_hist[i] > zoom_max_count) zoom_max_count = zoom_initial_hist[i];
-            if (zoom_final_hist[i] > zoom_max_count) zoom_max_count = zoom_final_hist[i];
-        }
-        
-        if (zoom_max_count > 0) {
-            // Set up coordinate system
-            cpgswin(zoom_min, zoom_max, 0, zoom_max_count * 1.1f);
-            cpgbox("BCNST", 0.0, 0, "BCNST", 0.0, 0);
-            char zoom_title[200];
-            sprintf(zoom_title, "OutChannel Detection: %s Distribution Comparison (Zoomed: 0-0.25)", stat_name);
-            
-            // Use cpgmtxt for better positioning control - zoomed histogram, closer to plot
-            cpgmtxt("B", 2.0, 0.5, 0.5, stat_label);           // X-axis label closer
-            cpgmtxt("L", 2.0, 0.5, 0.5, "Number of Channels");  // Y-axis label closer
-            cpgmtxt("T", 1.0, 0.5, 0.5, zoom_title);            // Title much closer to plot
-            
-            // Draw zoomed initial histogram (dashed outline)
-            cpgsci(3); // Green for initial
-            cpgsls(2); // Dashed line
-            for (int i = 0; i < zoom_nbins; i++) {
-                if (zoom_initial_hist[i] > 0) {
-                    float x1 = zoom_min + i * zoom_bin_width;
-                    float x2 = zoom_min + (i + 1) * zoom_bin_width;
-                    float y = zoom_initial_hist[i];
-                    // Draw outline
-                    cpgmove(x1, 0);
-                    cpgdraw(x1, y);
-                    cpgdraw(x2, y);
-                    cpgdraw(x2, 0);
-                }
-            }
-            
-            // Draw zoomed final histogram (solid bars)
-            cpgsci(2); // Red for final
-            cpgsls(1); // Solid line
-            for (int i = 0; i < zoom_nbins; i++) {
-                if (zoom_final_hist[i] > 0) {
-                    float x1 = zoom_min + i * zoom_bin_width;
-                    float x2 = zoom_min + (i + 1) * zoom_bin_width;
-                    cpgrect(x1, x2, 0, zoom_final_hist[i]);
-                }
-            }
-            
-            // Draw threshold lines in zoomed range
-            cpgsci(1); // White
-            if (initial_median >= zoom_min && initial_median <= zoom_max) {
-                cpgmove(initial_median, 0);
-                cpgdraw(initial_median, zoom_max_count * 1.1f);
-                cpgptxt(initial_median, zoom_max_count * 0.9f, 0.0, 0.0, "Initial Median");
-            }
-            
-            if (valid_count > 0 && final_median >= zoom_min && final_median <= zoom_max) {
-                cpgmove(final_median, 0);
-                cpgdraw(final_median, zoom_max_count * 1.1f);
-                cpgptxt(final_median, zoom_max_count * 0.8f, 0.0, 0.0, "Final Median");
-            }
-            
-            // Add zoomed legend and statistics
-            float zoom_legend_x = zoom_min + (zoom_max - zoom_min) * 0.05f;
-            float zoom_legend_y_base = zoom_max_count * 0.9f;
-            float zoom_line_spacing = zoom_max_count * 0.05f;
-            
-            cpgsci(3);
-            cpgptxt(zoom_legend_x, zoom_legend_y_base, 0.0, 0.0, "Initial (before outChannel)");
-            cpgsci(2);
-            cpgptxt(zoom_legend_x, zoom_legend_y_base - zoom_line_spacing, 0.0, 0.0, "Final (after outChannel)");
-            
-            // Add iteration statistics
-            cpgsci(1);
-            char iteration_info1[200], iteration_info2[200], iteration_info3[200], iteration_info4[200], iteration_info5[200];
-            sprintf(iteration_info1, "Iterations: %d", iterations);
-            sprintf(iteration_info2, "T\\dpoint\\u: %.1f", nsigma_in);   // T_point (inChannel threshold)
-            sprintf(iteration_info3, "T\\dchan\\u: %.1f", nsigma_out);  // T_chan (outChannel threshold)
-            sprintf(iteration_info4, "Valid channels: %d", nchan - final_flagged_count);
-            sprintf(iteration_info5, "Flagged channels: %d", final_flagged_count - initial_flagged_count);
-            
-            cpgptxt(zoom_legend_x, zoom_legend_y_base - 3*zoom_line_spacing, 0.0, 0.0, iteration_info1);
-            cpgptxt(zoom_legend_x, zoom_legend_y_base - 4*zoom_line_spacing, 0.0, 0.0, iteration_info2);
-            cpgptxt(zoom_legend_x, zoom_legend_y_base - 5*zoom_line_spacing, 0.0, 0.0, iteration_info3);
-            cpgptxt(zoom_legend_x, zoom_legend_y_base - 6*zoom_line_spacing, 0.0, 0.0, iteration_info4);
-            cpgptxt(zoom_legend_x, zoom_legend_y_base - 7*zoom_line_spacing, 0.0, 0.0, iteration_info5);
-            
-            // Add Gaussian fitting curve for final data
-            printf("Fitting Gaussian curve to final data in zoomed histogram...\n");
-            
-            // Prepare fitting data for final histogram only
-            float *x_data = (float *)malloc(zoom_nbins * sizeof(float));
-            float *y_data = (float *)malloc(zoom_nbins * sizeof(float));
-            int fit_points = 0;
-            
-            for (int i = 0; i < zoom_nbins; i++) {
-                if (zoom_final_hist[i] > 0) {
-                    float bin_center = zoom_min + (i + 0.5f) * zoom_bin_width;
-                    x_data[fit_points] = bin_center;
-                    y_data[fit_points] = zoom_final_hist[i];
-                    fit_points++;
-                }
-            }
-            
-            if (fit_points >= 3) {
-                // Calculate fixed amplitude from final histogram max bin value
-                float zoom_final_amplitude = zoom_max_count;
-                printf("Zoomed final histogram amplitude (max bin value): %.2f\n", zoom_final_amplitude);
-                
-                // Use GSL Gaussian fitting with fixed amplitude
-                float fitted_mu, fitted_sigma;
-                int gsl_success = gsl_gaussian_fit(x_data, y_data, fit_points, zoom_final_amplitude, &fitted_mu, &fitted_sigma);
-                
-                if (gsl_success) {
-                    printf("Zoomed Gaussian fit (fixed amp=%.2f): center=%.6f, sigma=%.6f\n", 
-                           zoom_final_amplitude, fitted_mu, fitted_sigma);
-                    
-                    // Draw fitted Gaussian curve
-                    cpgsci(1); // Black color for fitted curve
-                    cpgsls(1); // Solid line
-                    
-                    int curve_points = 100;
-                    for (int i = 0; i < curve_points; i++) {
-                        float x = zoom_min + i * (zoom_max - zoom_min) / (curve_points - 1);
-                        float y = gaus_with_amplitude(x, zoom_final_amplitude, fitted_mu, fitted_sigma);
-                        
-                        if (i == 0) {
-                            cpgmove(x, y);
-                        } else {
-                            cpgdraw(x, y);
-                        }
-                    }
-                    
-                    // Add Gaussian fit parameters as text annotations
-                    cpgsci(1); // White color for text
-                    char fit_text1[100], fit_text2[100], fit_text3[100];
-                    sprintf(fit_text1, "Gaussian Fit (Final Data):");
-                    sprintf(fit_text2, "\\gm = %.6f", fitted_mu);
-                    sprintf(fit_text3, "\\gs = %.6f", fitted_sigma);
-                    
-                    float fit_text_x = zoom_min + (zoom_max - zoom_min) * 0.55f;
-                    float fit_text_y_base = zoom_max_count * 0.6f;
-                    float fit_line_spacing = zoom_max_count * 0.04f;
-                    
-                    cpgptxt(fit_text_x, fit_text_y_base, 0.0, 0.0, fit_text1);
-                    cpgptxt(fit_text_x, fit_text_y_base - fit_line_spacing, 0.0, 0.0, fit_text2);
-                    cpgptxt(fit_text_x, fit_text_y_base - 2 * fit_line_spacing, 0.0, 0.0, fit_text3);
-                    
-                    // Add fitted curve to legend
-                    cpgsci(6);
-                    cpgptxt(zoom_legend_x, zoom_legend_y_base - 2*zoom_line_spacing, 0.0, 0.0, "Gaussian fit (final data)");
-                    
-                } else {
-                    printf("Error: GSL Gaussian fit failed for zoomed histogram\n");
-                }
-            } else {
-                printf("Insufficient data points (%d < 3) for Gaussian fitting in zoomed range\n", fit_points);
-            }
-            
-            free(x_data);
-            free(y_data);
-            
-            cpgsls(1);
-            cpgsci(1);
-            printf("Zoomed outChannel comparison %s histogram completed! (Initial: %d, Final: %d channels in 0-0.25 range)\n", 
-                   stat_name, zoom_initial_count, zoom_final_count);
-        } else {
-            printf("No data found in 0-0.25 range for outChannel comparison %s histogram\n", stat_name);
-        }
-        
-        free(zoom_initial_hist);
-        free(zoom_final_hist);
-    } else {
-        printf("No %s data in 0-0.25 range, skipping zoomed comparison histogram\n", stat_name);
-    }
-    
-    // Cleanup
-    free(temp_data);
-    free(initial_hist);
-    free(final_hist);
 }
 
 /* -------------------------------------------------------------------------
  * New version: consistent-shape histogram (initial shape fixed)
  * Keeps original function above; this one only highlights removed vs kept
  * ------------------------------------------------------------------------- */
-void drawOutChannelComparisonHist_new(float *initial_stats, float *final_stats, int nchan,
-                                      int use_mad, int initial_flagged_count, int final_flagged_count,
-                                      int iterations, float nsigma_out, float nsigma_in)
+void drawOutChannelComparisonHist(float *initial_stats, float *final_stats, 
+    int nchan, int initial_flagged_count, int final_flagged_count, 
+    int iterations, float nsigma_out, float nsigma_in)
 {
-    const char* stat_name  = use_mad ? "MAD" : "STD";
-    const char* stat_label = use_mad ? "Channel MAD M\\dj\\u" : "Channel STD \\gs\\dj\\u";
+    const char* stat_name  = "STD";
+    const char* stat_label = "Channel STD \\gs\\dj\\u";
 
     printf("\n=== OutChannel Comparison (CONSISTENT SHAPE) %s Histogram ===\n", stat_name);
     printf("Initial flagged (pre-existing): %d\n", initial_flagged_count);

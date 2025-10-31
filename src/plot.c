@@ -19,6 +19,26 @@
 #define PALETT_CUBE_HELIX 9
 #define PALETT_VIRIDIS 10
 
+// Ensure PGPLOT device is opened once.
+int ensure_pgplot_device(const char *device)
+{
+    static int opened = 0;
+    if (opened) return 1;
+
+    const char *dev = device;
+    if (!dev || !dev[0]) {
+        dev = "output/plot.ps/VCPS";
+    }
+    int id = cpgopen(dev);
+    if (id <= 0) {
+        fprintf(stderr, "PGPLOT: failed to open device '%s'\n", dev);
+        return 0;
+    }
+    cpgask(0); // do not pause between pages
+    opened = 1;
+    return 1;
+}
+
 int ClosestFreqIdx(const float *freqArray, int arraySize, float targetFreq)
 {
     if (arraySize <= 0 || freqArray == NULL)
@@ -61,6 +81,10 @@ void drawColorBar(float zmin, float zmax, const char *label)
 
 void plotDownsampLongTimeAbs(Metadata *m, int numReads, float *dsDataT, float *dsFreqArray, float startTime, int currentBlock)
 {
+    if (!ensure_pgplot_device(NULL)) {
+        fprintf(stderr, "PGPLOT unavailable, skip plotDownsampLongTimeAbs.\n");
+        return;
+    }
     // === Global Layout Configuration ===
     float globalMargin = 0.1;  // Symmetric margin for left/right/top/bottom
     float mainPanelRight = 0.7;  // Main panel right boundary
@@ -89,7 +113,7 @@ void plotDownsampLongTimeAbs(Metadata *m, int numReads, float *dsDataT, float *d
     float *dsFreqProfile = malloc(sizeof(float) * m->nchanBinned * numReads);
     int *dsChannelMask = calloc(m->nchanBinned, sizeof(int));
 
-    getProfile(dsDataT, nsampPlot, nchanPlot, dsFreqProfile, dsTimeProfile, 1, NULL);
+    getProfile(dsDataT, nsampPlot, nchanPlot, dsFreqProfile, dsTimeProfile, NULL);
 
     int palettType = 3;
     double contrast = 1.0;
@@ -194,8 +218,12 @@ void plotDownsampLongTimeAbs(Metadata *m, int numReads, float *dsDataT, float *d
  * @param rightPanelMode Mode for right panel: 0=mean, 1=std
  * @param mask Optional mask array for RFI flagging (NULL to skip mask plotting)
  */
-void plotTimeFreqSED(Metadata *m, int numReads, float *dsDataT, float *dsFreqArray, float startTime, int currentBlock, float *baseline, int topPanelMode, int rightPanelMode, int *mask, int *flaggedChans)
+void plotTimeFreqSED(Metadata *m, int numReads, float *dsDataT, float *dsFreqArray, float startTime, int currentBlock, float *baseline, int topPanelMode, int rightPanelMode, bool *mask, int *flaggedChans)
 {
+    if (!ensure_pgplot_device(NULL)) {
+        fprintf(stderr, "PGPLOT unavailable, skip plotTimeFreqSED.\n");
+        return;
+    }
     // === Global Layout Configuration ===
     float globalMargin = 0.1;  // Symmetric margin for left/right/top/bottom
     float mainPanelRight = 0.7;  // Main panel right boundary
@@ -227,8 +255,8 @@ void plotTimeFreqSED(Metadata *m, int numReads, float *dsDataT, float *dsFreqArr
     int *dsChannelMask = calloc(m->nchanBinned, sizeof(int));
 
     // Calculate both mean and std profiles
-    getProfile(dsDataT, nsampPlot, nchanPlot, dsFreqProfile_mean, dsTimeProfile_mean, 1, mask);
-    getProfileStd(dsDataT, nsampPlot, nchanPlot, dsFreqProfile_std, dsTimeProfile_std, 1, mask);
+    getProfile(dsDataT, nsampPlot, nchanPlot, dsFreqProfile_mean, dsTimeProfile_mean, mask);
+    getProfileStd(dsDataT, nsampPlot, nchanPlot, dsFreqProfile_std, dsTimeProfile_std, mask);
 
     // Select profiles based on panel modes
     float *dsTimeProfile = (topPanelMode == 0) ? dsTimeProfile_mean : dsTimeProfile_std;
@@ -365,7 +393,7 @@ void plotTimeFreqSED(Metadata *m, int numReads, float *dsDataT, float *dsFreqArr
 void plotIndexMask(
     float fmin, int nchanPlot, float chan_bwPlot,
     float tmin, int nsampPlot, float tbinPlot,
-    int *mask,
+    bool *mask,
     int plotStartChan, int plotEndChan)
 {
     for (int i = plotStartChan; i <= plotEndChan; i++)
@@ -381,23 +409,7 @@ void plotIndexMask(
             float y1 = fmin + (i - plotStartChan + 0.0) * chan_bwPlot;
             float y2 = fmin + (i - plotStartChan + 1.0) * chan_bwPlot;
 
-            // Set color
-            int color_index;
-            switch (mask[idx])
-            {
-            case 1:
-                color_index = 4;
-                break;
-            case 2:
-                color_index = 3;
-                break;
-            case 3:
-                color_index = 5;
-                break;
-            default:
-                color_index = mask[idx] % 16 + 1;
-            }
-            cpgsci(color_index);
+            cpgsci(4); // 
             cpgrect(x1, x2, y1, y2);
         }
     }
@@ -406,6 +418,10 @@ void plotIndexMask(
 
 void calcHist(float *data, int size, int numBins)
 {
+    if (!ensure_pgplot_device(NULL)) {
+        fprintf(stderr, "PGPLOT unavailable, skip calcHist plotting.\n");
+        return;
+    }
     float *hist = (float *)malloc(sizeof(float) * numBins);
     // Initialize histogram
     memset(hist, 0, sizeof(float) * numBins); // More effecient init
@@ -462,10 +478,8 @@ void calcHist(float *data, int size, int numBins)
     cpgsci(2);
 
     printf("Min: %f, Max: %f, BinWidth: %f\n", minVal, maxVal, binWidth);
-    float binCenter;
     for (int i = 0; i < numBins; i++)
     {
-        binCenter = minVal + (i + 0.5f) * binWidth;
         float leftEdge = minVal + i * binWidth;
         float rightEdge = minVal + (i + 1) * binWidth;
         // Use edge instead of center
@@ -482,6 +496,10 @@ void calcHist(float *data, int size, int numBins)
 
 void plot8bitHist(int *hist, float lowerBound, float upperBound, float mean, float sigma, int maxBin)
 {
+    if (!ensure_pgplot_device(NULL)) {
+        fprintf(stderr, "PGPLOT unavailable, skip plot8bitHist.\n");
+        return;
+    }
     /* === Draw rectangles for the hist === */
     cpgpage();
     cpgsvp(0.1, 0.9, 0.1, 0.9);
@@ -516,7 +534,13 @@ void plot8bitHist(int *hist, float lowerBound, float upperBound, float mean, flo
 
 void plotAllMasks(Metadata *m, int blocksPerRead, float *outDataT, float *dsFreqArray, int startTime, int numiter, IdentNSigmaMasks *maskSet, int *flaggedChans) {
     // List of masks to plot, excluding globalMask
-    int *masks[] = {maskSet->horizontalMask, maskSet->verticalMask, maskSet->pointMask, maskSet->chanBrightMask, maskSet->chanDarkMask, maskSet->chanComplexMask};
+    bool *masks[] = {
+        maskSet->horizontalMask, 
+        maskSet->verticalMask, 
+        maskSet->pointMask, 
+        maskSet->chanBrightMask, 
+        maskSet->chanDarkMask, 
+        maskSet->chanComplexMask};
     char *maskNames[] = {"horizontalMask", "verticalMask", "pointMask", "chanBrightMask", "chanDarkMask", "chanComplexMask"};
     int numMasks = 6;
 

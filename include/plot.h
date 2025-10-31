@@ -2,6 +2,13 @@
 #include "ReadFASTData.h"
 #include "identification.h"
 
+// Ensure a PGPLOT device is opened once.
+// If device is NULL, choose default: 
+//   - "/xs" when DISPLAY is set (interactive)
+//   - "output/plot.ps/PS" otherwise (headless)
+// Returns 1 on success, 0 on failure. Safe to call multiple times.
+int ensure_pgplot_device(const char *device);
+
 void plotDownsampLongTimeAbs(
     Metadata *m, 
     int numReads, 
@@ -10,7 +17,8 @@ void plotDownsampLongTimeAbs(
     float startTime, 
     int currentBlock);
 
-void plotTimeFreqSED(Metadata *m, int numReads, float *dsDataT, float *dsFreqArray, float startTime, int currentBlock, float *baseline, int topPanelMode, int rightPanelMode, int *mask, int *flaggedChans);
+void plotTimeFreqSED(Metadata *m, int numReads, float *dsDataT, float *dsFreqArray, float startTime, 
+    int currentBlock, float *baseline, int topPanelMode, int rightPanelMode, bool *mask, int *flaggedChans);
 
 void plotAllMasks(Metadata *m, int blocksPerRead, float *outDataT, float *dsFreqArray, int startTime, int numiter, IdentNSigmaMasks *maskSet, int *flaggedChans);
 
@@ -21,7 +29,7 @@ void plotIndexMask(
     float tmin, 
     int nsampPlot, 
     float tbinPlot,
-    int *mask,
+    bool *mask,
     int plotStartChan,
     int plotEndChan
 );

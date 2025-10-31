@@ -409,7 +409,8 @@ class FITSDataset(Dataset):
         for fid in self.ids:
             file_id = self.extract_id(fid)
             if file_id:
-                mask_path = os.path.join(mask_dir, f"mask_{file_id}.png")
+                # 修正掩码文件名
+                mask_path = os.path.join(mask_dir, f"mask_merged_{file_id}.png")
                 image_path = os.path.join(image_dir, fid)
                 
                 # 检查文件是否存在且可读

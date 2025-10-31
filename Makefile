@@ -13,7 +13,7 @@ HAS_NVCC := $(shell which nvcc >/dev/null 2>&1 && echo 1 || echo 0)
 # 构建模式：
 # 可通过 make MODE=release 或 make MODE=debug 切换，
 # 也可以直接修改下面这行来改变默认模式
-MODE ?= debug
+MODE ?= turbo
 
 
 # 基础编译选项
@@ -91,6 +91,13 @@ else ifeq ($(MODE), turbo)
     else ifeq ($(IS_CLANG), 1)
         CXXFLAGS += -fvectorize -fslp-vectorize
     endif
+    # Clean unsupported flags on clang to avoid warnings
+    ifeq ($(IS_CLANG), 1)
+        CFLAGS := $(filter-out -funroll-all-loops -finline-limit=1000 -fno-signaling-nans,$(CFLAGS))
+        CXXFLAGS := $(filter-out -funroll-all-loops -finline-limit=1000 -fno-signaling-nans,$(CXXFLAGS))
+        CFLAGS += -funroll-loops
+        CXXFLAGS += -funroll-loops
+    endif
 # 分析模式 (保留符号信息但优化)
 else ifeq ($(MODE), profile)
     CFLAGS := $(BASE_CFLAGS) -pg -g -O2 -march=native -fopenmp
@@ -145,7 +152,11 @@ TARGET := $(BUILD_DIR)/ReadFASTData
 LIBS := -lcfitsio -lgfortran -lcpgplot -lm -lfftw3f -lpng -ldl -lgsl -lgslcblas
 # 添加OpenMP支持
 ifeq ($(findstring -fopenmp,$(CFLAGS)),-fopenmp)
-    LIBS += -lgomp
+    ifeq ($(IS_CLANG), 1)
+        LIBS += -lomp
+    else
+        LIBS += -lgomp
+    endif
 endif
 
 # 添加CUDA库支持

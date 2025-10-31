@@ -10,18 +10,10 @@
             "program": "${workspaceFolder}/build/ReadFASTData",
             "args": [
                 // "--filename=/mnt/d/FASTData/FITSFiles/G200.48+2.54_20250409_snapshot-M01-P1-c1024b1.fits",
-                // "--filename=/home/cbm/deRFI/Datasets/Dataset_G200.48+2.54_5978_2classes_NoSubMed_IndexCorrected/image/val/G200.48+2.54_20251015_block5000.fits",
-                // "--filename=/mnt/d/FASTData/FITSFiles/G191.19+2.54_20250408_snapshot-M05-P2-c1024b1.fits",
-                // "--filename=/mnt/d/FASTData/FITSFiles/J195137+283648_20240726_tracking-M01-P1-c512b1.fits",
-                // "--filename=/mnt/d/FASTData/G57.49-0.17_20190321_snapshot-M01-P1-c2048b1.fits",
-                "--filename=/mnt/d/FASTData/FITSFiles/G200.14+2.80_20250409_snapshot-M05-P1-c1024b1.fits",
-                // "--filename=/mnt/d/FASTData/FITSFiles/B0355+54_20191110_tracking_1-M01-P1-c2048b1.fits",
-                // "--filename=/mnt/d/FASTData/FITSFiles/G57.49-0.17_20211221_snapshot-M03-P2-c2048b1.fits",
-                // "--filename=/mnt/d/FASTData/FITSFiles/B1929+10_20210106_tracking-M01-P1-c1024b1.fits",
-                // "--filename=/mnt/d/FASTData/FITSFiles/G65.07+1.10_20230604_snapshot-M12-P4-c2048b1.fits",
-                // "--filename=/mnt/d/FASTData/FITSFiles/G200.53+2.97_20250409_snapshot-M01-P2-c1024b1.fits",
-                
-                // "--timeDuration=0.4",
+                // "--filename=/mnt/d/FASTData/FITSFiles/G200.14+2.80_20250409_snapshot-M05-P1-c1024b1.fits",
+                "--filename=/mnt/d/FASTData/FITSFiles/G184.63-5.93_20210526_snapshot-M14-P4-c1024b1.fits",
+                // "--filename=/mnt/d/FASTData/FITSFiles/G152.35-2.20_20200104_snapshot-M05-P3-c2048b1.fits",
+                // "--filename=/mnt/d/FASTData/FITSFiles/G80.92-0.08_20210226_snapshot-M05-P4-c2048b1.fits",
                 "--binFactorTime=1",
                 "--binFactorFreq=1",
                 "--plot=1",
@@ -78,4 +70,5 @@
             ]
         }
     ]
-// ./build/ReadFASTData --filename=/mnt/d/FASTData/FITSFiles/G200.14+2.80_20250409_snapshot-M05-P1-c1024b1.fits --binFactorTime=1 --binFactorFreq=1 --plot=1 --savePlot=1 --write=1 --writeBack=0 --writeMasks=1 --doSubstitution=1 --doSumThreshold=1 --blocksPerRead=1 --startTime=0.0 --generateMasks=1 --datasetPath=/home/cbm/deRFI/output --enableCuda=0
+} 
+// --filename=/mnt/d/FASTData/FITSFiles/G152.35-2.20_20200104_snapshot-M05-P3-c2048b1.fits --binFactorTime=1 --binFactorFreq=1 --plot=1 --savePlot=1 --write=1 --writeBack=0 --writeMasks=1 --doSubstitution=1 --doSumThreshold=1 --blocksPerRead=1 --startTime=0.0 --generateMasks=1 --datasetPath=/home/cbm/deRFI/output --enableCuda=0

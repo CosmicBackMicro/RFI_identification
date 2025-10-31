@@ -1,5 +1,6 @@
 #pragma once
 #include <fitsio.h>
+#include <stdbool.h>
 typedef struct {
     /* From Command Line */
     char *filename;
@@ -36,9 +37,9 @@ typedef struct {
 
 char *extractSourceName(const char *absolutePath);
 
-void getProfile(float *array, int nsamp, int nchan, float *freqProfile, float *timeProfile, int isTranspose, int *mask);
+void getProfile(float *array, int nsamp, int nchan, float *freqProfile, float *timeProfile, bool *mask);
 
-void getProfileStd(float *array, int nsamp, int nchan, float *freqProfile, float *timeProfile, int isTranspose, int *mask);
+void getProfileStd(float *array, int nsamp, int nchan, float *freqProfile, float *timeProfile, bool *mask);
 
 void downsamp2D(float *array, int nsamp, int nchan, 
     float *binnedArray, int binFactorTime, int binFactorFreq, int isTranspose);
@@ -50,5 +51,6 @@ void upsampleMask2D(int *binnedMask, int nsampBinned, int nchanBinned,
                     int binFactorTime, int binFactorFreq, int isTranspose);
 
 void readRawBlock(fitsfile *fptr, int blockIndex, int blocksPerRead, int nchan, int blockSize,
-                  float *scale, float *offset, unsigned char *outRawData, int *fits_status);
+                  float *scale, float *offset, float *scaleRows, float *offsetRows,
+                  unsigned char *outRawData, int *fits_status);
 

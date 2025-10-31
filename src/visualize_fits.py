@@ -36,36 +36,57 @@ def load_fits_image(fits_path):
 
 def test_load_fits_image():
     """测试load_fits_image函数，直接可视化输出"""
-    # 使用找到的FITS文件
-    fits_path = "/home/cbm/deRFI/output/G200.14+2.80_20251027_block0.fits"
-    
-    if not os.path.exists(fits_path):
-        print(f"Test FITS file not found: {fits_path}")
+    import glob
+
+    # Get current directory
+    current_dir = os.getcwd()
+    print(f"Searching for .fits and .fit files in: {current_dir}")
+
+    # Find all .fits and .fit files
+    fits_files = glob.glob(os.path.join(current_dir, '**', '*.fits'), recursive=True)
+    fits_files += glob.glob(os.path.join(current_dir, '**', '*.fit'), recursive=True)
+
+    if not fits_files:
+        print("No FITS files found in the current directory.")
         return
-    
-    print(f"Loading FITS file: {fits_path}")
-    
-    # 调用load_fits_image函数
-    image = load_fits_image(fits_path)
-    
-    if image is None:
-        print("Failed to load image")
-        return
-    
-    print(f"Image shape: {image.shape}")
-    print(f"Image dtype: {image.dtype}")
-    print(f"Image range: {image.min():.2e} to {image.max():.2e}")
-    print(f"Image mean: {image.mean():.2e}")
-    print(f"Image std: {image.std():.2e}")
-    
-    # 直接可视化image数组
-    plt.figure(figsize=(12, 8))
-    plt.imshow(image, aspect='auto', cmap='viridis')
-    plt.colorbar(label='Intensity')
-    plt.title('load_fits_image Output')
-    plt.xlabel('Time Sample')
-    plt.ylabel('Channel')
-    plt.show()
+
+    for fits_path in fits_files:
+        if not os.path.exists(fits_path):
+            print(f"Test FITS file not found: {fits_path}")
+            continue
+        
+        print(f"Loading FITS file: {fits_path}")
+        
+        # 调用load_fits_image函数
+        image = load_fits_image(fits_path)
+        
+        if image is None:
+            print("Failed to load image")
+            continue
+        
+        print(f"Image shape: {image.shape}")
+        print(f"Image dtype: {image.dtype}")
+        print(f"Image range: {image.min():.2e} to {image.max():.2e}")
+        print(f"Image mean: {image.mean():.2e}")
+        print(f"Image std: {image.std():.2e}")
+        
+        # Calculate vmin and vmax based on 5-sigma
+        mean = image.mean()
+        std = image.std()
+        vmin = mean - 3 * std
+        vmax = mean + 3 * std
+        
+        # 直接可视化image数组
+        plt.figure(figsize=(12, 8))
+        plt.imshow(image, aspect='auto', cmap='gist_heat', vmin=vmin, vmax=vmax)
+        plt.colorbar(label='Intensity')
+        plt.title(f'Visualization of {os.path.basename(fits_path)}')
+        plt.xlabel('Time Sample')
+        plt.ylabel('Channel')
+        plt.show()
+        
+        # Wait for user input to continue
+        # input("Press Enter to continue to the next image...")
 
 if __name__ == "__main__":
     test_load_fits_image()

@@ -7,7 +7,7 @@
 #include "mask.h"
 #include "identification.h" // for IdentNSigmaMasks definition
 
-void writeIndexMaskPNG(int *mask, int nsamp, int nchan, char *filename)
+void writeIndexMaskPNG(const bool *mask, int nsamp, int nchan, char *filename)
 {
     FILE *fp = fopen(filename, "wb");
     if (!fp) return;
@@ -38,7 +38,7 @@ void writeIndexMaskPNG(int *mask, int nsamp, int nchan, char *filename)
         row_pointers[nchan - 1 - i] = (png_bytep)malloc(nsamp);
         for (j = 0; j < nsamp; j++)
         {
-            int val = mask[i * nsamp + j];
+            int val = mask[i * nsamp + j] ? 1 : 0;
             row_pointers[nchan - 1 - i][j] = (png_byte)val;  // 直接使用类别编号作为像素值
         }
     }
@@ -68,7 +68,7 @@ void mergeMask2D(int *masks[], int nmasks, int nsamp, int nchan, int *result)
     }
 }
 
-void expandChannelMask(const int *channelFlagged, int *mask2D, int nsamp, int nchan)
+void expandChannelMask(const int *channelFlagged, bool *mask2D, int nsamp, int nchan)
 {
     #pragma omp parallel for
     for (int i = 0; i < nchan; i++) {
@@ -81,24 +81,21 @@ void expandChannelMask(const int *channelFlagged, int *mask2D, int nsamp, int nc
     }
 }
 
-void logicalOR(int *globalMask, const int *mask, int nsamp, int nchan)
+void logicalOR(bool *restrict globalMask, const bool *restrict mask, int nsamp, int nchan)
 {
     if (!globalMask || !mask) return;
     int total = nsamp * nchan;
     #pragma omp parallel for
     for (int idx = 0; idx < total; idx++) {
-        if (mask[idx]) globalMask[idx] = 1;
+        if (mask[idx]) globalMask[idx] = true;
     }
-
 }
 
 void writeAllMasksPNG(const IdentNSigmaMasks *masks, int nsamp, int nchan,
                       const char *datasetPath, int index, int merge)
 {
     if (!masks || !datasetPath) return;
-
     char filename[512];
-
     if (merge) {
         int total = nsamp * nchan;
         int *indexMask = (int *)calloc(total, sizeof(int));
@@ -182,24 +179,24 @@ void writeAllMasksPNG(const IdentNSigmaMasks *masks, int nsamp, int nchan,
 
 void allocIdentNSigmaMasks(IdentNSigmaMasks *m, int nsamp, int nchan) {
     if (!m) return;
-    m->horizontalMask = (int *)calloc(nsamp * nchan, sizeof(int));
-    m->verticalMask   = (int *)calloc(nsamp * nchan, sizeof(int));
-    m->globalMask     = (int *)calloc(nsamp * nchan, sizeof(int));
-    m->pointMask      = (int *)calloc(nsamp * nchan, sizeof(int));
-    m->chanBrightMask = (int *)calloc(nsamp * nchan, sizeof(int));
-    m->chanDarkMask   = (int *)calloc(nsamp * nchan, sizeof(int));
-    m->chanComplexMask = (int *)calloc(nsamp * nchan, sizeof(int));
+    m->horizontalMask = (bool *)calloc(nsamp * nchan, sizeof(bool));
+    m->verticalMask   = (bool *)calloc(nsamp * nchan, sizeof(bool));
+    m->globalMask     = (bool *)calloc(nsamp * nchan, sizeof(bool));
+    m->pointMask      = (bool *)calloc(nsamp * nchan, sizeof(bool));
+    m->chanBrightMask = (bool *)calloc(nsamp * nchan, sizeof(bool));
+    m->chanDarkMask   = (bool *)calloc(nsamp * nchan, sizeof(bool));
+    m->chanComplexMask = (bool *)calloc(nsamp * nchan, sizeof(bool));
 }
 
 void clearIdentNSigmaMasks(IdentNSigmaMasks *m, int nsamp, int nchan) {
     if (!m) return;
-    memset(m->horizontalMask,    0, sizeof(int)*nsamp*nchan);
-    memset(m->verticalMask,      0, sizeof(int)*nsamp*nchan);
-    memset(m->globalMask,        0, sizeof(int)*nsamp*nchan);
-    memset(m->pointMask,         0, sizeof(int)*nsamp*nchan);
-    memset(m->chanBrightMask,    0, sizeof(int)*nsamp*nchan);
-    memset(m->chanDarkMask,      0, sizeof(int)*nsamp*nchan);
-    memset(m->chanComplexMask,   0, sizeof(int)*nsamp*nchan);
+    memset(m->horizontalMask,    0, sizeof(bool)*nsamp*nchan);
+    memset(m->verticalMask,      0, sizeof(bool)*nsamp*nchan);
+    memset(m->globalMask,        0, sizeof(bool)*nsamp*nchan);
+    memset(m->pointMask,         0, sizeof(bool)*nsamp*nchan);
+    memset(m->chanBrightMask,    0, sizeof(bool)*nsamp*nchan);
+    memset(m->chanDarkMask,      0, sizeof(bool)*nsamp*nchan);
+    memset(m->chanComplexMask,   0, sizeof(bool)*nsamp*nchan);
 }
 
 void freeIdentNSigmaMasks(IdentNSigmaMasks *m) {

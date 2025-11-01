@@ -11,9 +11,10 @@
             "args": [
                 // "--filename=/mnt/d/FASTData/FITSFiles/G200.48+2.54_20250409_snapshot-M01-P1-c1024b1.fits",
                 // "--filename=/mnt/d/FASTData/FITSFiles/G200.14+2.80_20250409_snapshot-M05-P1-c1024b1.fits",
-                "--filename=/mnt/d/FASTData/FITSFiles/G184.63-5.93_20210526_snapshot-M14-P4-c1024b1.fits",
+                // "--filename=/mnt/d/FASTData/FITSFiles/G184.63-5.93_20210526_snapshot-M14-P4-c1024b1.fits",
                 // "--filename=/mnt/d/FASTData/FITSFiles/G152.35-2.20_20200104_snapshot-M05-P3-c2048b1.fits",
                 // "--filename=/mnt/d/FASTData/FITSFiles/G80.92-0.08_20210226_snapshot-M05-P4-c2048b1.fits",
+                "--filename=/mnt/d/FASTData/FITSFiles/G31.37+2.20_20201111_snapshot-M07-P1-c2048b1.fits",
                 "--binFactorTime=1",
                 "--binFactorFreq=1",
                 "--plot=1",

@@ -28,6 +28,132 @@
 #ifndef PI
 #define PI 3.14159265358979323846
 #endif
+/* weak reference for optional CFITSIO API; if absent, pointer will be NULL */
+extern int fits_is_reentrant(void) __attribute__((weak));
+/* ===========================
+ * Minimal async reader (single-slot prefetch)
+ * =========================== */
+typedef struct {
+    char filename[512];
+    int nchan;
+    int blockSize;
+    int blocksPerRead;
+} ReaderCtx;
+
+typedef struct {
+    int requested;            // -1 none; >=0 block index
+    unsigned char *outRaw;    // target raw buffer
+    float *scaleRows;         // target scale rows buffer (blocksPerRead*nchan)
+    float *offsetRows;        // target offset rows buffer (blocksPerRead*nchan)
+    int result_ready;         // 0/1
+    int result_status;        // CFITSIO status
+} ReaderSlot;
+
+static pthread_t g_reader_thread;
+static pthread_mutex_t g_reader_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_reader_cv  = PTHREAD_COND_INITIALIZER;
+static int g_reader_running = 0;
+static ReaderCtx  g_reader_ctx;
+static ReaderSlot g_reader_slot;
+
+static void* reader_thread_main(void *arg) {
+    (void)arg;
+    fitsfile *rf = NULL;
+    int st = 0;
+    fits_open_file(&rf, g_reader_ctx.filename, READONLY, &st);
+    if (st) {
+        pthread_mutex_lock(&g_reader_mtx);
+        g_reader_slot.result_ready = 1;
+        g_reader_slot.result_status = st;
+        pthread_cond_broadcast(&g_reader_cv);
+        pthread_mutex_unlock(&g_reader_mtx);
+        return NULL;
+    }
+
+    for (;;) {
+        pthread_mutex_lock(&g_reader_mtx);
+        while (g_reader_running && g_reader_slot.requested < 0) {
+            pthread_cond_wait(&g_reader_cv, &g_reader_mtx);
+        }
+        if (!g_reader_running) { pthread_mutex_unlock(&g_reader_mtx); break; }
+        int blockIndex = g_reader_slot.requested;
+        unsigned char *outRaw = g_reader_slot.outRaw;
+        float *scaleRows = g_reader_slot.scaleRows;
+        float *offsetRows = g_reader_slot.offsetRows;
+        g_reader_slot.requested = -1;
+        pthread_mutex_unlock(&g_reader_mtx);
+
+        int status = 0;
+        readRawBlock(rf, blockIndex, g_reader_ctx.blocksPerRead, g_reader_ctx.nchan,
+                     g_reader_ctx.blockSize, NULL, NULL, scaleRows, offsetRows, outRaw, &status);
+
+        pthread_mutex_lock(&g_reader_mtx);
+        g_reader_slot.result_ready = 1;
+        g_reader_slot.result_status = status;
+        pthread_cond_broadcast(&g_reader_cv);
+        pthread_mutex_unlock(&g_reader_mtx);
+    }
+
+    if (rf) fits_close_file(rf, &st);
+    return NULL;
+}
+
+static int start_reader_thread_prefetch(const Metadata *m) {
+    int reent = 1;
+    if (fits_is_reentrant) reent = fits_is_reentrant();
+    if (!reent) {
+        fprintf(stderr, "[CFITSIO] Non-reentrant build; async prefetch disabled.\n");
+        return 0;
+    }
+    memset(&g_reader_ctx, 0, sizeof(g_reader_ctx));
+    strncpy(g_reader_ctx.filename, m->filename, sizeof(g_reader_ctx.filename)-1);
+    g_reader_ctx.nchan = m->nchan;
+    g_reader_ctx.blockSize = m->blockSize;
+    g_reader_ctx.blocksPerRead = m->blocksPerRead;
+
+    pthread_mutex_lock(&g_reader_mtx);
+    g_reader_running = 1;
+    g_reader_slot.requested = -1;
+    g_reader_slot.result_ready = 0;
+    g_reader_slot.result_status = 0;
+    pthread_mutex_unlock(&g_reader_mtx);
+    pthread_create(&g_reader_thread, NULL, reader_thread_main, NULL);
+    return 1;
+}
+
+static void stop_reader_thread_prefetch(void) {
+    pthread_mutex_lock(&g_reader_mtx);
+    g_reader_running = 0;
+    pthread_cond_broadcast(&g_reader_cv);
+    pthread_mutex_unlock(&g_reader_mtx);
+    pthread_join(g_reader_thread, NULL);
+}
+
+static void submit_read_request_async(int blockIndex,
+                                      unsigned char *outRaw,
+                                      float *scaleRows,
+                                      float *offsetRows) {
+    pthread_mutex_lock(&g_reader_mtx);
+    g_reader_slot.requested = blockIndex;
+    g_reader_slot.outRaw = outRaw;
+    g_reader_slot.scaleRows = scaleRows;
+    g_reader_slot.offsetRows = offsetRows;
+    g_reader_slot.result_ready = 0;
+    pthread_cond_broadcast(&g_reader_cv);
+    pthread_mutex_unlock(&g_reader_mtx);
+}
+
+static int wait_read_ready_async(int *status_out) {
+    pthread_mutex_lock(&g_reader_mtx);
+    while (!g_reader_slot.result_ready && g_reader_running) {
+        pthread_cond_wait(&g_reader_cv, &g_reader_mtx);
+    }
+    int ready = g_reader_slot.result_ready;
+    int st = g_reader_slot.result_status;
+    pthread_mutex_unlock(&g_reader_mtx);
+    if (status_out) *status_out = st;
+    return ready;
+}
 
 #ifndef SWAP
 #define SWAP(a, b)          \
@@ -101,7 +227,7 @@ int readMetadata(Metadata *m)
     fitsfile *fptr;
     fits_open_file(&fptr, m->filename, READONLY, &status);
 
-    fits_movnam_hdu(fptr, BINARY_TBL, "SUBINT", 0, &status);             // move to hdu by name
+    fits_movnam_hdu(fptr, BINARY_TBL, "SUBINT  ", 0, &status);             // move to hdu by name
     fits_read_key(fptr, TINT, "NCHAN", &m->nchan, NULL, &status);        // number of channels
     fits_read_key(fptr, TDOUBLE, "CHAN_BW", &m->chan_bw, NULL, &status); // channel bandwidth
     fits_read_key(fptr, TDOUBLE, "TBIN", &m->tbin, NULL, &status);       // time resolution
@@ -493,9 +619,9 @@ void readRawBlock(fitsfile *fptr, int blockIndex, int blocksPerRead, int nchan, 
     const long startRow = (long)(blockIndex * blocksPerRead + 1);
 
     // Resolve column indices once
-    fits_get_colnum(fptr, CASESEN, "DAT_SCL",  &col_scl,  status);
-    fits_get_colnum(fptr, CASESEN, "DAT_OFFS", &col_offs, status);
-    fits_get_colnum(fptr, CASESEN, "DATA",     &col_data, status);
+    fits_get_colnum(fptr, CASEINSEN, "DAT_SCL",  &col_scl,  status);
+    fits_get_colnum(fptr, CASEINSEN, "DAT_OFFS", &col_offs, status);
+    fits_get_colnum(fptr, CASEINSEN, "DATA",     &col_data, status);
     if (*status) {
         fprintf(stderr, "Error locating columns for reading block %d\n", blockIndex);
         fits_report_error(stderr, *status);
@@ -552,7 +678,7 @@ void writeBlock(
         fits_get_colnum(fptr, CASEINSEN, "DAT_OFFS", &col1, status);
         fits_write_col(fptr, TFLOAT, col1, firstrow, 1, nchanBinned, offset, status);
 
-        fits_get_colnum(fptr, CASEINSEN, "DAT_SCL", &col1, status);
+        fits_get_colnum(fptr, CASEINSEN, "DAT_SCL ", &col1, status);
         fits_write_col(fptr, TFLOAT, col1, firstrow, 1, nchanBinned, scale, status);
 
         int writeSize = nsampBinned / blocksPerRead * nchanBinned;
@@ -651,7 +777,7 @@ void writeFITSDataset(unsigned char *outRawData, float *scale, float *offset,
 }
 
 // ---------------------------
-// Minimal async write thread
+// Minimal async write thread pool
 // ---------------------------
 
 typedef struct WriteTask {
@@ -664,7 +790,8 @@ typedef struct WriteTask {
     struct WriteTask *next;
 } WriteTask;
 
-static pthread_t g_writer_thread;
+static pthread_t *g_writer_threads = NULL;
+static int g_writer_nthreads = 0;
 static pthread_mutex_t g_writer_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_writer_cond = PTHREAD_COND_INITIALIZER;
 static WriteTask *g_writer_head = NULL;
@@ -720,21 +847,32 @@ static void* writer_thread_main(void *arg) {
     return NULL;
 }
 
-static void start_writer_thread(Metadata *m) {
+static void start_writer_threads(Metadata *m, int nthreads) {
+    if (nthreads < 1) nthreads = 1;
     pthread_mutex_lock(&g_writer_mutex);
     g_writer_meta = m;
     g_writer_running = 1;
+    g_writer_nthreads = nthreads;
+    g_writer_threads = (pthread_t*)malloc(sizeof(pthread_t) * (size_t)g_writer_nthreads);
     pthread_mutex_unlock(&g_writer_mutex);
-    pthread_create(&g_writer_thread, NULL, writer_thread_main, NULL);
+    for (int i = 0; i < g_writer_nthreads; ++i) {
+        pthread_create(&g_writer_threads[i], NULL, writer_thread_main, NULL);
+    }
 }
 
-static void stop_writer_thread_and_join() {
+static void stop_writer_threads_and_join() {
     pthread_mutex_lock(&g_writer_mutex);
-    // Signal thread to stop after draining queue
+    // Signal threads to stop after draining queue
     g_writer_running = 0;
     pthread_cond_broadcast(&g_writer_cond);
     pthread_mutex_unlock(&g_writer_mutex);
-    pthread_join(g_writer_thread, NULL);
+
+    for (int i = 0; i < g_writer_nthreads; ++i) {
+        pthread_join(g_writer_threads[i], NULL);
+    }
+    free(g_writer_threads);
+    g_writer_threads = NULL;
+    g_writer_nthreads = 0;
 
     // Safety: free any remaining tasks if any (should be none)
     pthread_mutex_lock(&g_writer_mutex);
@@ -848,8 +986,8 @@ int main(int argc, char *argv[])
         free(saveName);
     }
 
-    // Start background writer thread (for dataset writes)
-    start_writer_thread(&m);
+    // Start background writer threads (for dataset writes)
+    start_writer_threads(&m, 2);
 
     int nsamp, nchan, binFactorFreq, binFactorTime, nsampBinned, nchanBinned, blockSize, binnedBlockSize;
     int blocksPerRead, naxis2, colnumFreq;
@@ -879,7 +1017,7 @@ int main(int argc, char *argv[])
     int numReads = naxis2 / blocksPerRead;
 
     // Allocate output buffers
-    unsigned char *outRawData = malloc(sizeof(unsigned char) * nchan * nsamp);
+    unsigned char *outRawData = malloc(sizeof(unsigned char) * (size_t)nchan * (size_t)nsamp);
     float *outData = malloc(sizeof(float) * nchanBinned * nsampBinned);
     float *outDataT = malloc(sizeof(float) * nchanBinned * nsampBinned);
 
@@ -950,6 +1088,21 @@ int main(int argc, char *argv[])
     // Note: cfitsio library handles I/O optimization internally
     // We rely on its buffering and caching mechanisms
     
+    /*
+     * Async prefetch setup: create double buffers and kick off first read if enabled
+     */
+    unsigned char *rawBufA = outRawData;
+    unsigned char *rawBufB = (unsigned char*)malloc(sizeof(unsigned char) * (size_t)nchan * (size_t)nsamp);
+    float *sclBufA = scaleRows;
+    float *sclBufB = (float*)malloc(sizeof(float) * (size_t)blocksPerRead * (size_t)nchan);
+    float *offBufA = offsetRows;
+    float *offBufB = (float*)malloc(sizeof(float) * (size_t)blocksPerRead * (size_t)nchan);
+    int use_async_prefetch = start_reader_thread_prefetch(&m);
+    int useA = 1; // which buffer corresponds to current ii when ready
+    if (use_async_prefetch && numReads > 0) {
+        submit_read_request_async(0, rawBufA, sclBufA, offBufA);
+    }
+
     for (ii = 0; ii < numReads; ii++)
     {
         double loop_start = omp_get_wtime();
@@ -962,16 +1115,46 @@ int main(int argc, char *argv[])
         
         // Read a raw data block of `blocksPerRead` subints with its scale and offset
         double read_start = omp_get_wtime();
-        readRawBlock(fptr, ii, blocksPerRead, nchan, blockSize,
-             scale, offset, scaleRows, offsetRows,
-             outRawData, &fits_status);
+        unsigned char *currRaw = outRawData;
+        float *currScl = scaleRows;
+        float *currOff = offsetRows;
+        if (use_async_prefetch) {
+            // wait for prefetch completion for current ii
+            int st_ready = 0;
+            (void)wait_read_ready_async(&st_ready);
+            if (st_ready) {
+                // Non-zero indicates error; fall back to sync read and disable prefetch
+                fprintf(stderr, "Prefetch read error on block %d (status=%d); disabling async prefetch.\n", ii, st_ready);
+                use_async_prefetch = 0;
+            }
+            // Select buffer based on toggle
+            if (useA) { currRaw = rawBufA; currScl = sclBufA; currOff = offBufA; }
+            else      { currRaw = rawBufB; currScl = sclBufB; currOff = offBufB; }
+            // Fill first-row scale/offset to keep downstream behavior
+            memcpy(scale,  currScl, sizeof(float) * (size_t)nchan);
+            memcpy(offset, currOff, sizeof(float) * (size_t)nchan);
+            // Submit next request ASAP to overlap with compute
+            if (use_async_prefetch && (ii + 1) < numReads) {
+                if (useA) submit_read_request_async(ii + 1, rawBufB, sclBufB, offBufB);
+                else      submit_read_request_async(ii + 1, rawBufA, sclBufA, offBufA);
+            }
+        }
+        if (!use_async_prefetch) {
+            // Synchronous path
+            readRawBlock(fptr, ii, blocksPerRead, nchan, blockSize,
+                scale, offset, currScl, currOff,
+                currRaw, &fits_status);
+            if (fits_status) {
+                fits_report_error(stderr, fits_status);
+            }
+        }
         double read_time = omp_get_wtime() - read_start;
         printf("Read block time: %.4f seconds\n", read_time);
         
         // Start timing
         double convert_start = omp_get_wtime();
         // Decode (per-SUBINT DAT_SCL/DAT_OFFS)
-        sclOffsToFloatPerRow(outRawData, rawToFloatArray, scaleRows, offsetRows,
+        sclOffsToFloatPerRow(currRaw, rawToFloatArray, currScl, currOff,
             blocksPerRead, m.nsblk, nchan);
         // Downsample data (time, freq)
         downsamp2D(rawToFloatArray, nsamp, nchan, outData, binFactorTime, binFactorFreq, 0);
@@ -1254,10 +1437,16 @@ int main(int argc, char *argv[])
         printf("Total loop %d time: %.4f seconds\n", ii, loop_time);
         printf("iteration %d done.\n\n", numiter);
 
+        // toggle buffer for next iteration
+        if (use_async_prefetch) useA = !useA;
+
     }
 
-    // Stop writer thread and cleanup
-    stop_writer_thread_and_join();
+    // Stop writer threads and cleanup
+    stop_writer_threads_and_join();
+    if (g_reader_running) {
+        stop_reader_thread_prefetch();
+    }
     // Cleanup
     if (m.plot) cpgend();
     fits_close_file(fptr, &fits_status);
@@ -1269,12 +1458,15 @@ int main(int argc, char *argv[])
     freeIdentNSigmaMasks(&maskSet);
     free(flaggedChans);
     free(outRawData);
+    free(rawBufB);
     free(scale);
     free(offset);
     free(scaleBinned);
     free(offsetBinned);
     free(scaleRows);
     free(offsetRows);
+    free(sclBufB);
+    free(offBufB);
     free(rawToFloatArray);
     free(finalMedian);
     free(finalStd);

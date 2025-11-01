@@ -34,28 +34,45 @@ def load_fits_image(fits_path):
                     
     return image
 
-def test_load_fits_image():
-    """测试load_fits_image函数，直接可视化输出"""
+import argparse
+
+def test_load_fits_image(output_dir):
+    """测试load_fits_image函数，在同一个图窗中步进显示所有图像"""
     import glob
+    import re
 
-    # Get current directory
-    current_dir = os.getcwd()
-    print(f"Searching for .fits and .fit files in: {current_dir}")
+    print(f"Searching for .fits and .fit files in: {output_dir}")
 
-    # Find all .fits and .fit files
-    fits_files = glob.glob(os.path.join(current_dir, '**', '*.fits'), recursive=True)
-    fits_files += glob.glob(os.path.join(current_dir, '**', '*.fit'), recursive=True)
+    # Find all .fits and .fit files only in the output directory
+    fits_files = glob.glob(os.path.join(output_dir, '*.fits'))
+    fits_files += glob.glob(os.path.join(output_dir, '*.fit'))
+
+    # Sort files based on the block number in the filename
+    def get_block_number(filename):
+        match = re.search(r'block(\d+)\.(fits|fit)', os.path.basename(filename))
+        if match:
+            return int(match.group(1))
+        return -1
+    
+    fits_files.sort(key=get_block_number)
 
     if not fits_files:
-        print("No FITS files found in the current directory.")
+        print(f"No FITS files found in the directory: {output_dir}")
         return
 
-    for fits_path in fits_files:
+    # 在循环外创建图窗和坐标轴
+    fig, ax = plt.subplots(figsize=(12, 8))
+    # 添加一个占位符图像和颜色条
+    image_display = ax.imshow(np.zeros((1,1)), aspect='auto', cmap='gist_heat')
+    colorbar = fig.colorbar(image_display, ax=ax)
+    colorbar.set_label('Intensity')
+
+    for i, fits_path in enumerate(fits_files):
         if not os.path.exists(fits_path):
             print(f"Test FITS file not found: {fits_path}")
             continue
         
-        print(f"Loading FITS file: {fits_path}")
+        print(f"Loading FITS file: {fits_path} ({i+1}/{len(fits_files)})")
         
         # 调用load_fits_image函数
         image = load_fits_image(fits_path)
@@ -64,29 +81,34 @@ def test_load_fits_image():
             print("Failed to load image")
             continue
         
-        print(f"Image shape: {image.shape}")
-        print(f"Image dtype: {image.dtype}")
-        print(f"Image range: {image.min():.2e} to {image.max():.2e}")
-        print(f"Image mean: {image.mean():.2e}")
-        print(f"Image std: {image.std():.2e}")
-        
-        # Calculate vmin and vmax based on 5-sigma
+        # Calculate vmin and vmax based on 3-sigma
         mean = image.mean()
         std = image.std()
         vmin = mean - 3 * std
         vmax = mean + 3 * std
         
-        # 直接可视化image数组
-        plt.figure(figsize=(12, 8))
-        plt.imshow(image, aspect='auto', cmap='gist_heat', vmin=vmin, vmax=vmax)
-        plt.colorbar(label='Intensity')
-        plt.title(f'Visualization of {os.path.basename(fits_path)}')
-        plt.xlabel('Time Sample')
-        plt.ylabel('Channel')
-        plt.show()
+        # 更新图像数据和范围
+        image_display.set_data(image)
+        image_display.set_clim(vmin, vmax)
         
-        # Wait for user input to continue
-        # input("Press Enter to continue to the next image...")
+        # 更新标题和标签
+        ax.set_title(f'Visualization of {os.path.basename(fits_path)}')
+        ax.set_xlabel('Time Sample')
+        ax.set_ylabel('Channel')
+        
+        # 重绘图窗
+        fig.canvas.draw()
+
+        # 如果不是最后一张图，则等待按键
+        if i < len(fits_files) - 1:
+            plt.waitforbuttonpress()
+        else:
+            # 显示最后一张图，直到手动关闭
+            plt.show()
 
 if __name__ == "__main__":
-    test_load_fits_image()
+    parser = argparse.ArgumentParser(description='Visualize FITS files in a directory.')
+    parser.add_argument('--dir', type=str, default="/home/cbm/deRFI/output",
+                        help='Directory containing FITS files to visualize. Defaults to the hardcoded path.')
+    args = parser.parse_args()
+    test_load_fits_image(args.dir)

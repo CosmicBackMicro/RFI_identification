@@ -1077,6 +1077,18 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    int maxScratchThreads = omp_get_max_threads();
+    if (maxScratchThreads < 1) maxScratchThreads = 1;
+    size_t inChanScratchCount = (size_t)maxScratchThreads * (size_t)nsampBinned;
+    float *inChanScratch = NULL;
+    if (inChanScratchCount > 0) {
+        inChanScratch = (float *)malloc(sizeof(float) * inChanScratchCount);
+        if (!inChanScratch) {
+            fprintf(stderr, "Warning: allocating inChanScratch buffer failed; falling back to per-channel allocation.\n");
+            inChanScratchCount = 0;
+        }
+    }
+
     // Accumulators for loop timing stats
     double loop_total_time = 0.0;
     double loop_min_time = DBL_MAX;
@@ -1299,7 +1311,8 @@ int main(int argc, char *argv[])
                 printf("=== Using CPU RFI detection ===\n");
                 identSubstNSigma(outDataT, nsampBinned, nchanBinned, NSigmaInChan, NSigmaOutChan, ii, m.plot,
                                 &maskSet, finalMedian, finalStd, m.cudaReady, flaggedChans,
-                                identSubst_goodSamps, identSubst_randIdxs, identSubst_medTemp);
+                                identSubst_goodSamps, identSubst_randIdxs, identSubst_medTemp,
+                                inChanScratch, inChanScratchCount);
                 double rfi_time = omp_get_wtime() - rfi_start;
                 printf("RFI detection time: %.4f seconds\n", rfi_time);
 
@@ -1412,10 +1425,10 @@ int main(int argc, char *argv[])
         } else if (numiter % 200 == 1) {
             m.plot = 0; 
         }
-        // if (numiter == 200) {
-        //     status = 0; // keep original behavior but allow cleanup and summary
-        //     break;
-        // }
+        if (numiter == 200) {
+            status = 0; // keep original behavior but allow cleanup and summary
+            break;
+        }
 
         // if (numiter == 1) {
         //     m.plot = 0;
@@ -1475,6 +1488,7 @@ int main(int argc, char *argv[])
     free(identSubst_goodSamps);
     free(identSubst_randIdxs);
     free(identSubst_medTemp);
+    free(inChanScratch);
 
     // Print loop timing summary (if any iteration executed)
     if (numiter > 0) {

@@ -172,13 +172,15 @@ void findMedianStd(float *arr, int n, float *outMedian, float *outStd)
 
 void findMeanStd(float *arr, int size, float *mean, float *std)
 {
-
+    // 使用局部 restrict 指针与 OpenMP SIMD 提示，便于编译器向量化
+    float *restrict a = arr;
     int i;
     /* === First pass for mean === */
     float sum = 0.0f;
+    #pragma omp simd reduction(+:sum)
     for (i = 0; i < size; i++)
     {
-        sum += arr[i];
+        sum += a[i];
     }
     float calculated_mean = sum / size;
     if (mean != NULL)
@@ -190,9 +192,10 @@ void findMeanStd(float *arr, int size, float *mean, float *std)
     if (std == NULL)
         return;
     float variance = 0.0f;
+    #pragma omp simd reduction(+:variance)
     for (i = 0; i < size; i++)
     {
-        float diff = arr[i] - calculated_mean;
+        float diff = a[i] - calculated_mean;
         variance += diff * diff;
     }
     variance /= size;

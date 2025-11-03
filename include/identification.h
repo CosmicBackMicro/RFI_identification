@@ -1,5 +1,6 @@
 #pragma once
 #include <stdbool.h>
+#include <stddef.h>
 void sumthreshold_2d(
     const float *dataT, 
     int nsamp, 
@@ -29,6 +30,9 @@ void outChanDetection(float *data, int nsamp, int nchan, int *channelFlagged,
 
 int meanOutlierDetection(float *data, int nsamp, int nchan, int *channelFlagged);
 
+int inChanDetection(float *data, int nsamp, int nchan, float Nsigma,
+    bool *horizontalMask, int *channel_fully_flagged,
+    float *scratch, size_t scratch_count);
 
 void subChanMed(float *data, int nsamp, int nchan, float *channel_medians, float *temp_data);
 
@@ -47,7 +51,8 @@ void identSubstNSigma(
     float NSigmaInChan, float NSigmaOutChan, int iterationIndex, int plot,
     IdentNSigmaMasks *masks,
     float *finalMedian, float *finalStd, int cudaReady, int *flaggedChans,
-    int *identSubst_goodSamps, int *identSubst_randIdxs, float *identSubst_medTemp);
+    int *identSubst_goodSamps, int *identSubst_randIdxs, float *identSubst_medTemp,
+    float *inChanScratch, size_t inChanScratchCount);
 
 // Histogram functions
 // OutChannel comparison histogram function

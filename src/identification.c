@@ -1571,17 +1571,15 @@ void flagChannelsByDualSumThreshold(
  * @param Nsigma Sigma threshold for outlier detection
  * @param mask Output mask for this channel (nsamp length)
  * @param median_temp Temporary array for median calculation (nsamp length)
- * @param good_samples Temporary array for good sample indices (nsamp length)
- * @param random_indices Temporary array for random indices (nsamp length)
  * @return Total number of outliers detected
  */
 int inChanOutlierIter(float *data, int nsamp, float Nsigma, 
-                                   bool *mask, float *median_temp,
-                                   int *good_samples, int *random_indices)
+                                   bool *mask, float *median_temp)
 {
     const int MAX_ITERATIONS = 15;   // Increased maximum iterations
     const float STD_CHANGE_THRESHOLD = 0.0001f;  // Standard deviation change rate threshold (0.01%)
     const float MEDIAN_CHANGE_THRESHOLD = 1e-6f;  // Median change threshold
+    const float EPS_STD = 1e-12f;    // Tiny epsilon to avoid divide-by-zero and detect degenerate std
     
     float last_median = 0.0f, last_std = 0.0f;
     float current_median, current_std;
@@ -1598,37 +1596,34 @@ int inChanOutlierIter(float *data, int nsamp, float Nsigma,
         }
     }
     
-    if (valid_count < 3) {
-        // Too few samples for meaningful statistics
-        printf("    [DEBUG] Channel has too few valid samples (%d < 3), skipping\n", valid_count);
-        return 0;
-    }
+    if (valid_count < 3) return 0;
     
-    int converged = 0;
-    
-    while (iter < MAX_ITERATIONS && valid_count >= 3 && !converged)
+    while (iter < MAX_ITERATIONS && valid_count >= 3)
     {
-    // Calculate current median and std from that median in one pass
-    findMedianStd(median_temp, valid_count, &current_median, &current_std);
-        
+        // Calculate current median and std from that median in one pass
+        findMedianStd(median_temp, valid_count, &current_median, &current_std);
+
+        // Early stop: degenerate standard deviation
+        if (current_std <= EPS_STD) break;
+
         // Check convergence conditions after first iteration
         if (iter > 0) {
             median_change = fabsf(current_median - last_median);
-            std_change_rate = (last_std > 0) ? fabsf(current_std - last_std) / last_std : 0.0f;
-            
+            float denom = (last_std > EPS_STD) ? last_std : EPS_STD;
+            std_change_rate = fabsf(current_std - last_std) / denom;
             if (median_change < MEDIAN_CHANGE_THRESHOLD && std_change_rate < STD_CHANGE_THRESHOLD) {
-                converged = 1;
+                break;  // Converged — avoid an extra full pass
             }
         }
-        
+
         // Calculate N-sigma bounds
         float upper_bound = current_median + Nsigma * current_std;
         float lower_bound = current_median - Nsigma * current_std;
-        
+
         // Flag new outliers and rebuild valid data array
         int new_outliers = 0;
-        valid_count = 0;  // Reset and rebuild
-        
+        int new_valid_count = 0;  // Rebuild count
+
         for (int i = 0; i < nsamp; i++) {
             if (mask[i] == 0) {  // Currently unmasked
                 if (data[i] > upper_bound || data[i] < lower_bound) {
@@ -1636,27 +1631,24 @@ int inChanOutlierIter(float *data, int nsamp, float Nsigma,
                     new_outliers++;
                     total_outliers++;
                 } else {
-                    median_temp[valid_count] = data[i];  // Keep in valid data
-                    valid_count++;
+                    median_temp[new_valid_count] = data[i];  // Keep in valid data
+                    new_valid_count++;
                 }
             }
         }
-        
-        if (new_outliers == 0 && iter > 0) {
-            converged = 1;
+
+        // Early stop: no new outliers in this iteration
+        if (new_outliers == 0) {
+            break;
         }
-        
+
         // Update for next iteration
+        valid_count = new_valid_count;
         last_median = current_median;
         last_std = current_std;
         iter++;
     }
-    
-    // Adjust reason if stopped due to insufficient samples
-    if (valid_count < 3) {
-        // No action needed, just continue
-    }
-    
+
     return total_outliers;
 }
 /**
@@ -1670,34 +1662,48 @@ int inChanOutlierIter(float *data, int nsamp, float Nsigma,
  * @return Total number of outliers detected across all channels
  */
 int inChanDetection(float *data, int nsamp, int nchan, float Nsigma,
-    bool *horizontalMask, int *channel_fully_flagged)
+    bool *horizontalMask, int *channel_fully_flagged,
+    float *scratch, size_t scratch_count)
 {
     int totalOutliers = 0;
-    
-    // Allocate temporary arrays for each thread
-    {
-        float *median_temp = (float *)malloc(nsamp * sizeof(float));
-        int *good_samples = (int *)malloc(nsamp * sizeof(int));
-        int *random_indices = (int *)malloc(nsamp * sizeof(int));
-        int i;
-        
-        for (i = 0; i < nchan; i++)
+
+    int threads = omp_get_max_threads();
+    if (threads < 1) threads = 1;
+    size_t required = (size_t)threads * (size_t)nsamp;
+
+    if (scratch && scratch_count >= required) {
+        #pragma omp parallel reduction(+:totalOutliers)
         {
-            // Perform iterative outlier detection for this channel
-            int channelOutliers = inChanOutlierIter(
-                data + i * nsamp, nsamp, Nsigma,
-                horizontalMask + i * nsamp, median_temp,
-                good_samples, random_indices
-            );
-            
-            totalOutliers += channelOutliers;
+            const int t = omp_get_thread_num();
+            float *median_temp_local = scratch + (size_t)t * (size_t)nsamp;
+
+            #pragma omp for schedule(static)
+            for (int i = 0; i < nchan; i++)
+            {
+                int channelOutliers = inChanOutlierIter(
+                    data + (size_t)i * (size_t)nsamp, nsamp, Nsigma,
+                    horizontalMask + (size_t)i * (size_t)nsamp, median_temp_local);
+                totalOutliers += channelOutliers;
+            }
         }
-        
-        free(median_temp);
-        free(good_samples);
-        free(random_indices);
+        return totalOutliers;
     }
-    
+
+    // Fallback: sequential processing with on-stack buffer if scratch is unavailable or undersized
+    float *temp = (float *)malloc((size_t)nsamp * sizeof(float));
+    if (!temp) {
+        return totalOutliers; // give up silently if allocation fails
+    }
+
+    for (int i = 0; i < nchan; i++)
+    {
+        int channelOutliers = inChanOutlierIter(
+            data + (size_t)i * (size_t)nsamp, nsamp, Nsigma,
+            horizontalMask + (size_t)i * (size_t)nsamp, temp);
+        totalOutliers += channelOutliers;
+    }
+
+    free(temp);
     return totalOutliers;
 }
 
@@ -1952,7 +1958,8 @@ void identSubstNSigma(
     int iterationIndex, int plot,
     IdentNSigmaMasks *masks,
     float *finalMedian, float *finalStd, int cudaReady, int *flaggedChans,
-    int *identSubst_goodSamps, int *identSubst_randIdxs, float *identSubst_medTemp)
+    int *identSubst_goodSamps, int *identSubst_randIdxs, float *identSubst_medTemp,
+    float *inChanScratch, size_t inChanScratchCount)
 {
     bool *horizontalMask = masks->horizontalMask;
     bool *verticalMask = masks->verticalMask;
@@ -1961,12 +1968,6 @@ void identSubstNSigma(
     bool *brightMask = masks->chanBrightMask;
     bool *darkMask = masks->chanDarkMask;
     bool *complexMask = masks->chanComplexMask;
-
-    // 方案A: 每次调用开头清空 flaggedChans，避免跨迭代残留影响 killThresh 和后续逻辑
-    if (flaggedChans) {
-        memset(flaggedChans, 0, sizeof(int) * nchan);
-    }
-
     memset(horizontalMask, 0, nsamp * nchan * sizeof(bool));
     memset(verticalMask, 0, nsamp * nchan * sizeof(bool));
     memset(globalMask, 0, nsamp * nchan * sizeof(bool));
@@ -1974,20 +1975,13 @@ void identSubstNSigma(
     memset(brightMask, 0, nsamp * nchan * sizeof(bool));
     memset(darkMask, 0, nsamp * nchan * sizeof(bool));
     memset(complexMask, 0, nsamp * nchan * sizeof(bool));
-
-    // Use external buffers to avoid per-iteration allocation
-    int *good_samples = identSubst_goodSamps;     // Reserved for substitution
-    int *random_indices = identSubst_randIdxs;    // Reserved for substitution
-    // (void)good_samples; (void)random_indices;
-    float *median_temp = identSubst_medTemp;
-    if (median_temp) {
-        memcpy(median_temp, data, (size_t)nsamp * (size_t)nchan * sizeof(float));
-    }
+    
+    memset(flaggedChans, 0, sizeof(int) * nchan);
+    memcpy(identSubst_medTemp, data, (size_t)nsamp * (size_t)nchan * sizeof(float));
     
     float killThresh = 0.2f;
     int i;
     
-
     if (plot)
     {
         printf("=== Generating Channel STD sigma_j Histogram (Iteration %d) ===\n", iterationIndex);
@@ -1999,7 +1993,8 @@ void identSubstNSigma(
     printf("=== Performing point-level (pixel) outlier detection ===\n");
     double inchan_start = omp_get_wtime();
     int pixelOutliers = 0;
-    pixelOutliers = inChanDetection(data, nsamp, nchan, NSigmaInChan, pointMask, flaggedChans);
+    pixelOutliers = inChanDetection(data, nsamp, nchan, NSigmaInChan, pointMask,
+        flaggedChans, inChanScratch, inChanScratchCount);
     
     double inchan_time = omp_get_wtime() - inchan_start;
     printf("Point-level detection: flagged %d outlier pixels (%.4f seconds)\n", pixelOutliers, inchan_time);
@@ -2062,7 +2057,7 @@ void identSubstNSigma(
     }
     
     if ((brightMask || darkMask || complexMask) && nchan > 0) {
-        classifyChannels(median_temp, nsamp, nchan, flaggedChans, brightMask, darkMask, complexMask);
+        classifyChannels(identSubst_medTemp, nsamp, nchan, flaggedChans, brightMask, darkMask, complexMask);
     }
 
     printf("Final status: %d/%d channels fully flagged (%.2f%%)\n", 
@@ -2082,9 +2077,8 @@ void identSubstNSigma(
     printf("=== End RFI Detection Statistics ===\n");
     
     // globalMask already equals union of all masks via logicalOR
-    float finalMedian_temp, finalStd_temp;
-    findMeanStd(median_temp, nsamp * nchan, &finalMedian_temp, &finalStd_temp);
-    float finalMedian_value = median(median_temp, nsamp * nchan);
+    // finalMedian/finalStd are float* outputs; pass them directly (not by address)
+    findMedianStd(identSubst_medTemp, nsamp * nchan, finalMedian, finalStd);
 
     // Calculate total pixels substituted
     int totalPixelsSubstituted = inChanPixelsSubstituted + outChanPixelsSubstituted;
@@ -2100,10 +2094,6 @@ void identSubstNSigma(
         printf("WARNING: High outlier ratio %.4f > %.2f detected - data may be corrupted\n",
                outlierRatio, killThresh);
     }
-
-    *finalMedian = finalMedian_value;
-    *finalStd = finalStd_temp;
-
 
     // Buffers are managed by caller
 

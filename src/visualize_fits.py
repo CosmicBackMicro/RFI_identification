@@ -5,17 +5,60 @@
 
 import os
 import numpy as np
-import matplotlib.pyplot as plt
 import fitsio
+import matplotlib
+
+
+def _setup_mpl_backend():
+    """Prefer a Tk backend to avoid mixing Qt (matplotlib) with Tk (file dialog),
+    which can cause freezes on some Linux/remote/X11 setups. Fallback to Agg if Tk is unavailable.
+    You can override by setting environment variable DERFI_MPL_BACKEND.
+    """
+    env_backend = os.environ.get("DERFI_MPL_BACKEND")
+    if env_backend:
+        try:
+            matplotlib.use(env_backend, force=True)
+            return
+        except Exception:
+            pass  # fall through to auto selection
+    # Try TkAgg first
+    try:
+        import tkinter  # noqa: F401
+        matplotlib.use("TkAgg", force=True)
+        return
+    except Exception:
+        # Headless or Tk unavailable -> safe non-interactive backend
+        matplotlib.use("Agg", force=True)
+
+
+_setup_mpl_backend()
+
+# Disable matplotlib's default key bindings that conflict with our shortcuts
+try:
+    # Avoid grid toggling when pressing 'g'/'G'
+    matplotlib.rcParams['keymap.grid'] = []
+    matplotlib.rcParams['keymap.grid_minor'] = []
+    # Avoid built-in nav on left/right/home that could interfere with our handler
+    matplotlib.rcParams['keymap.back'] = []
+    matplotlib.rcParams['keymap.forward'] = []
+    matplotlib.rcParams['keymap.home'] = []
+    # Disable axis offset formatting like +1.37e+2 on x-axis
+    matplotlib.rcParams['axes.formatter.useoffset'] = False
+except Exception:
+    pass
+
+import matplotlib.pyplot as plt
 
 def load_fits_image(fits_path):
     """
     从FITS文件加载原始图像数据，不进行归一化。
+    返回 (image, tbin)，其中 tbin 为每个时间样本的时间宽度（秒）。
+    若头信息中无 TBIN/TSAMP，则 tbin 默认 1.0。
     """
     # 使用更安全的FITS文件读取方式
     with fitsio.FITS(fits_path, 'r') as fits:
-        fits_header = fits[1].read_header()
-        fits_data = fits[1].read()
+            fits_header = fits[1].read_header()
+            fits_data = fits[1].read()
         
     nsamp = fits_header["NBLOCKS"] * fits_header["NSBLK"]
     nchan = fits_header["NCHAN"]
@@ -29,15 +72,28 @@ def load_fits_image(fits_path):
     data *= dat_scl[np.newaxis, :]   # 原地乘法
     data += dat_offs[np.newaxis, :]  # 原地加法
     
-    # 合并转置和翻转操作
+    # 合并转置和翻转操作（保持原先显示方向）
     image = np.flipud(data.T)
-                    
-    return image
+
+    # 提取时间分辨率
+    tbin = None
+    # 常见键名：TBIN（PSRFITS），或 TSAMP 等
+    if 'TBIN' in fits_header:
+        tbin = float(fits_header['TBIN'])
+    elif 'TSAMP' in fits_header:
+        tbin = float(fits_header['TSAMP'])
+    else:
+        tbin = 1.0
+        print("[Info] Header 未找到 TBIN/TSAMP，tbin 采用默认 1.0 秒")
+
+    return image, tbin
 
 import argparse
 
-def test_load_fits_image(output_dir):
-    """测试load_fits_image函数，在同一个图窗中步进显示所有图像"""
+def test_load_fits_image(output_dir, verbose=False):
+    """使用键盘左右方向键进行双向浏览（←/→），按 J 跳转编号，Q/Esc 退出。
+    verbose=True 时会打印每帧加载日志，默认关闭以减少 I/O。
+    """
     import glob
     import re
 
@@ -53,62 +109,226 @@ def test_load_fits_image(output_dir):
         if match:
             return int(match.group(1))
         return -1
-    
+
     fits_files.sort(key=get_block_number)
 
     if not fits_files:
         print(f"No FITS files found in the directory: {output_dir}")
         return
 
-    # 在循环外创建图窗和坐标轴
+    print("Right/Left Arrow: Step Forward/Back; J: Jump to index; Q/Esc: Quit")
+
+    # Create figure and axis once
     fig, ax = plt.subplots(figsize=(12, 8))
-    # 添加一个占位符图像和颜色条
-    image_display = ax.imshow(np.zeros((1,1)), aspect='auto', cmap='gist_heat')
+    image_display = ax.imshow(np.zeros((1, 1)), aspect='auto', cmap='gist_heat')
     colorbar = fig.colorbar(image_display, ax=ax)
     colorbar.set_label('Intensity')
 
-    for i, fits_path in enumerate(fits_files):
-        if not os.path.exists(fits_path):
-            print(f"Test FITS file not found: {fits_path}")
-            continue
-        
-        print(f"Loading FITS file: {fits_path} ({i+1}/{len(fits_files)})")
-        
-        # 调用load_fits_image函数
-        image = load_fits_image(fits_path)
-        
+    # idx: current index; busy: rendering in progress; pending: pending direction (-1/0/+1)
+    state = {'idx': 0, 'busy': False, 'pending': 0}
+
+    def show(index):
+        # Clamp index
+        index = max(0, min(index, len(fits_files) - 1))
+        path = fits_files[index]
+        if not os.path.exists(path):
+            print(f"Missing file: {path}")
+            return
+
+        if verbose:
+            print(f"Loading FITS file: {path} ({index+1}/{len(fits_files)})")
+        image, tbin = load_fits_image(path)
         if image is None:
             print("Failed to load image")
-            continue
-        
-        # Calculate vmin and vmax based on 3-sigma
-        mean = image.mean()
-        std = image.std()
-        vmin = mean - 3 * std
-        vmax = mean + 3 * std
-        
-        # 更新图像数据和范围
+            return
+
+        # Calculate vmin and vmax based on 3-sigma (guard zero-std)
+        mean = float(image.mean())
+        std = float(image.std())
+        if std <= 0:
+            vmin, vmax = mean - 1e-6, mean + 1e-6
+        else:
+            vmin, vmax = mean - 3 * std, mean + 3 * std
+
+        # Update image, color limits and coordinate extent
         image_display.set_data(image)
         image_display.set_clim(vmin, vmax)
-        
-        # 更新标题和标签
-        ax.set_title(f'Visualization of {os.path.basename(fits_path)}')
-        ax.set_xlabel('Time Sample')
-        ax.set_ylabel('Channel')
-        
-        # 重绘图窗
-        fig.canvas.draw()
 
-        # 如果不是最后一张图，则等待按键
-        if i < len(fits_files) - 1:
-            plt.waitforbuttonpress()
-        else:
-            # 显示最后一张图，直到手动关闭
-            plt.show()
+        # 设置坐标范围：
+        #  x 轴：相对第 1 个样本的时间，(block_index-1)*nsamp*tbin + i*tbin
+        #  y 轴：频道 0..nchan
+        nchan, nsamp = image.shape
+        import re as _re
+        m = _re.search(r'block(\d+)\.(fits|fit)$', os.path.basename(path))
+        block_idx = int(m.group(1)) if m else 1
+        x_left = ((block_idx - 1) * nsamp) * tbin
+        x_right = x_left + nsamp * tbin
+        y_bottom, y_top = 0, nchan
+        try:
+            image_display.set_extent((x_left, x_right, y_bottom, y_top))
+            ax.set_xlim(x_left, x_right)
+            ax.set_ylim(y_bottom, y_top)
+        except Exception:
+            pass
+
+        # Force plain tick labels on x-axis: no scientific, no offset string
+        try:
+            from matplotlib.ticker import ScalarFormatter
+            sf = ScalarFormatter(useOffset=False)
+            sf.set_scientific(False)
+            ax.xaxis.set_major_formatter(sf)
+            # Alternatively, ensure style plain
+            ax.ticklabel_format(axis='x', style='plain', useOffset=False)
+        except Exception:
+            pass
+
+        # Update title and labels
+        ax.set_title(f'[{index+1}/{len(fits_files)}] {os.path.basename(path)}  (←/→:step, J:jump-to, Q/Esc:quit)')
+        ax.set_xlabel('Time since first sample (s)')
+        ax.set_ylabel('Channel (index)')
+
+        # Do not draw here; draw synchronously in navigation to avoid frame skipping
+        state['idx'] = index
+
+    def _do_step(direction):
+        """Perform one navigation step synchronously (direction in {-1, +1}).
+        Ensures the frame is drawn before accepting another step.
+        """
+        if direction == 0:
+            return
+        cur = state['idx']
+        target = cur + (1 if direction > 0 else -1)
+        target = max(0, min(target, len(fits_files) - 1))
+        if target == cur:
+            state['pending'] = 0
+            return
+        state['busy'] = True
+        show(target)
+        # Force a synchronous redraw to avoid event pile-up when holding keys
+        fig.canvas.draw()
+        try:
+            fig.canvas.flush_events()
+        except Exception:
+            pass
+        # Yield briefly to the UI loop to ensure the image appears
+        plt.pause(0.001)
+        state['busy'] = False
+        # If a new request came in while drawing, coalesce and process once
+        if state['pending'] != 0:
+            pending_dir = state['pending']
+            state['pending'] = 0
+            _do_step(pending_dir)
+
+    def _navigate(direction):
+        """Handle navigation requests. If drawing is in progress, remember last direction."""
+        if state['busy']:
+            state['pending'] = 1 if direction > 0 else -1
+            return
+        _do_step(direction)
+
+    def on_key(event):
+        def _prompt_goto_index():
+            """Open a small dialog to ask for an index (1-based). Returns int or None on cancel/error."""
+            try:
+                import tkinter as tk
+                from tkinter import simpledialog
+                root = tk.Tk()
+                root.withdraw()
+                value = simpledialog.askinteger(
+                    title="跳转到编号",
+                    prompt=f"Jump to (1-{len(fits_files)}):",
+                    minvalue=1,
+                    maxvalue=len(fits_files),
+                    parent=root
+                )
+                try:
+                    root.update()
+                except Exception:
+                    pass
+                root.destroy()
+                return value
+            except Exception as e:
+                print(f"[Info] 无法显示跳转输入框：{e}")
+                return None
+
+        key = event.key
+        if key in ('right', 'n', ' '):
+            _navigate(+1)
+        elif key in ('left', 'p', 'backspace'):
+            _navigate(-1)
+        elif key in ('j', 'J'):
+            if not state['busy']:
+                value = _prompt_goto_index()
+                if value is not None:
+                    target = max(1, min(value, len(fits_files))) - 1
+                    show(target)
+                    fig.canvas.draw(); plt.pause(0.001)
+        elif key in ('q', 'escape'):
+            plt.close(fig)
+
+    fig.canvas.mpl_connect('key_press_event', on_key)
+    show(0)
+    fig.canvas.draw(); plt.pause(0.001)
+    plt.show()
+
+def _choose_directory_via_gui(initial_dir=None, title="选择包含 FITS 文件的文件夹"):
+    """Try to open a folder picker dialog using Tkinter. Returns path or None if canceled/fails."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        # On headless systems, this may raise a TclError
+        root = tk.Tk()
+        root.withdraw()
+        # Explicit keyword args to satisfy type checkers
+        init_dir = initial_dir if (initial_dir and os.path.isdir(initial_dir)) else os.getcwd()
+        selected = filedialog.askdirectory(parent=root,
+                                           title=title,
+                                           initialdir=init_dir,
+                                           mustexist=False)
+        try:
+            root.update()
+        except Exception:
+            pass
+        root.destroy()
+        if selected:
+            return selected
+        return None
+    except Exception as e:
+        # GUI unavailable or other error; fallback handled by caller
+        print(f"[Info] 无法打开图形化目录选择器，将回退到命令行参数/默认路径。原因：{e}")
+        return None
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Visualize FITS files in a directory.')
-    parser.add_argument('--dir', type=str, default="/home/cbm/deRFI/output",
-                        help='Directory containing FITS files to visualize. Defaults to the hardcoded path.')
+    parser.add_argument('--dir', type=str, default=None,
+                        help='Directory containing FITS files to visualize. If not set, a folder dialog will pop up.')
+    parser.add_argument('--browse', action='store_true',
+                        help='Force opening a folder selection dialog even if --dir is provided.')
+    parser.add_argument('--verbose', action='store_true',
+                        help='Print per-frame loading logs (default: off).')
     args = parser.parse_args()
-    test_load_fits_image(args.dir)
+
+    DEFAULT_DIR = "/home/cbm/deRFI/output"
+
+    dir_path = None
+    # If --browse is requested or --dir not provided, try GUI first
+    if args.browse or not args.dir:
+        dir_path = _choose_directory_via_gui(initial_dir=args.dir or os.getcwd())
+
+    # If GUI canceled or failed, fallback to provided --dir
+    if not dir_path and args.dir:
+        dir_path = args.dir
+
+    # Final fallback to the previous hardcoded default
+    if not dir_path:
+        print(f"[Info] 使用默认路径：{DEFAULT_DIR}")
+        dir_path = DEFAULT_DIR
+
+    # Validate path exists
+    if not os.path.isdir(dir_path):
+        print(f"[Error] 目标路径不存在：{dir_path}")
+        raise SystemExit(1)
+
+    test_load_fits_image(dir_path, verbose=args.verbose)

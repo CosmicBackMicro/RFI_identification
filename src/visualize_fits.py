@@ -89,8 +89,9 @@ def load_fits_image(fits_path):
     return image, tbin
 
 import argparse
+from typing import Optional
 
-def test_load_fits_image(output_dir, verbose=False):
+def test_load_fits_image(output_dir: str, verbose: bool=False, mask_dir: Optional[str]=None, mask_alpha: float=0.35):
     """使用键盘左右方向键进行双向浏览（←/→），按 J 跳转编号，Q/Esc 退出。
     verbose=True 时会打印每帧加载日志，默认关闭以减少 I/O。
     """
@@ -118,9 +119,39 @@ def test_load_fits_image(output_dir, verbose=False):
 
     print("Right/Left Arrow: Step Forward/Back; J: Jump to index; Q/Esc: Quit")
 
+    # Optional: prepare mask file mapping by block index
+    mask_map = {}
+    if mask_dir:
+        import glob as _glob
+        import re as _re
+        if not os.path.isdir(mask_dir):
+            print(f"[Warn] Mask dir not found: {mask_dir}, overlay disabled.")
+            mask_dir = None
+        else:
+            # Accept common case variants
+            pngs = []
+            for pat in ('*.png', '*.PNG', '*.Png'):
+                pngs.extend(_glob.glob(os.path.join(mask_dir, pat)))
+            def _idx_from_mask_name(name):
+                # Prefer 'blockNNN' pattern; fallback to last integer in filename
+                m = _re.search(r'block(\d+)', name)
+                if m:
+                    return int(m.group(1))
+                m2 = _re.findall(r'(\d+)', name)
+                if m2:
+                    return int(m2[-1])
+                return None
+            for p in pngs:
+                idx = _idx_from_mask_name(os.path.basename(p))
+                if idx is not None:
+                    mask_map[idx] = p
+            print(f"[Info] Found {len(mask_map)} mask PNG(s) in: {mask_dir}")
+
     # Create figure and axis once
     fig, ax = plt.subplots(figsize=(12, 8))
     image_display = ax.imshow(np.zeros((1, 1)), aspect='auto', cmap='gist_heat')
+    # Create an empty RGBA overlay for mask; updated per frame when available
+    mask_display = ax.imshow(np.zeros((1, 1, 4), dtype=float), aspect='auto', interpolation='nearest')
     colorbar = fig.colorbar(image_display, ax=ax)
     colorbar.set_label('Intensity')
 
@@ -154,7 +185,7 @@ def test_load_fits_image(output_dir, verbose=False):
         image_display.set_data(image)
         image_display.set_clim(vmin, vmax)
 
-        # 设置坐标范围：
+    # 设置坐标范围：
         #  x 轴：相对第 1 个样本的时间，(block_index-1)*nsamp*tbin + i*tbin
         #  y 轴：频道 0..nchan
         nchan, nsamp = image.shape
@@ -170,6 +201,109 @@ def test_load_fits_image(output_dir, verbose=False):
             ax.set_ylim(y_bottom, y_top)
         except Exception:
             pass
+
+        # If mask overlay enabled, try to overlay corresponding PNG by block index
+        if mask_dir:
+            # Derive block index from FITS filename
+            m2 = _re.search(r'block(\d+)\.(fits|fit)$', os.path.basename(path))
+            block_idx = int(m2.group(1)) if m2 else None
+            overlay = None
+            # Try exact match first; then try off-by-one (0-based masks vs 1-based blocks)
+            candidate_path = None
+            if block_idx is not None:
+                if block_idx in mask_map:
+                    candidate_path = mask_map[block_idx]
+                elif (block_idx - 1) in mask_map:
+                    candidate_path = mask_map[block_idx - 1]
+                elif (block_idx + 1) in mask_map:
+                    candidate_path = mask_map[block_idx + 1]
+            if candidate_path:
+                try:
+                    # Read class-index mask preserving integer labels
+                    mask_idx = None
+                    try:
+                        from PIL import Image as _PIL_Image
+                        _im = _PIL_Image.open(candidate_path)
+                        # Preserve palette indices if present; else convert to 8-bit or 32-bit integer
+                        if _im.mode == 'P':
+                            mask_idx = np.array(_im, dtype=np.uint16)
+                        elif _im.mode in ('L',):
+                            mask_idx = np.array(_im, dtype=np.uint8)
+                        elif _im.mode.startswith('I'):
+                            mask_idx = np.array(_im, dtype=np.int32)
+                        else:
+                            # Fallback: convert to 'L' (8-bit) which holds label indices up to 255
+                            mask_idx = np.array(_im.convert('L'), dtype=np.uint8)
+                    except Exception:
+                        # Fallback to matplotlib if PIL unavailable; will likely return floats in [0,1]
+                        import matplotlib.image as mpimg
+                        mask_img = mpimg.imread(candidate_path)
+                        if mask_img.ndim == 2:
+                            mask_idx = (mask_img * 255.0 + 0.5).astype(np.uint8)
+                        elif mask_img.ndim == 3:
+                            mask_idx = (mask_img[..., 0] * 255.0 + 0.5).astype(np.uint8)
+                        else:
+                            mask_idx = None
+
+                    if mask_idx is not None and mask_idx.ndim == 2:
+                        # Try to match orientation to displayed image (nchan x nsamp)
+                        mh, mw = mask_idx.shape
+                        ih, iw = image.shape
+                        if (mh, mw) == (ih, iw):
+                            mask_aligned = mask_idx
+                        elif (mh, mw) == (iw, ih):
+                            mask_aligned = mask_idx.T
+                        else:
+                            # Shapes differ; cannot safely rescale without extra deps; disable overlay for this frame
+                            print(f"[Warn] Mask shape {mh}x{mw} mismatches image {ih}x{iw}; skip overlay for {block_idx}")
+                            mask_aligned = None
+
+                        if mask_aligned is not None:
+                            # Build categorical color overlay: 0=background (transparent), >0 are classes
+                            rgba = np.zeros((ih, iw, 4), dtype=float)
+                            # A small color palette for classes 1..N (cycled)
+                            # Prefer GB-dominant, low-R colors to contrast gi st_heat (red-toned)
+                            palette = np.array([
+                                [0.00, 1.00, 0.00],  # green
+                                [0.00, 1.00, 1.00],  # cyan
+                                [0.00, 0.85, 0.70],  # teal
+                                [0.00, 0.70, 1.00],  # sky blue
+                                [0.10, 0.90, 0.90],  # light cyan (low R)
+                                [0.10, 1.00, 0.40],  # spring green (low R)
+                                [0.00, 0.50, 1.00],  # blue
+                                [0.15, 0.85, 0.55],  # sea green
+                                [0.20, 0.70, 1.00],  # azure
+                                [0.25, 1.00, 0.75],  # aquamarine
+                            ], dtype=float)
+                            cls_ids = np.unique(mask_aligned)
+                            cls_ids = cls_ids[cls_ids != 0]
+                            for cid in cls_ids:
+                                sel = (mask_aligned == cid)
+                                color = palette[(int(cid) - 1) % len(palette)]
+                                rgba[..., 0][sel] = color[0]
+                                rgba[..., 1][sel] = color[1]
+                                rgba[..., 2][sel] = color[2]
+                                rgba[..., 3][sel] = float(mask_alpha)
+                            overlay = rgba
+                except Exception as e:
+                    print(f"[Warn] Failed to overlay mask for block {block_idx}: {e}")
+
+            if overlay is not None:
+                mask_display.set_data(overlay)
+                try:
+                    mask_display.set_extent((x_left, x_right, y_bottom, y_top))
+                except Exception:
+                    pass
+                # Ensure overlay is on top
+                try:
+                    mask_display.set_zorder(image_display.get_zorder() + 1)
+                except Exception:
+                    pass
+                mask_display.set_visible(True)
+            else:
+                mask_display.set_visible(False)
+        else:
+            mask_display.set_visible(False)
 
         # Force plain tick labels on x-axis: no scientific, no offset string
         try:
@@ -308,6 +442,10 @@ if __name__ == "__main__":
                         help='Force opening a folder selection dialog even if --dir is provided.')
     parser.add_argument('--verbose', action='store_true',
                         help='Print per-frame loading logs (default: off).')
+    parser.add_argument('--mask', nargs='?', const=True, default=False,
+                        help='Enable mask overlay. Optionally provide MASK_DIR; if omitted, a folder dialog will ask for it.')
+    parser.add_argument('--mask-alpha', type=float, default=0.35,
+                        help='Alpha (opacity) for mask overlay in [0,1]. Default: 0.35')
     args = parser.parse_args()
 
     DEFAULT_DIR = "/home/cbm/deRFI/output"
@@ -331,4 +469,18 @@ if __name__ == "__main__":
         print(f"[Error] 目标路径不存在：{dir_path}")
         raise SystemExit(1)
 
-    test_load_fits_image(dir_path, verbose=args.verbose)
+    # Resolve mask directory if overlay enabled
+    mask_dir = None
+    if args.mask:
+        if isinstance(args.mask, str) and args.mask:
+            mask_dir = args.mask
+        else:
+            mask_dir = _choose_directory_via_gui(initial_dir=dir_path, title="选择包含 掩码PNG 的文件夹")
+        if mask_dir and not os.path.isdir(mask_dir):
+            print(f"[Warn] 提供的掩码路径无效：{mask_dir}，将禁用掩码叠加。")
+            mask_dir = None
+
+    # Clamp mask alpha
+    mask_alpha = max(0.0, min(1.0, float(args.mask_alpha)))
+
+    test_load_fits_image(dir_path, verbose=args.verbose, mask_dir=mask_dir, mask_alpha=mask_alpha)

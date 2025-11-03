@@ -64,7 +64,7 @@ int eraseIsolatedPixels(bool *restrict mask, int width, int height, int N)
 
     const int half = N / 2;
     int suppressed = 0;
-    #pragma omp parallel for reduction(+:suppressed) schedule(static)
+    // #pragma omp parallel for reduction(+:suppressed) schedule(static)
     for (int y = 0; y < H; ++y) {
         for (int x = 0; x < W; ++x) {
             const int idx = y * W + x;
@@ -368,7 +368,7 @@ void subChanMed(float *data, int nsamp, int nchan, float *channel_medians, float
     }
 
     if (alloc_ok && thread_bufs) {
-        #pragma omp parallel for schedule(static)
+    // #pragma omp parallel for schedule(static)
         for (int i = 0; i < nchan; i++) {
             int tid = omp_get_thread_num();
             float *tmp = thread_bufs[tid];
@@ -387,7 +387,7 @@ void subChanMed(float *data, int nsamp, int nchan, float *channel_medians, float
     }
 
     // 2) Subtract median from each channel (safe to parallelize; each channel slice is independent)
-    #pragma omp parallel for schedule(static)
+    // #pragma omp parallel for schedule(static)
     for (int i = 0; i < nchan; i++) {
         const float med = channel_medians[i];
         float *row = data + (size_t)i * nsamp;
@@ -673,7 +673,7 @@ void sumthreshold_2d(
     }
     
     // Apply Gaussian smoothing along time axis (for each channel)
-    #pragma omp parallel for
+    // #pragma omp parallel for
     for (j = 0; j < nchan; j++) {
         for (i = 0; i < nsamp; i++) {
             float weighted_sum = 0.0f;
@@ -693,7 +693,7 @@ void sumthreshold_2d(
     /* gaussian_kernel_m is on the stack now, no free needed */
     
     // Use residual data for thresholding
-    #pragma omp parallel for collapse(2)
+    // #pragma omp parallel for collapse(2)
     for (j = 0; j < nchan; j++) {
         for (i = 0; i < nsamp; i++) {
             temp_dataT[j * nsamp + i] = (temp_dataT[j * nsamp + i] - smoothed_data[j * nsamp + i]) / (global_std + 1e-6f);
@@ -712,7 +712,7 @@ void sumthreshold_2d(
     free(ksigma_mtemp);
 
     // Time-axis processing with optimized 1D
-    #pragma omp parallel for
+    // #pragma omp parallel for
     for (j = 0; j < nchan; j++) {
         sumthreshold_1d(&temp_dataT[j * nsamp], nsamp, &mask[j * nsamp], 
                        chi_1, M_len, temp_data_1d, local_mask_1d, M, chi_i);
@@ -723,14 +723,14 @@ void sumthreshold_2d(
     transpose(temp_dataT, nchan, nsamp, transposed_data);
 
     // Frequency-axis processing
-    #pragma omp parallel for
+    // #pragma omp parallel for
     for (i = 0; i < nsamp; i++) {
         sumthreshold_1d(&transposed_data[i * nchan], nchan, &temp_maskT[i * nchan], 
                        chi_1, M_len, temp_data_1d, local_mask_1d, M, chi_i);
     }
 
     // Merge masks
-    #pragma omp parallel for collapse(2)
+    // #pragma omp parallel for collapse(2)
     for (i = 0; i < nsamp; i++) {
         for (j = 0; j < nchan; j++) {
             mask[j * nsamp + i] |= temp_maskT[i * nchan + j];
@@ -1672,12 +1672,12 @@ int inChanDetection(float *data, int nsamp, int nchan, float Nsigma,
     size_t required = (size_t)threads * (size_t)nsamp;
 
     if (scratch && scratch_count >= required) {
-        #pragma omp parallel reduction(+:totalOutliers)
+    // #pragma omp parallel reduction(+:totalOutliers)
         {
             const int t = omp_get_thread_num();
             float *median_temp_local = scratch + (size_t)t * (size_t)nsamp;
 
-            #pragma omp for schedule(static)
+            // #pragma omp for schedule(static)
             for (int i = 0; i < nchan; i++)
             {
                 int channelOutliers = inChanOutlierIter(

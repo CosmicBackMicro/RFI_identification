@@ -63,7 +63,7 @@ void transpose(float *array, int nsamp, int nchan, float *arrayT)
 void transpose_int(const int *array, int nsamp, int nchan, int *arrayT)
 {
     int i, j;
-    #pragma omp parallel for collapse(2)
+    // #pragma omp parallel for collapse(2)
     for (i = 0; i < nsamp; i++)
     {
         for (j = 0; j < nchan; j++)

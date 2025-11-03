@@ -30,6 +30,58 @@
 #endif
 /* weak reference for optional CFITSIO API; if absent, pointer will be NULL */
 extern int fits_is_reentrant(void) __attribute__((weak));
+
+/* ===========================
+ * Thread-local CFITSIO handle helpers (per-thread FITS handles)
+ * =========================== */
+#define SLICE_PTR(base, elems_per_thread, tid) ((base) + ((size_t)(tid) * (size_t)(elems_per_thread)))
+
+static inline int slice_index_from_iter(int iter, int maxThreads) {
+    if (omp_in_parallel()) {
+        int tid = omp_get_thread_num();
+        return (tid >= 0) ? tid : 0;
+    }
+    if (maxThreads < 1) maxThreads = 1;
+    return iter % maxThreads;
+}
+
+static _Thread_local fitsfile *tls_read_fptr = NULL; // per-thread read handle
+static _Thread_local int tls_read_hdu_ready = 0;     // per-thread SUBINT selected
+
+static inline fitsfile* get_thread_read_fptr(const char *filename, int *status) {
+    if (!tls_read_fptr) {
+        int st = 0;
+        fits_open_file(&tls_read_fptr, filename, READONLY, &st);
+        if (status) *status = st;
+    } else if (status) {
+        *status = 0;
+    }
+    return tls_read_fptr;
+}
+
+static inline fitsfile* ensure_thread_read_ready(const char *filename, int *status) {
+    int st = 0;
+    fitsfile *f = get_thread_read_fptr(filename, &st);
+    if (status) *status = st;
+    if (st) return f;
+    if (!tls_read_hdu_ready) {
+        fits_movnam_hdu(f, BINARY_TBL, "SUBINT", 0, &st);
+        if (st) {
+            if (status) *status = st;
+        } else {
+            tls_read_hdu_ready = 1;
+        }
+    }
+    return f;
+}
+
+static inline void close_thread_read_fptr(void) {
+    if (tls_read_fptr) {
+        int st = 0;
+        fits_close_file(tls_read_fptr, &st);
+        tls_read_fptr = NULL;
+    }
+}
 /* ===========================
  * Minimal async reader (single-slot prefetch)
  * =========================== */
@@ -96,63 +148,6 @@ static void* reader_thread_main(void *arg) {
 
     if (rf) fits_close_file(rf, &st);
     return NULL;
-}
-
-static int start_reader_thread_prefetch(const Metadata *m) {
-    int reent = 1;
-    if (fits_is_reentrant) reent = fits_is_reentrant();
-    if (!reent) {
-        fprintf(stderr, "[CFITSIO] Non-reentrant build; async prefetch disabled.\n");
-        return 0;
-    }
-    memset(&g_reader_ctx, 0, sizeof(g_reader_ctx));
-    strncpy(g_reader_ctx.filename, m->filename, sizeof(g_reader_ctx.filename)-1);
-    g_reader_ctx.nchan = m->nchan;
-    g_reader_ctx.blockSize = m->blockSize;
-    g_reader_ctx.blocksPerRead = m->blocksPerRead;
-
-    pthread_mutex_lock(&g_reader_mtx);
-    g_reader_running = 1;
-    g_reader_slot.requested = -1;
-    g_reader_slot.result_ready = 0;
-    g_reader_slot.result_status = 0;
-    pthread_mutex_unlock(&g_reader_mtx);
-    pthread_create(&g_reader_thread, NULL, reader_thread_main, NULL);
-    return 1;
-}
-
-static void stop_reader_thread_prefetch(void) {
-    pthread_mutex_lock(&g_reader_mtx);
-    g_reader_running = 0;
-    pthread_cond_broadcast(&g_reader_cv);
-    pthread_mutex_unlock(&g_reader_mtx);
-    pthread_join(g_reader_thread, NULL);
-}
-
-static void submit_read_request_async(int blockIndex,
-                                      unsigned char *outRaw,
-                                      float *scaleRows,
-                                      float *offsetRows) {
-    pthread_mutex_lock(&g_reader_mtx);
-    g_reader_slot.requested = blockIndex;
-    g_reader_slot.outRaw = outRaw;
-    g_reader_slot.scaleRows = scaleRows;
-    g_reader_slot.offsetRows = offsetRows;
-    g_reader_slot.result_ready = 0;
-    pthread_cond_broadcast(&g_reader_cv);
-    pthread_mutex_unlock(&g_reader_mtx);
-}
-
-static int wait_read_ready_async(int *status_out) {
-    pthread_mutex_lock(&g_reader_mtx);
-    while (!g_reader_slot.result_ready && g_reader_running) {
-        pthread_cond_wait(&g_reader_cv, &g_reader_mtx);
-    }
-    int ready = g_reader_slot.result_ready;
-    int st = g_reader_slot.result_status;
-    pthread_mutex_unlock(&g_reader_mtx);
-    if (status_out) *status_out = st;
-    return ready;
 }
 
 #ifndef SWAP
@@ -336,7 +331,7 @@ void downsamp1D(float *array, int inputSize, int binFactor, float *binnedArray)
 
     int i, j;
     int dsSize = inputSize / binFactor;
-    #pragma omp parallel for
+    // #pragma omp parallel for
     for (i = 0; i < dsSize; i++)
     {
         float sum = 0.0f;
@@ -377,7 +372,7 @@ void downsamp2D(float *array, int nsamp, int nchan,
     int nchanBinned = nchan / binFactorFreq;
     if (isTranspose) {
         int i, j, ti, fj;
-        #pragma omp parallel for collapse(2)
+    // #pragma omp parallel for collapse(2)
         for (i = 0; i < nsampBinned; i++) {
             for (j = 0; j < nchanBinned; j++) {
                 float sum = 0.0f;
@@ -393,7 +388,7 @@ void downsamp2D(float *array, int nsamp, int nchan,
         }
     } else {
         int i, j, ti, fj;
-        #pragma omp parallel for collapse(2)
+    // #pragma omp parallel for collapse(2)
         for (i = 0; i < nsampBinned; i++) {
             for (j = 0; j < nchanBinned; j++) {
                 float sum = 0.0f;
@@ -424,14 +419,14 @@ static inline void sclOffsToFloatPerRow(const unsigned char *raw, float *out,
 {
     const size_t rowDataSize = (size_t)nsblk * (size_t)nchan;
 
-    #pragma omp parallel for collapse(2) schedule(static)
+    // #pragma omp parallel for collapse(2) schedule(static)
     for (int k = 0; k < blocksPerRead; ++k) {
         for (int j = 0; j < nsblk; ++j) {
             const float *scl  = scaleRows  + (size_t)k * (size_t)nchan;
             const float *offs = offsetRows + (size_t)k * (size_t)nchan;
             const unsigned char *src = raw + (size_t)k * rowDataSize + (size_t)j * (size_t)nchan;
             float *dst = out + (size_t)k * rowDataSize + (size_t)j * (size_t)nchan;
-            #pragma omp simd
+            // #pragma omp simd
             for (int i = 0; i < nchan; ++i) {
                 dst[i] = (float)src[i] * scl[i] + offs[i];
             }
@@ -441,9 +436,9 @@ static inline void sclOffsToFloatPerRow(const unsigned char *raw, float *out,
 
 void getProfile(float *restrict array, int nsamp, int nchan, float *restrict freqProfile, float *restrict timeProfile, bool *restrict mask)
 {
-    #pragma omp parallel
+    // #pragma omp parallel
     {
-        #pragma omp for schedule(static)
+    // #pragma omp for schedule(static)
         for (int i = 0; i < nchan; i++)
         {
             float sum = 0.0f;
@@ -460,7 +455,7 @@ void getProfile(float *restrict array, int nsamp, int nchan, float *restrict fre
             freqProfile[i] = (validCount > 0) ? sum / validCount : 0.0f;
         }
 
-        #pragma omp for schedule(static)
+    // #pragma omp for schedule(static)
         for (int i = 0; i < nsamp; i++)
         {
             float sum = 0.0f;
@@ -481,9 +476,9 @@ void getProfile(float *restrict array, int nsamp, int nchan, float *restrict fre
 
 void getProfileStd(float *restrict array, int nsamp, int nchan, float *restrict freqProfile, float *restrict timeProfile, bool *restrict mask)
 {
-    #pragma omp parallel
+    // #pragma omp parallel
     {
-        #pragma omp for schedule(static)
+    // #pragma omp for schedule(static)
         for (int i = 0; i < nchan; i++)
         {
             float sum = 0.0f;
@@ -514,7 +509,7 @@ void getProfileStd(float *restrict array, int nsamp, int nchan, float *restrict 
             }
         }
 
-        #pragma omp for schedule(static)
+    // #pragma omp for schedule(static)
         for (int i = 0; i < nsamp; i++)
         {
             float sum = 0.0f;
@@ -587,11 +582,11 @@ void applyCompress(float *outData, unsigned char *target_data, int nchan, int ns
 
 void applyScaleOffset(float *data, float *scale, float *offset, int lenx, int nchanBinned) {
     int i, j;
-    #pragma omp parallel for schedule(static)
+    // #pragma omp parallel for schedule(static)
     for (j = 0; j < lenx; j++) {
         float *row = data + (size_t)j * (size_t)nchanBinned;
         /* hint to vectorize inner loop */
-        #pragma omp simd
+    // #pragma omp simd
         for (i = 0; i < nchanBinned; i++) {
             row[i] = row[i] * scale[i] + offset[i];
         }
@@ -846,83 +841,6 @@ static void* writer_thread_main(void *arg) {
     }
     return NULL;
 }
-
-static void start_writer_threads(Metadata *m, int nthreads) {
-    if (nthreads < 1) nthreads = 1;
-    pthread_mutex_lock(&g_writer_mutex);
-    g_writer_meta = m;
-    g_writer_running = 1;
-    g_writer_nthreads = nthreads;
-    g_writer_threads = (pthread_t*)malloc(sizeof(pthread_t) * (size_t)g_writer_nthreads);
-    pthread_mutex_unlock(&g_writer_mutex);
-    for (int i = 0; i < g_writer_nthreads; ++i) {
-        pthread_create(&g_writer_threads[i], NULL, writer_thread_main, NULL);
-    }
-}
-
-static void stop_writer_threads_and_join() {
-    pthread_mutex_lock(&g_writer_mutex);
-    // Signal threads to stop after draining queue
-    g_writer_running = 0;
-    pthread_cond_broadcast(&g_writer_cond);
-    pthread_mutex_unlock(&g_writer_mutex);
-
-    for (int i = 0; i < g_writer_nthreads; ++i) {
-        pthread_join(g_writer_threads[i], NULL);
-    }
-    free(g_writer_threads);
-    g_writer_threads = NULL;
-    g_writer_nthreads = 0;
-
-    // Safety: free any remaining tasks if any (should be none)
-    pthread_mutex_lock(&g_writer_mutex);
-    WriteTask *t = g_writer_head;
-    while (t) {
-        WriteTask *next = t->next;
-        free(t->outRawData);
-        free(t->scaleBinned);
-        free(t->offsetBinned);
-        free(t);
-        t = next;
-    }
-    g_writer_head = g_writer_tail = NULL;
-    pthread_mutex_unlock(&g_writer_mutex);
-}
-
-static int submit_write_task(const unsigned char *outRawData,
-                             const float *scaleBinned,
-                             const float *offsetBinned,
-                             int nsampBinned,
-                             int nchanBinned,
-                             int blockIndex) {
-    // Deep copy buffers to decouple from producer lifetime
-    size_t data_bytes = (size_t)nsampBinned * (size_t)nchanBinned;
-    size_t vec_bytes = (size_t)nchanBinned * sizeof(float);
-
-    WriteTask *task = (WriteTask*)malloc(sizeof(WriteTask));
-    if (!task) return -1;
-    task->outRawData = (unsigned char*)malloc(data_bytes);
-    task->scaleBinned = (float*)malloc(vec_bytes);
-    task->offsetBinned = (float*)malloc(vec_bytes);
-    if (!task->outRawData || !task->scaleBinned || !task->offsetBinned) {
-        free(task->outRawData); free(task->scaleBinned); free(task->offsetBinned); free(task);
-        return -1;
-    }
-    memcpy(task->outRawData, outRawData, data_bytes);
-    memcpy(task->scaleBinned, scaleBinned, vec_bytes);
-    memcpy(task->offsetBinned, offsetBinned, vec_bytes);
-    task->nsampBinned = nsampBinned;
-    task->nchanBinned = nchanBinned;
-    task->blockIndex = blockIndex;
-    task->next = NULL;
-
-    pthread_mutex_lock(&g_writer_mutex);
-    enqueue_task(task);
-    pthread_cond_signal(&g_writer_cond);
-    pthread_mutex_unlock(&g_writer_mutex);
-    return 0;
-}
-
 // --- Mask allocation/cleanup helpers are implemented in mask.c ---
 
 int setup_cuda(Metadata *m) {
@@ -958,14 +876,21 @@ int main(int argc, char *argv[])
     if (status != 0) return status;
     readMetadata(&m);
 
-    // Initialize OpenMP and CUDA 
-    setup_openmp(20);
+    // Hard check: CFITSIO reentrancy (fail-fast if known to be non-reentrant)
+    if (fits_is_reentrant) {
+        int reent = fits_is_reentrant();
+        if (!reent) {
+            fprintf(stderr, "[CFITSIO] ERROR: CFITSIO is not built as re-entrant/thread-safe. Please reinstall or use a thread-safe build.\n");
+            return EXIT_FAILURE;
+        }
+    }
+
+        // Initialize OpenMP and CUDA (use all available CPUs by default)
+        setup_openmp(omp_get_num_procs());
     if (setup_cuda(&m) != 0) return -1;
 
-    fitsfile *fptr = NULL;
+    fitsfile *wfptr = NULL; // optional writer handle (when writeBack)
     int fits_status = 0;
-    fits_open_file(&fptr, m.filename, READWRITE, &fits_status);
-    fits_movnam_hdu(fptr, BINARY_TBL, "SUBINT", 0, &fits_status);
 
     // Setup PGPLOT output
     if (m.plot)
@@ -986,8 +911,8 @@ int main(int argc, char *argv[])
         free(saveName);
     }
 
-    // Start background writer threads (for dataset writes)
-    start_writer_threads(&m, 2);
+    // // Start background writer threads (disabled for parallel-safe sync I/O)
+    // start_writer_threads(&m, 2);
 
     int nsamp, nchan, binFactorFreq, binFactorTime, nsampBinned, nchanBinned, blockSize, binnedBlockSize;
     int blocksPerRead, naxis2, colnumFreq;
@@ -1007,86 +932,67 @@ int main(int argc, char *argv[])
     colnumFreq = m.colnumFreq;
     startTime = m.startTime;
 
+    // Prepare read handle (ensure per-thread handle selects SUBINT HDU)
+    fitsfile *rf0 = ensure_thread_read_ready(m.filename, &fits_status);
+    if (fits_status) { fits_report_error(stderr, fits_status); return fits_status; }
+
     // Read frequency array
     float *freqArray = malloc(sizeof(float) * nchan);
     float *dsFreqArray = malloc(sizeof(float) * nchanBinned);
-    fits_read_col(fptr, TFLOAT, colnumFreq, 1, 1, nchan, &nulval, freqArray, &anynul, &fits_status);
+    fits_read_col(rf0, TFLOAT, colnumFreq, 1, 1, nchan, &nulval, freqArray, &anynul, &fits_status);
     downsamp1D(freqArray, nchan, binFactorFreq, dsFreqArray);
 
     // Calculate buffer parameters
     int numReads = naxis2 / blocksPerRead;
 
-    // Allocate output buffers
-    unsigned char *outRawData = malloc(sizeof(unsigned char) * (size_t)nchan * (size_t)nsamp);
-    float *outData = malloc(sizeof(float) * nchanBinned * nsampBinned);
-    float *outDataT = malloc(sizeof(float) * nchanBinned * nsampBinned);
-
-    // Allocate RFI-related buffers (only those actually used below)
-    int *flaggedChans = (int *)calloc(nchanBinned, sizeof(int)); // Track fully flagged channels
-
-    IdentNSigmaMasks maskSet;
-    allocIdentNSigmaMasks(&maskSet, nsampBinned, nchanBinned);
-
-
-    float *finalMedian = malloc(sizeof(float) * nsampBinned * nchanBinned);
-    if (!finalMedian) {
-        fprintf(stderr, "Memory allocation failed for finalMedian in ReadFASTData\n");
-        return 1;
-    }
-    float *finalStd = malloc(sizeof(float) * nsampBinned * nchanBinned);
-    if (!finalStd) {
-        fprintf(stderr, "Memory allocation failed for finalStd in ReadFASTData\n");
-        return 1;
-    }
-    float *scale = malloc(sizeof(float) * nchan);  // Fix: Use original nchan size
-    float *offset = malloc(sizeof(float) * nchan); // Fix: Use original nchan size
-    float *scaleBinned = malloc(sizeof(float) * nchanBinned); // For downsampled data
-    float *offsetBinned = malloc(sizeof(float) * nchanBinned); // For downsampled data
-    // Per-row (per SUBINT) scale/offset buffers, size = blocksPerRead x nchan
-    float *scaleRows = (float *)malloc(sizeof(float) * (size_t)blocksPerRead * (size_t)nchan);
-    if (!scaleRows) {
-        fprintf(stderr, "Memory allocation failed for scaleRows in ReadFASTData\n");
-        return 1;
-    }
-    float *offsetRows = (float *)malloc(sizeof(float) * (size_t)blocksPerRead * (size_t)nchan);
-    if (!offsetRows) {
-        fprintf(stderr, "Memory allocation failed for offsetRows in ReadFASTData\n");
-        return 1;
-    }
-    
-    // 解压后的全分辨率浮点缓冲（无论是否下采样都走统一流程，内部有早退）
-    float *rawToFloatArray = (float *)malloc(sizeof(float) * (size_t)nsamp * (size_t)nchan);
-    if (!rawToFloatArray) {
-        fprintf(stderr, "Memory allocation failed for rawToFloatArray in ReadFASTData\n");
-        return 1;
-    }
-
-    // Buffers for subChanMed to avoid repeated malloc/free
-    float *subChanMed_medianBuf = (float *)malloc(sizeof(float) * (size_t)nchanBinned);
-    float *subChanMed_tempDataBuf = (float *)malloc(sizeof(float) * (size_t)nsampBinned);
-
-    // Buffers for identSubstNSigma to avoid per-iteration malloc/free
-    int   *identSubst_goodSamps = (int *)malloc(sizeof(int) * (size_t)nsampBinned);
-    int   *identSubst_randIdxs  = (int *)malloc(sizeof(int) * (size_t)nsampBinned);
-    float *identSubst_medTemp   = (float *)malloc(sizeof(float) * (size_t)nsampBinned * (size_t)nchanBinned);
-    if (!identSubst_goodSamps || !identSubst_randIdxs || !identSubst_medTemp) {
-        fprintf(stderr, "Memory allocation failed for identSubst buffers in ReadFASTData\n");
-        free(identSubst_goodSamps);
-        free(identSubst_randIdxs);
-        free(identSubst_medTemp);
-        return 1;
-    }
-
+    // Determine thread count for per-thread scratch slicing
     int maxScratchThreads = omp_get_max_threads();
     if (maxScratchThreads < 1) maxScratchThreads = 1;
+
+    // Sizes per iteration
+    const size_t BYTES_per_iter_raw      = (size_t)nchan * (size_t)nsamp;             // unsigned char
+    const size_t FLOATS_per_iter_full    = (size_t)nchan * (size_t)nsamp;             // rawToFloatArray
+    const size_t FLOATS_per_iter_binned  = (size_t)nchanBinned * (size_t)nsampBinned; // outData/outDataT/finalMedian/finalStd
+    const size_t FLOATS_per_iter_rows    = (size_t)blocksPerRead * (size_t)nchan;     // scaleRows/offsetRows
+    const size_t FLOATS_per_iter_scale   = (size_t)nchan;                              // scale/offset
+    const size_t FLOATS_per_iter_scale_b = (size_t)nchanBinned;                        // scaleBinned/offsetBinned
+
+    // Allocate per-thread-slice buffers
+    unsigned char *outRawData_all   = (unsigned char*)malloc(BYTES_per_iter_raw * (size_t)maxScratchThreads);
+    float *outData_all              = (float*)malloc(sizeof(float) * FLOATS_per_iter_binned * (size_t)maxScratchThreads);
+    float *outDataT_all             = (float*)malloc(sizeof(float) * FLOATS_per_iter_binned * (size_t)maxScratchThreads);
+    float *finalMedian_all          = (float*)malloc(sizeof(float) * FLOATS_per_iter_binned * (size_t)maxScratchThreads);
+    float *finalStd_all             = (float*)malloc(sizeof(float) * FLOATS_per_iter_binned * (size_t)maxScratchThreads);
+    float *scale_all                = (float*)malloc(sizeof(float) * FLOATS_per_iter_scale   * (size_t)maxScratchThreads);
+    float *offset_all               = (float*)malloc(sizeof(float) * FLOATS_per_iter_scale   * (size_t)maxScratchThreads);
+    float *scaleBinned_all          = (float*)malloc(sizeof(float) * FLOATS_per_iter_scale_b * (size_t)maxScratchThreads);
+    float *offsetBinned_all         = (float*)malloc(sizeof(float) * FLOATS_per_iter_scale_b * (size_t)maxScratchThreads);
+    float *scaleRows_all            = (float*)malloc(sizeof(float) * FLOATS_per_iter_rows    * (size_t)maxScratchThreads);
+    float *offsetRows_all           = (float*)malloc(sizeof(float) * FLOATS_per_iter_rows    * (size_t)maxScratchThreads);
+    float *rawToFloatArray_all      = (float*)malloc(sizeof(float) * FLOATS_per_iter_full    * (size_t)maxScratchThreads);
+
+    // Per-thread flagged channels and masks
+    int *flaggedChans_all = (int *)calloc((size_t)nchanBinned * (size_t)maxScratchThreads, sizeof(int));
+    IdentNSigmaMasks *maskSets = (IdentNSigmaMasks*)malloc(sizeof(IdentNSigmaMasks) * (size_t)maxScratchThreads);
+    for (int t=0; t<maxScratchThreads; ++t) {
+        allocIdentNSigmaMasks(&maskSets[t], nsampBinned, nchanBinned);
+    }
+
+    // (maxScratchThreads already determined above)
+
+    // Buffers for subChanMed to avoid repeated malloc/free (per-thread slices)
+    float *subChanMed_medianBuf = (float *)malloc(sizeof(float) * (size_t)nchanBinned * (size_t)maxScratchThreads);
+    float *subChanMed_tempDataBuf = (float *)malloc(sizeof(float) * (size_t)nsampBinned * (size_t)maxScratchThreads);
+
+    // Buffers for identSubstNSigma to avoid per-iteration malloc/free (per-thread slices)
+    int   *identSubst_goodSamps = (int *)malloc(sizeof(int) * (size_t)nsampBinned * (size_t)maxScratchThreads);
+    int   *identSubst_randIdxs  = (int *)malloc(sizeof(int) * (size_t)nsampBinned * (size_t)maxScratchThreads);
+    float *identSubst_medTemp   = (float *)malloc(sizeof(float) * (size_t)nsampBinned * (size_t)nchanBinned * (size_t)maxScratchThreads);
+
     size_t inChanScratchCount = (size_t)maxScratchThreads * (size_t)nsampBinned;
     float *inChanScratch = NULL;
     if (inChanScratchCount > 0) {
         inChanScratch = (float *)malloc(sizeof(float) * inChanScratchCount);
-        if (!inChanScratch) {
-            fprintf(stderr, "Warning: allocating inChanScratch buffer failed; falling back to per-channel allocation.\n");
-            inChanScratchCount = 0;
-        }
     }
 
     // Accumulators for loop timing stats
@@ -1095,70 +1001,79 @@ int main(int argc, char *argv[])
     double loop_max_time = 0.0;
 
     int ii;
-    int numiter = 0;
     
     // Note: cfitsio library handles I/O optimization internally
     // We rely on its buffering and caching mechanisms
     
-    /*
-     * Async prefetch setup: create double buffers and kick off first read if enabled
-     */
-    unsigned char *rawBufA = outRawData;
-    unsigned char *rawBufB = (unsigned char*)malloc(sizeof(unsigned char) * (size_t)nchan * (size_t)nsamp);
-    float *sclBufA = scaleRows;
-    float *sclBufB = (float*)malloc(sizeof(float) * (size_t)blocksPerRead * (size_t)nchan);
-    float *offBufA = offsetRows;
-    float *offBufB = (float*)malloc(sizeof(float) * (size_t)blocksPerRead * (size_t)nchan);
-    int use_async_prefetch = start_reader_thread_prefetch(&m);
-    int useA = 1; // which buffer corresponds to current ii when ready
-    if (use_async_prefetch && numReads > 0) {
-        submit_read_request_async(0, rawBufA, sclBufA, offBufA);
+    // Async prefetch disabled: use synchronous read
+    // unsigned char *rawBufA = outRawData;
+    // unsigned char *rawBufB = (unsigned char*)malloc(sizeof(unsigned char) * (size_t)nchan * (size_t)nsamp);
+    // float *sclBufA = scaleRows;
+    // float *sclBufB = (float*)malloc(sizeof(float) * (size_t)blocksPerRead * (size_t)nchan);
+    // float *offBufA = offsetRows;
+    // float *offBufB = (float*)malloc(sizeof(float) * (size_t)blocksPerRead * (size_t)nchan);
+    // int use_async_prefetch = start_reader_thread_prefetch(&m);
+    // int useA = 1; // which buffer corresponds to current ii when ready
+    // if (use_async_prefetch && numReads > 0) {
+    //     submit_read_request_async(0, rawBufA, sclBufA, offBufA);
+    // }
+
+    // Optional write-back handle (open once if needed)
+    int enable_writeback = (m.write && m.writeBack) ? 1 : 0;
+    if (enable_writeback) {
+        fits_open_file(&wfptr, m.filename, READWRITE, &fits_status);
+        if (fits_status) { fits_report_error(stderr, fits_status); return fits_status; }
+        fits_movnam_hdu(wfptr, BINARY_TBL, "SUBINT", 0, &fits_status);
+        if (fits_status) { fits_report_error(stderr, fits_status); return fits_status; }
     }
 
-    for (ii = 0; ii < numReads; ii++)
+    // Limit to 200 iterations if larger, to preserve previous behavior
+    int effectiveNumReads = (numReads > 200) ? 200 : numReads;
+    const int plotEvery = 200; // base interval for plotting
+
+    #pragma omp parallel for schedule(static) reduction(+:loop_total_time) reduction(min:loop_min_time) reduction(max:loop_max_time)
+    for (ii = 0; ii < effectiveNumReads; ii++)
     {
         double loop_start = omp_get_wtime();
-        printf("Processing block %d of %d, %d subints per block, %.3f%% done.\n", ii, numReads, blocksPerRead, (ii * 100.0f / numReads));
+    printf("Processing block %d of %d, %d subints per block, %.3f%% done.\n", ii, effectiveNumReads, blocksPerRead, (ii * 100.0f / (effectiveNumReads ? effectiveNumReads : 1)));
+    int tid = slice_index_from_iter(ii, maxScratchThreads);
+    // All plotting handled by a single thread for correctness
+    const int plotterTid = 0;
+    int doPlotThisIter = (m.plot != 0) && ((ii % plotEvery) == 0) && (tid == plotterTid);
+        // Per-iteration slices
+        unsigned char *outRawData   = SLICE_PTR(outRawData_all,   BYTES_per_iter_raw,      tid);
+        float *outData              = SLICE_PTR(outData_all,      FLOATS_per_iter_binned,  tid);
+        float *outDataT             = SLICE_PTR(outDataT_all,     FLOATS_per_iter_binned,  tid);
+        float *finalMedian          = SLICE_PTR(finalMedian_all,  FLOATS_per_iter_binned,  tid);
+        float *finalStd             = SLICE_PTR(finalStd_all,     FLOATS_per_iter_binned,  tid);
+        float *scale                = SLICE_PTR(scale_all,        FLOATS_per_iter_scale,   tid);
+        float *offset               = SLICE_PTR(offset_all,       FLOATS_per_iter_scale,   tid);
+        float *scaleBinned          = SLICE_PTR(scaleBinned_all,  FLOATS_per_iter_scale_b, tid);
+        float *offsetBinned         = SLICE_PTR(offsetBinned_all, FLOATS_per_iter_scale_b, tid);
+        float *scaleRows            = SLICE_PTR(scaleRows_all,    FLOATS_per_iter_rows,    tid);
+        float *offsetRows           = SLICE_PTR(offsetRows_all,   FLOATS_per_iter_rows,    tid);
+        float *rawToFloatArray      = SLICE_PTR(rawToFloatArray_all, FLOATS_per_iter_full, tid);
+        int   *flaggedChans         = SLICE_PTR(flaggedChans_all, nchanBinned, tid);
+        IdentNSigmaMasks *maskSetPtr = &maskSets[tid];
         
         // Reset flaggedChans, finalMedian, and finalStd to avoid accumulation/residual data across loops
-        memset(flaggedChans, 0, nchanBinned * sizeof(int));
-        memset(finalMedian, 0, nsampBinned * nchanBinned * sizeof(float));
-        memset(finalStd, 0, nsampBinned * nchanBinned * sizeof(float));
+    memset(flaggedChans, 0, nchanBinned * sizeof(int));
+    memset(finalMedian,  0, nsampBinned * nchanBinned * sizeof(float));
+    memset(finalStd,     0, nsampBinned * nchanBinned * sizeof(float));
         
-        // Read a raw data block of `blocksPerRead` subints with its scale and offset
+        // Read a raw data block of `blocksPerRead` subints with its scale and offset (synchronous)
         double read_start = omp_get_wtime();
+        int fits_status_local = 0;
+        fitsfile *rf_local = ensure_thread_read_ready(m.filename, &fits_status_local);
+        if (fits_status_local) { fits_report_error(stderr, fits_status_local); continue; }
         unsigned char *currRaw = outRawData;
         float *currScl = scaleRows;
         float *currOff = offsetRows;
-        if (use_async_prefetch) {
-            // wait for prefetch completion for current ii
-            int st_ready = 0;
-            (void)wait_read_ready_async(&st_ready);
-            if (st_ready) {
-                // Non-zero indicates error; fall back to sync read and disable prefetch
-                fprintf(stderr, "Prefetch read error on block %d (status=%d); disabling async prefetch.\n", ii, st_ready);
-                use_async_prefetch = 0;
-            }
-            // Select buffer based on toggle
-            if (useA) { currRaw = rawBufA; currScl = sclBufA; currOff = offBufA; }
-            else      { currRaw = rawBufB; currScl = sclBufB; currOff = offBufB; }
-            // Fill first-row scale/offset to keep downstream behavior
-            memcpy(scale,  currScl, sizeof(float) * (size_t)nchan);
-            memcpy(offset, currOff, sizeof(float) * (size_t)nchan);
-            // Submit next request ASAP to overlap with compute
-            if (use_async_prefetch && (ii + 1) < numReads) {
-                if (useA) submit_read_request_async(ii + 1, rawBufB, sclBufB, offBufB);
-                else      submit_read_request_async(ii + 1, rawBufA, sclBufA, offBufA);
-            }
-        }
-        if (!use_async_prefetch) {
-            // Synchronous path
-            readRawBlock(fptr, ii, blocksPerRead, nchan, blockSize,
-                scale, offset, currScl, currOff,
-                currRaw, &fits_status);
-            if (fits_status) {
-                fits_report_error(stderr, fits_status);
-            }
+        readRawBlock(rf_local, ii, blocksPerRead, nchan, blockSize,
+                     scale, offset, currScl, currOff,
+                     currRaw, &fits_status_local);
+        if (fits_status_local) {
+            fits_report_error(stderr, fits_status_local);
         }
         double read_time = omp_get_wtime() - read_start;
         printf("Read block time: %.4f seconds\n", read_time);
@@ -1194,14 +1109,17 @@ int main(int argc, char *argv[])
         
         if (m.generateMasks)
         {
-            clearIdentNSigmaMasks(&maskSet, nsampBinned, nchanBinned);
+            clearIdentNSigmaMasks(maskSetPtr, nsampBinned, nchanBinned);
 
             // Plot the unprocessed raw data
-            if (m.plot)
+            if (doPlotThisIter)
             { 
-                cpgpage(); // Create new graphics page
-                cpgmtxt("T", 3.0, 0.35, 0.5, "Raw Data");
-                plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, NULL, NULL);
+                #pragma omp critical(pgplot)
+                {
+                    cpgpage(); // Create new graphics page
+                    cpgmtxt("T", 3.0, 0.35, 0.5, "Raw Data");
+                    plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, ii, NULL, 1, 1, NULL, NULL);
+                }
             }
 
 
@@ -1210,8 +1128,11 @@ int main(int argc, char *argv[])
             if (subtractChanMed)
             {
                 double chanMed_start = omp_get_wtime();
+                int tid = slice_index_from_iter(ii, maxScratchThreads);
+                float *scm_median = SLICE_PTR(subChanMed_medianBuf, nchanBinned, tid);
+                float *scm_temp   = SLICE_PTR(subChanMed_tempDataBuf, nsampBinned, tid);
                 subChanMed(outDataT, nsampBinned, nchanBinned,
-                                       subChanMed_medianBuf, subChanMed_tempDataBuf);
+                                       scm_median, scm_temp);
                 double chanMed_time = omp_get_wtime() - chanMed_start;
                 printf("Channel median subtraction time: %.4f seconds\n", chanMed_time);
             } else {
@@ -1309,10 +1230,16 @@ int main(int argc, char *argv[])
             {
                 double rfi_start = omp_get_wtime();
                 printf("=== Using CPU RFI detection ===\n");
-                identSubstNSigma(outDataT, nsampBinned, nchanBinned, NSigmaInChan, NSigmaOutChan, ii, m.plot,
-                                &maskSet, finalMedian, finalStd, m.cudaReady, flaggedChans,
-                                identSubst_goodSamps, identSubst_randIdxs, identSubst_medTemp,
-                                inChanScratch, inChanScratchCount);
+                int tid = slice_index_from_iter(ii, maxScratchThreads);
+                int   *goodSamps = SLICE_PTR(identSubst_goodSamps, nsampBinned, tid);
+                int   *randIdxs  = SLICE_PTR(identSubst_randIdxs,  nsampBinned, tid);
+                float *medTemp   = SLICE_PTR(identSubst_medTemp,   (size_t)nsampBinned * (size_t)nchanBinned, tid);
+                float *inChanSlice = SLICE_PTR(inChanScratch, nsampBinned, tid);
+                size_t inChanSliceCount = (size_t)nsampBinned;
+                identSubstNSigma(outDataT, nsampBinned, nchanBinned, NSigmaInChan, NSigmaOutChan, ii, doPlotThisIter,
+                                maskSetPtr, finalMedian, finalStd, m.cudaReady, flaggedChans,
+                                goodSamps, randIdxs, medTemp,
+                                inChanSlice, inChanSliceCount);
                 double rfi_time = omp_get_wtime() - rfi_start;
                 printf("RFI detection time: %.4f seconds\n", rfi_time);
 
@@ -1321,27 +1248,36 @@ int main(int argc, char *argv[])
             {
                 // merge=0 默认分别输出；如需合并成索引图传 1
                 int merge = 1;
-                writeAllMasksPNG(&maskSet, nsampBinned, nchanBinned, m.datasetPath, ii, merge);
+                writeAllMasksPNG(maskSetPtr, nsampBinned, nchanBinned, m.datasetPath, ii, merge);
             }
-            if (m.plot)
+            if (doPlotThisIter)
             { // Plot result after NSigma substitution
-                cpgpage();
-                plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, maskSet.globalMask, flaggedChans);
+                #pragma omp critical(pgplot)
+                {
+                    cpgpage();
+                    plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, ii, NULL, 1, 1, maskSetPtr->globalMask, flaggedChans);
+                }
             }
 
             // Plot all individual masks except globalMask
-            if (m.plot)
+            if (doPlotThisIter)
             {
-                plotAllMasks(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, &maskSet, flaggedChans);
+                #pragma omp critical(pgplot)
+                {
+                    plotAllMasks(&m, blocksPerRead, outDataT, dsFreqArray, startTime, ii, maskSetPtr, flaggedChans);
+                }
             }
 
             // --- Final visualization: show data after all pixel substitutions ---
-            if (m.plot)
+            if (doPlotThisIter)
             {
-                cpgpage();
-                cpgmtxt("T", 3.0, 0.35, 0.5, "Final result after all substitutions");
-                // Display processed data without mask overlay; stats panels remain enabled (top/right)
-                plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, NULL, flaggedChans);
+                #pragma omp critical(pgplot)
+                {
+                    cpgpage();
+                    cpgmtxt("T", 3.0, 0.35, 0.5, "Final result after all substitutions");
+                    // Display processed data without mask overlay; stats panels remain enabled (top/right)
+                    plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, ii, NULL, 1, 1, NULL, flaggedChans);
+                }
             }
 
 
@@ -1392,43 +1328,36 @@ int main(int argc, char *argv[])
             applyCompress(outData, outRawData, nchanBinned, nsampBinned, scaleBinned, offsetBinned);
             
             int writeBack = m.writeBack, writeDastset = 1;
-            
+
             if (writeBack) {
-                writeBlock(fptr, blocksPerRead, nchanBinned, nsampBinned, binnedBlockSize,
-                        offsetBinned, scaleBinned, outRawData, m.naxis2, ii, &fits_status);
-                if (fits_status)
+                int fits_status_wb = 0;
+                #pragma omp critical(fits_writeback)
                 {
-                    fits_report_error(stderr, fits_status);
-                    printf("Writing subint block %d, failed!\n", ii);
+                    writeBlock(wfptr, blocksPerRead, nchanBinned, nsampBinned, binnedBlockSize,
+                               offsetBinned, scaleBinned, outRawData, m.naxis2, ii, &fits_status_wb);
+                    if (fits_status_wb)
+                    {
+                        fits_report_error(stderr, fits_status_wb);
+                        printf("Writing subint block %d, failed!\n", ii);
+                    }
+                    else
+                    {
+                        printf("Writing subint block %d, OK.\n", ii);
+                    }
                 }
-                else
-                {
-                    printf("Writing subint block %d, OK.\n", ii);
-                }    
             }
 
             if (writeDastset) {
-                // Offload dataset writing to background thread
-                if (submit_write_task(outRawData, scaleBinned, offsetBinned, nsampBinned, nchanBinned, ii) != 0) {
-                    fprintf(stderr, "Warning: submit_write_task failed, fallback to synchronous write.\n");
-                    writeFITSDataset(outRawData, scaleBinned, offsetBinned, nsampBinned, nchanBinned, ii, &m, &fits_status);
-                }
+                // Synchronous dataset writing (async writer disabled)
+                int fits_status_ds = 0;
+                writeFITSDataset(outRawData, scaleBinned, offsetBinned,
+                                 nsampBinned, nchanBinned, ii, &m, &fits_status_ds);
             }
             double write_time = omp_get_wtime() - write_start;
             printf("Write operations time: %.4f seconds\n", write_time);
         }
 
-
-        numiter++;
-        if (numiter % 200 == 0) {
-            m.plot = 1; 
-        } else if (numiter % 200 == 1) {
-            m.plot = 0; 
-        }
-        if (numiter == 200) {
-            status = 0; // keep original behavior but allow cleanup and summary
-            break;
-        }
+        int iter1 = ii + 1; // 1-based iteration count
 
         // if (numiter == 1) {
         //     m.plot = 0;
@@ -1447,42 +1376,48 @@ int main(int argc, char *argv[])
         loop_total_time += loop_time;
         if (loop_time < loop_min_time) loop_min_time = loop_time;
         if (loop_time > loop_max_time) loop_max_time = loop_time;
-        printf("Total loop %d time: %.4f seconds\n", ii, loop_time);
-        printf("iteration %d done.\n\n", numiter);
+    printf("Total loop %d time: %.4f seconds\n", ii, loop_time);
+    printf("iteration %d done.\n\n", iter1);
 
-        // toggle buffer for next iteration
-        if (use_async_prefetch) useA = !useA;
+    // toggle buffer for next iteration (not used in sync mode)
+    // if (use_async_prefetch) useA = !useA;
 
     }
 
-    // Stop writer threads and cleanup
-    stop_writer_threads_and_join();
-    if (g_reader_running) {
-        stop_reader_thread_prefetch();
-    }
+    // Stop writer threads and cleanup (disabled for sync I/O)
+    // stop_writer_threads_and_join();
+    // if (g_reader_running) {
+    //     stop_reader_thread_prefetch();
+    // }
     // Cleanup
     if (m.plot) cpgend();
-    fits_close_file(fptr, &fits_status);
+    if (wfptr) { int st=0; fits_close_file(wfptr, &st); wfptr=NULL; }
+    close_thread_read_fptr();
     free(freqArray);
     free(dsFreqArray);
-    free(outData);
-    free(outDataT);
-    
-    freeIdentNSigmaMasks(&maskSet);
-    free(flaggedChans);
-    free(outRawData);
-    free(rawBufB);
-    free(scale);
-    free(offset);
-    free(scaleBinned);
-    free(offsetBinned);
-    free(scaleRows);
-    free(offsetRows);
-    free(sclBufB);
-    free(offBufB);
-    free(rawToFloatArray);
-    free(finalMedian);
-    free(finalStd);
+    free(outData_all);
+    free(outDataT_all);
+
+    if (maskSets) {
+        for (int t=0; t<maxScratchThreads; ++t) {
+            freeIdentNSigmaMasks(&maskSets[t]);
+        }
+        free(maskSets);
+    }
+    free(flaggedChans_all);
+    free(outRawData_all);
+    // free(rawBufB);
+    free(scale_all);
+    free(offset_all);
+    free(scaleBinned_all);
+    free(offsetBinned_all);
+    free(scaleRows_all);
+    free(offsetRows_all);
+    // free(sclBufB);
+    // free(offBufB);
+    free(rawToFloatArray_all);
+    free(finalMedian_all);
+    free(finalStd_all);
     free(subChanMed_medianBuf);
     free(subChanMed_tempDataBuf);
     free(identSubst_goodSamps);
@@ -1491,10 +1426,13 @@ int main(int argc, char *argv[])
     free(inChanScratch);
 
     // Print loop timing summary (if any iteration executed)
-    if (numiter > 0) {
-        double loop_avg_time = loop_total_time / (double)numiter;
-        printf("Loop summary: %d iterations, total %.2f s, avg %.4f s, min %.4f s, max %.4f s\n",
-               numiter, loop_total_time, loop_avg_time, loop_min_time, loop_max_time);
+    {
+        int iterations_executed = effectiveNumReads;
+        if (iterations_executed > 0) {
+            double loop_avg_time = loop_total_time / (double)iterations_executed;
+            printf("Loop summary: %d iterations, total %.2f s, avg %.4f s, min %.4f s, max %.4f s\n",
+                   iterations_executed, loop_total_time, loop_avg_time, loop_min_time, loop_max_time);
+        }
     }
 
     double global_end_time = omp_get_wtime();

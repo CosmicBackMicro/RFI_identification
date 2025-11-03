@@ -177,7 +177,7 @@ void findMeanStd(float *arr, int size, float *mean, float *std)
     int i;
     /* === First pass for mean === */
     float sum = 0.0f;
-    #pragma omp simd reduction(+:sum)
+    // #pragma omp simd reduction(+:sum)
     for (i = 0; i < size; i++)
     {
         sum += a[i];
@@ -192,7 +192,7 @@ void findMeanStd(float *arr, int size, float *mean, float *std)
     if (std == NULL)
         return;
     float variance = 0.0f;
-    #pragma omp simd reduction(+:variance)
+    // #pragma omp simd reduction(+:variance)
     for (i = 0; i < size; i++)
     {
         float diff = a[i] - calculated_mean;

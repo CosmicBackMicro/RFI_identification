@@ -7,6 +7,7 @@
 #include "mask.h"
 #include "identification.h" // for IdentNSigmaMasks definition
 
+// Write binary mask (0/1) as grayscale PNG (0 or 1 values)
 void writeIndexMaskPNG(const bool *mask, int nsamp, int nchan, char *filename)
 {
     FILE *fp = fopen(filename, "wb");
@@ -53,6 +54,62 @@ void writeIndexMaskPNG(const bool *mask, int nsamp, int nchan, char *filename)
     fclose(fp);
 }
 
+// Write class-index mask (0..255) as 8-bit grayscale PNG
+void writeClassIndexMaskPNG(const int *indexMask, int nsamp, int nchan, char *filename)
+{
+    if (!indexMask || nsamp <= 0 || nchan <= 0 || !filename) return;
+    FILE *fp = fopen(filename, "wb");
+    if (!fp) return;
+    png_structp png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    if (!png_ptr) { fclose(fp); return; }
+    png_infop info_ptr = png_create_info_struct(png_ptr);
+    if (!info_ptr) { png_destroy_write_struct(&png_ptr, (png_infopp)NULL); fclose(fp); return; }
+    if (setjmp(png_jmpbuf(png_ptr))) { png_destroy_write_struct(&png_ptr, &info_ptr); fclose(fp); return; }
+
+    png_init_io(png_ptr, fp);
+    png_set_IHDR(
+        png_ptr,
+        info_ptr,
+        nsamp,
+        nchan,
+        8,
+        PNG_COLOR_TYPE_GRAY,
+        PNG_INTERLACE_NONE,
+        PNG_COMPRESSION_TYPE_DEFAULT,
+        PNG_FILTER_TYPE_DEFAULT);
+
+    png_set_gAMA(png_ptr, info_ptr, 1.0);
+    png_bytep *row_pointers = (png_bytep *)malloc(sizeof(png_bytep) * nchan);
+    if (!row_pointers) { png_destroy_write_struct(&png_ptr, &info_ptr); fclose(fp); return; }
+    for (int i = 0; i < nchan; i++)
+    {
+        row_pointers[nchan - 1 - i] = (png_bytep)malloc(nsamp);
+        if (!row_pointers[nchan - 1 - i]) {
+            for (int k = 0; k < i; ++k) free(row_pointers[nchan - 1 - k]);
+            free(row_pointers);
+            png_destroy_write_struct(&png_ptr, &info_ptr);
+            fclose(fp);
+            return;
+        }
+        for (int j = 0; j < nsamp; j++)
+        {
+            int idx = indexMask[i * nsamp + j];
+            if (idx < 0) idx = 0;
+            if (idx > 255) idx = 255;
+            row_pointers[nchan - 1 - i][j] = (png_byte)idx;
+        }
+    }
+
+    png_write_info(png_ptr, info_ptr);
+    png_write_image(png_ptr, row_pointers);
+    png_write_end(png_ptr, NULL);
+
+    for (int i = 0; i < nchan; i++) free(row_pointers[i]);
+    free(row_pointers);
+    png_destroy_write_struct(&png_ptr, &info_ptr);
+    fclose(fp);
+}
+
 void mergeMask2D(int *masks[], int nmasks, int nsamp, int nchan, int *result)
 {
     int i, j;
@@ -70,7 +127,7 @@ void mergeMask2D(int *masks[], int nmasks, int nsamp, int nchan, int *result)
 
 void expandChannelMask(const int *channelFlagged, bool *mask2D, int nsamp, int nchan)
 {
-    #pragma omp parallel for
+    // #pragma omp parallel for
     for (int i = 0; i < nchan; i++) {
         if (channelFlagged[i]) {
             int base = i * nsamp;
@@ -85,7 +142,7 @@ void logicalOR(bool *restrict globalMask, const bool *restrict mask, int nsamp, 
 {
     if (!globalMask || !mask) return;
     int total = nsamp * nchan;
-    #pragma omp parallel for
+    // #pragma omp parallel for
     for (int idx = 0; idx < total; idx++) {
         if (mask[idx]) globalMask[idx] = true;
     }
@@ -129,7 +186,7 @@ void writeAllMasksPNG(const IdentNSigmaMasks *masks, int nsamp, int nchan,
         }
 
         snprintf(filename, sizeof(filename), "%smask_merged_%d.png", datasetPath, index);
-        writeIndexMaskPNG(indexMask, nsamp, nchan, filename);
+        writeClassIndexMaskPNG(indexMask, nsamp, nchan, filename);
         free(indexMask);
         return; // merged 模式下直接返回
     }

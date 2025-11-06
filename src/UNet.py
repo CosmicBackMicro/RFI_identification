@@ -407,27 +407,30 @@ class FITSDataset(Dataset):
         # 验证文件完整性
         valid_pairs = []
         for fid in self.ids:
-            file_id = self.extract_id(fid)
-            if file_id:
-                # 修正掩码文件名
-                mask_path = os.path.join(mask_dir, f"mask_merged_{file_id}.png")
-                image_path = os.path.join(image_dir, fid)
-                
-                # 检查文件是否存在且可读
-                if os.path.exists(mask_path) and os.path.exists(image_path):
-                    try:
-                        # 快速检查FITS文件是否可读
-                        with fitsio.FITS(image_path, 'r') as fits:
-                            _ = fits[1].read_header()
-                        # 检查mask文件是否可读
-                        test_mask = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
-                        if test_mask is not None:
-                            valid_pairs.append((image_path, mask_path))
-                    except Exception as e:
-                        print(f"跳过损坏的文件对: {fid} - {e}")
-                        continue
-                else:
-                    print(f"缺少对应文件: {fid}")
+            # C侧命名规则：<sourceName>_block<index>.fits 对应 <sourceName>_block<index>.png
+            base_name, _ = os.path.splitext(fid)  # e.g. G120..._block12
+            mask_path = os.path.join(mask_dir, f"{base_name}.png")
+            image_path = os.path.join(image_dir, fid)
+            
+            # 检查文件是否存在且可读
+            if os.path.exists(mask_path) and os.path.exists(image_path):
+                try:
+                    # 快速检查FITS文件是否可读
+                    with fitsio.FITS(image_path, 'r') as fits:
+                        _ = fits[1].read_header()
+                    # 检查mask文件是否可读
+                    test_mask = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
+                    if test_mask is not None:
+                        valid_pairs.append((image_path, mask_path))
+                except Exception as e:
+                    print(f"跳过损坏的文件对: {fid} - {e}")
+                    continue
+            else:
+                # 打印更明确的缺失信息
+                if not os.path.exists(image_path):
+                    print(f"缺少图像文件: {image_path}")
+                if not os.path.exists(mask_path):
+                    print(f"缺少掩码文件: {mask_path}")
         
         # 更新文件列表为有效的文件对
         self.image_list = [pair[0] for pair in valid_pairs]
@@ -515,12 +518,9 @@ class FITSDataset(Dataset):
         total_pixels = 0
         
         for image_file in image_files:
-            file_id = FITSDataset.extract_id(image_file)
-            if not file_id:
-                continue
-                
-            # 修正掩码文件名
-            mask_path = os.path.join(mask_dir, f"mask_{file_id}.png")
+            # 与C侧一致：用图像基名替换扩展名为.png
+            base_name, _ = os.path.splitext(image_file)
+            mask_path = os.path.join(mask_dir, f"{base_name}.png")
             if not os.path.exists(mask_path):
                 continue
             
@@ -564,27 +564,34 @@ class FITSDataset(Dataset):
     def load_fits_image(fits_path):
         """
         从FITS文件加载原始图像数据，不进行归一化。
+        约束：每个样本的 FITS 只能有 1 个 SUBINT 行。
         """
         # 使用更安全的FITS文件读取方式
         with fitsio.FITS(fits_path, 'r') as fits:
             fits_header = fits[1].read_header()
             fits_data = fits[1].read()
-            
-        nsamp = fits_header["NBLOCKS"] * fits_header["NSBLK"]
-        nchan = fits_header["NCHAN"]
-        
-        # 直接读取并应用缩放偏移，减少中间变量
-        data = fits_data[0]["DATA"].reshape(nsamp, nchan).astype(np.float32)
-        dat_scl = fits_data[0]["DAT_SCL"]
-        dat_offs = fits_data[0]["DAT_OFFS"]
-        
-        # 注意！！！是先乘后加！！！
+
+        nchan = int(fits_header["NCHAN"])  # 频道数
+
+        # rows 应该为 1（约束）。如不为 1，抛出清晰错误，方便定位生成阶段问题。
+        rows = fits_data.shape[0] if hasattr(fits_data, 'shape') else len(fits_data)
+        if rows != 1:
+            raise ValueError(f"Expected exactly 1 SUBINT row, but got {rows} in {os.path.basename(fits_path)}")
+
+        raw = np.asarray(fits_data[0]["DATA"], dtype=np.uint8)
+        total = int(raw.size)
+        nsamp = total // nchan
+
+        data = raw.reshape(nsamp, nchan).astype(np.float32)
+        dat_scl = np.asarray(fits_data[0]["DAT_SCL"], dtype=np.float32)
+        dat_offs = np.asarray(fits_data[0]["DAT_OFFS"], dtype=np.float32)
+
+        # 注意：先乘后加
         data *= dat_scl[np.newaxis, :]
         data += dat_offs[np.newaxis, :]
-        
-        # 合并转置和翻转操作
+
+        # 转置为 (nchan, nsamp)，并上下翻转以匹配可视化方向
         image = np.flipud(data.T)
-                     
         return image
 
     def __getitem__(self, i):
@@ -820,7 +827,8 @@ if __name__ == "__main__":
     print("📋 解析命令行参数...")
     # ...existing code...
     # dataset_top_dir = "/home/cbm/deRFI/Datasets/Dataset_G200.48+2.54_5978_2classes_NoSubMed_ThreshCorrected"
-    dataset_top_dir = "/home/cbm/deRFI/Datasets/Dataset_Simulation_5000+1000_6classes"
+    # dataset_top_dir = "/home/cbm/deRFI/Datasets/Dataset_Simulation_5000+1000_6classes"
+    dataset_top_dir = "/home/cbm/deRFI/output"
     image_dir = os.path.join(dataset_top_dir, "image")
     mask_dir = os.path.join(dataset_top_dir, "mask")
 

@@ -60,19 +60,36 @@ def load_fits_image(fits_path):
             fits_header = fits[1].read_header()
             fits_data = fits[1].read()
         
-    nsamp = fits_header["NBLOCKS"] * fits_header["NSBLK"]
-    nchan = fits_header["NCHAN"]
-    
-    # 直接读取并应用缩放偏移，减少中间变量
-    data = fits_data[0]["DATA"].reshape(nsamp, nchan).astype(np.float32)
-    dat_scl = fits_data[0]["DAT_SCL"]
-    dat_offs = fits_data[0]["DAT_OFFS"]
-    
-    # 原地操作，减少内存分配
-    data *= dat_scl[np.newaxis, :]   # 原地乘法
-    data += dat_offs[np.newaxis, :]  # 原地加法
-    
-    # 合并转置和翻转操作（保持原先显示方向）
+    # 更健壮的尺寸推断：不再假设 nsamp = NBLOCKS*NSBLK，因为文件可能按单行写入（DATA 向量长度=nsamp*nchan），
+    # 也可能按多行写入（每行 DATA 为若干时间样本）。统一按行拼接。
+    nchan = int(fits_header["NCHAN"])  # 频道数
+
+    # 将每一行的 DATA 按 (nsamp_row, nchan) 还原，并应用本行的 DAT_SCL/DAT_OFFS
+    rows = fits_data.shape[0] if hasattr(fits_data, 'shape') else len(fits_data)
+    pieces = []
+    for r in range(rows):
+        raw = np.asarray(fits_data[r]["DATA"])  # uint8 扁平数组
+        if raw.size % nchan != 0:
+            raise ValueError(f"DATA length {raw.size} is not divisible by NCHAN {nchan} at row {r}")
+        nsamp_row = raw.size // nchan
+        arr = raw.reshape(nsamp_row, nchan).astype(np.float32, copy=False)
+
+        # 每行独立的缩放/偏移（长度= nchan）
+        dat_scl = np.asarray(fits_data[r]["DAT_SCL"], dtype=np.float32)
+        dat_offs = np.asarray(fits_data[r]["DAT_OFFS"], dtype=np.float32)
+        if dat_scl.size != nchan or dat_offs.size != nchan:
+            raise ValueError(f"DAT_SCL/DAT_OFFS length mismatch with NCHAN={nchan} at row {r}")
+        # 应用缩放偏移（广播到时间维度）
+        arr *= dat_scl[np.newaxis, :]
+        arr += dat_offs[np.newaxis, :]
+        pieces.append(arr)
+
+    # 按时间维拼接所有行 -> (nsamp_total, nchan)
+    if len(pieces) == 0:
+        raise ValueError("No rows found in SUBINT table.")
+    data = np.vstack(pieces)
+
+    # 转为 (nchan, nsamp) 并上下翻转以匹配既有显示方向
     image = np.flipud(data.T)
 
     # 提取时间分辨率
@@ -147,13 +164,61 @@ def test_load_fits_image(output_dir: str, verbose: bool=False, mask_dir: Optiona
                     mask_map[idx] = p
             print(f"[Info] Found {len(mask_map)} mask PNG(s) in: {mask_dir}")
 
-    # Create figure and axis once
-    fig, ax = plt.subplots(figsize=(12, 8))
-    image_display = ax.imshow(np.zeros((1, 1)), aspect='auto', cmap='gist_heat')
-    # Create an empty RGBA overlay for mask; updated per frame when available
-    mask_display = ax.imshow(np.zeros((1, 1, 4), dtype=float), aspect='auto', interpolation='nearest')
-    colorbar = fig.colorbar(image_display, ax=ax)
+    # Create figure and axes with a compact margins layout:
+    #  - left panel: frequency profile (mean over time), shares y with main
+    #  - top panel: time profile (mean over frequency), shares x with main
+    #  - main panel: time-frequency image
+    #  - right narrow panel: colorbar
+    fig = plt.figure(figsize=(12, 8))
+    from matplotlib.gridspec import GridSpec
+    gs = GridSpec(
+        2, 3,
+        width_ratios=[1.4, 8.0, 0.35],
+        height_ratios=[1.2, 8.0],
+        wspace=0,
+        hspace=0,
+        figure=fig,
+    )
+    ax_main = fig.add_subplot(gs[1, 1])
+    ax_top = fig.add_subplot(gs[0, 1], sharex=ax_main)
+    ax_left = fig.add_subplot(gs[1, 0], sharey=ax_main)
+    ax_blank = fig.add_subplot(gs[0, 0])
+    ax_blank.axis('off')
+    cax = fig.add_subplot(gs[1, 2])
+
+    # Leave space for a figure-level title (suptitle) above the top panel
+    try:
+        fig.subplots_adjust(top=0.90)
+    except Exception:
+        pass
+
+    # Main image and mask overlay
+    image_display = ax_main.imshow(np.zeros((1, 1)), aspect='auto', cmap='gist_heat')
+    mask_display = ax_main.imshow(np.zeros((1, 1, 4), dtype=float), aspect='auto', interpolation='nearest')
+    colorbar = fig.colorbar(image_display, cax=cax)
     colorbar.set_label('Intensity')
+
+    # Initialize profile lines (use dark colors to be visible on white background)
+    top_line, = ax_top.plot([], [], color='tab:blue', lw=1.5)
+    left_line, = ax_left.plot([], [], color='tab:blue', lw=1.5)
+    # Configure ticks/labels per panels
+    # Top panel: show x ticks/labels on TOP side, outward; hide bottom labels
+    ax_top.xaxis.set_ticks_position('top')
+    ax_top.xaxis.set_label_position('top')
+    ax_top.tick_params(axis='x', which='both', direction='out', top=True, labeltop=True, bottom=False, labelbottom=False)
+    # Move top-panel y-axis ticks/labels/label to LEFT side
+    ax_top.yaxis.set_ticks_position('left')
+    ax_top.yaxis.set_label_position('left')
+    ax_top.tick_params(axis='y', which='both', direction='out', left=True, labelleft=True, right=False, labelright=False)
+    # Left panel: show y ticks/labels on LEFT side, outward; hide right side labels
+    ax_left.tick_params(axis='y', which='both', direction='out', left=True, labelleft=True, right=False, labelright=False)
+    # Left panel: move x-axis label/ticks back to BOTTOM
+    ax_left.xaxis.set_ticks_position('bottom')
+    ax_left.xaxis.set_label_position('bottom')
+    ax_left.tick_params(axis='x', which='both', direction='out', top=False, labeltop=False, bottom=True, labelbottom=True)
+    # Main panel: remove left (y) and top (x) ticks/labels; keep bottom x-axis visible
+    ax_main.tick_params(axis='y', which='both', left=False, labelleft=False, right=False, labelright=False)
+    ax_main.tick_params(axis='x', which='both', top=False, labeltop=False)
 
     # idx: current index; busy: rendering in progress; pending: pending direction (-1/0/+1)
     state = {'idx': 0, 'busy': False, 'pending': 0}
@@ -185,20 +250,21 @@ def test_load_fits_image(output_dir: str, verbose: bool=False, mask_dir: Optiona
         image_display.set_data(image)
         image_display.set_clim(vmin, vmax)
 
-    # 设置坐标范围：
-        #  x 轴：相对第 1 个样本的时间，(block_index-1)*nsamp*tbin + i*tbin
+        # 设置坐标范围：
+        #  x 轴：相对第 1 个样本的时间，block_index*nsamp*tbin + i*tbin（block 为0基）
         #  y 轴：频道 0..nchan
         nchan, nsamp = image.shape
         import re as _re
         m = _re.search(r'block(\d+)\.(fits|fit)$', os.path.basename(path))
-        block_idx = int(m.group(1)) if m else 1
-        x_left = ((block_idx - 1) * nsamp) * tbin
+        # Filenames in this project are 0-based (block0, block1, ...). Use 0 as default.
+        block_idx = int(m.group(1)) if m else 0
+        x_left = (block_idx * nsamp) * tbin
         x_right = x_left + nsamp * tbin
         y_bottom, y_top = 0, nchan
         try:
             image_display.set_extent((x_left, x_right, y_bottom, y_top))
-            ax.set_xlim(x_left, x_right)
-            ax.set_ylim(y_bottom, y_top)
+            ax_main.set_xlim(x_left, x_right)
+            ax_main.set_ylim(y_bottom, y_top)
         except Exception:
             pass
 
@@ -305,21 +371,58 @@ def test_load_fits_image(output_dir: str, verbose: bool=False, mask_dir: Optiona
         else:
             mask_display.set_visible(False)
 
+        # Update marginal profiles on top and left panels
+        # Time profile: mean over frequency (axis=0) -> length nsamp
+        time_profile = image.mean(axis=0)
+        time_x = np.linspace(x_left + 0.5 * tbin, x_right - 0.5 * tbin, nsamp)
+        top_line.set_data(time_x, time_profile)
+        # Set y-limits with small padding
+        if np.isfinite(time_profile).any():
+            tmin_val = float(np.nanmin(time_profile))
+            tmax_val = float(np.nanmax(time_profile))
+            if not np.isfinite(tmin_val) or not np.isfinite(tmax_val):
+                tmin_val, tmax_val = 0.0, 1.0
+            span = (tmax_val - tmin_val)
+            pad = 0.05 * span
+            if span <= 0:
+                pad = max(1.0, abs(tmax_val) * 0.05 + 1e-3)
+            ax_top.set_ylim(tmin_val - pad, tmax_val + pad)
+        ax_top.set_xlim(x_left, x_right)
+
+        # Frequency profile: mean over time (axis=1) -> length nchan
+        freq_profile = image.mean(axis=1)
+        freq_y = np.linspace(y_bottom + 0.5, y_top - 0.5, nchan)
+        left_line.set_data(freq_profile, freq_y)
+        # Set x-limits with small padding
+        if np.isfinite(freq_profile).any():
+            fmin_val = float(np.nanmin(freq_profile))
+            fmax_val = float(np.nanmax(freq_profile))
+            if not np.isfinite(fmin_val) or not np.isfinite(fmax_val):
+                fmin_val, fmax_val = 0.0, 1.0
+            span = (fmax_val - fmin_val)
+            pad = 0.05 * span
+            if span <= 0:
+                pad = max(1.0, abs(fmax_val) * 0.05 + 1e-3)
+            ax_left.set_xlim(fmin_val - pad, fmax_val + pad)
+        ax_left.set_ylim(y_bottom, y_top)
+
         # Force plain tick labels on x-axis: no scientific, no offset string
         try:
             from matplotlib.ticker import ScalarFormatter
             sf = ScalarFormatter(useOffset=False)
             sf.set_scientific(False)
-            ax.xaxis.set_major_formatter(sf)
+            ax_main.xaxis.set_major_formatter(sf)
             # Alternatively, ensure style plain
-            ax.ticklabel_format(axis='x', style='plain', useOffset=False)
+            ax_main.ticklabel_format(axis='x', style='plain', useOffset=False)
         except Exception:
             pass
 
-        # Update title and labels
-        ax.set_title(f'[{index+1}/{len(fits_files)}] {os.path.basename(path)}  (←/→:step, J:jump-to, Q/Esc:quit)')
-        ax.set_xlabel('Time since first sample (s)')
-        ax.set_ylabel('Channel (index)')
+        # Update title and labels (use a figure-level title to avoid being covered by the top panel)
+        fig.suptitle(f'[{index+1}/{len(fits_files)}] {os.path.basename(path)}  (←/→:step, J:jump-to, Q/Esc:quit)')
+        ax_main.set_xlabel('Time since first sample (s)')
+        ax_main.set_ylabel('Channel (index)')
+        ax_top.set_ylabel('Freq Profile')
+        ax_left.set_xlabel('Time Profile')
 
         # Do not draw here; draw synchronously in navigation to avoid frame skipping
         state['idx'] = index
@@ -442,8 +545,10 @@ if __name__ == "__main__":
                         help='Force opening a folder selection dialog even if --dir is provided.')
     parser.add_argument('--verbose', action='store_true',
                         help='Print per-frame loading logs (default: off).')
-    parser.add_argument('--mask', nargs='?', const=True, default=False,
-                        help='Enable mask overlay. Optionally provide MASK_DIR; if omitted, a folder dialog will ask for it.')
+    parser.add_argument('--mask', nargs='?', const=True, default=True,
+                        help='Enable mask overlay (default: on). Optionally provide MASK_DIR; if omitted, a folder dialog will ask for it.')
+    parser.add_argument('--no-mask', action='store_true',
+                        help='Disable mask overlay (overrides --mask).')
     parser.add_argument('--mask-alpha', type=float, default=0.35,
                         help='Alpha (opacity) for mask overlay in [0,1]. Default: 0.35')
     args = parser.parse_args()
@@ -468,6 +573,10 @@ if __name__ == "__main__":
     if not os.path.isdir(dir_path):
         print(f"[Error] 目标路径不存在：{dir_path}")
         raise SystemExit(1)
+
+    # Optional override to disable mask
+    if getattr(args, 'no_mask', False):
+        args.mask = False
 
     # Resolve mask directory if overlay enabled
     mask_dir = None

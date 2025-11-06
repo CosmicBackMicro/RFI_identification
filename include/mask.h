@@ -21,9 +21,9 @@ void expandChannelMask(const int *channelFlagged, bool *mask2D, int nsamp, int n
 void logicalOR(bool *globalMask, const bool *mask, int nsamp, int nchan);
 
 // Convenience API: write all masks in IdentNSigmaMasks to PNGs with consistent naming
-// Filenames will be written to: `${datasetPath}mask_<name>_<index>.png`
+// Filenames will be written to: `${datasetPath}${sourceName}_block${index}_mask_<name>.png`
 void writeAllMasksPNG(const IdentNSigmaMasks *masks, int nsamp, int nchan,
-					  const char *datasetPath, int index, int merge);
+					  const char *datasetPath, int index, int merge, const char *sourceName);
 
 // Smooth outChannel mask by removing isolated flagged channels
 void smoothOutChanMask(int *channelFlagged, int nchan, int N);

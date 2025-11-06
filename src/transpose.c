@@ -42,22 +42,44 @@ fftwf_plan plan_transpose_f(int rows, int cols, float *in, float *out)
         NULL, // kind
         flags);
 }
+static inline void cpu_transpose_fallback(const float *array, int nsamp, int nchan, float *arrayT) {
+    for (int i = 0; i < nsamp; ++i) {
+        for (int j = 0; j < nchan; ++j) {
+            arrayT[j * nsamp + i] = array[i * nchan + j];
+        }
+    }
+}
+
 void transpose(float *array, int nsamp, int nchan, float *arrayT)
 {
-    static fftwf_plan tplan;
-    static int last_nsamp = -1, last_nchan = -1;
-    
-    // Create plan only if dimensions changed or plan doesn't exist
-    if (tplan == NULL || nsamp != last_nsamp || nchan != last_nchan) {
-        if (tplan != NULL) {
-            fftwf_destroy_plan(tplan);
+    // Thread-local plan cache with up to two shapes (covers our typical (nsamp,nchan) and (nchan,nsamp))
+    static _Thread_local fftwf_plan tplan1 = NULL, tplan2 = NULL;
+    static _Thread_local int p1_ns = -1, p1_nc = -1;
+    static _Thread_local int p2_ns = -1, p2_nc = -1;
+
+    fftwf_plan plan = NULL;
+    if (tplan1 && p1_ns == nsamp && p1_nc == nchan) {
+        plan = tplan1;
+    } else if (tplan2 && p2_ns == nsamp && p2_nc == nchan) {
+        plan = tplan2;
+    } else {
+        // Create a new plan in an empty slot (do not destroy existing plans to avoid races)
+        if (!tplan1) {
+            tplan1 = plan_transpose_f(nsamp, nchan, array, arrayT);
+            p1_ns = nsamp; p1_nc = nchan;
+            plan = tplan1;
+        } else if (!tplan2) {
+            tplan2 = plan_transpose_f(nsamp, nchan, array, arrayT);
+            p2_ns = nsamp; p2_nc = nchan;
+            plan = tplan2;
+        } else {
+            // Fallback safely without modifying existing plans
+            cpu_transpose_fallback(array, nsamp, nchan, arrayT);
+            return;
         }
-        tplan = plan_transpose_f(nsamp, nchan, array, arrayT);
-        last_nsamp = nsamp;
-        last_nchan = nchan;
     }
-    
-    fftwf_execute_r2r(tplan, array, arrayT);
+
+    fftwf_execute_r2r(plan, array, arrayT);
 }
 
 void transpose_int(const int *array, int nsamp, int nchan, int *arrayT)

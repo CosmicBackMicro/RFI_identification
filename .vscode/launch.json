@@ -9,15 +9,10 @@
             "preLaunchTask": "build",
             "program": "${workspaceFolder}/build/ReadFASTData",
             "args": [
-                // "--filename=/mnt/d/FASTData/FITSFiles/G200.48+2.54_20250409_snapshot-M01-P1-c1024b1.fits",
-                // "--filename=/mnt/d/FASTData/FITSFiles/G200.14+2.80_20250409_snapshot-M05-P1-c1024b1.fits",
-                // "--filename=/mnt/d/FASTData/FITSFiles/G184.63-5.93_20210526_snapshot-M14-P4-c1024b1.fits",
-                // "--filename=/mnt/d/FASTData/FITSFiles/G152.35-2.20_20200104_snapshot-M05-P3-c2048b1.fits",
-                // "--filename=/mnt/d/FASTData/FITSFiles/G80.92-0.08_20210226_snapshot-M05-P4-c2048b1.fits",
-                // "--filename=/mnt/d/FASTData/FITSFiles/G31.37+2.20_20201111_snapshot-M07-P1-c2048b1.fits",
-                // "--filename=/mnt/d/FASTData/FITSFiles/G191.19+2.54_20250408_snapshot-M05-P2-c1024b1.fits",
-                "--filename=/mnt/d/FASTData/FITSFiles/G82.54-2.20_20240120_snapshotzcal-M07-P2-c2048b1.fits",
-                "--binFactorTime=1",
+                "--filename=/mnt/d/FASTData/FITSFiles/G213.40+1.69_20191223_snapshot-M05-P3-c2048b1.fits",
+                "--blocksPerRead=16",
+                "--binFactorTime=16", 
+                // 生成训练数据时，一般blocksPerRead应与binFactorTime相等，这样可以保持生成图片的尺寸一致
                 "--binFactorFreq=1",
                 "--plot=1",
                 "--savePlot=1",
@@ -26,7 +21,6 @@
                 "--writeMasks=1",
                 "--doSubstitution=1",
                 "--doSumThreshold=1",
-                "--blocksPerRead=1",
                 "--startTime=0.0",
                 "--generateMasks=1",
                 "--datasetPath=/home/cbm/deRFI/output",
@@ -75,3 +69,46 @@
     ]
 } 
 // --filename=/mnt/d/FASTData/FITSFiles/G152.35-2.20_20200104_snapshot-M05-P3-c2048b1.fits --binFactorTime=1 --binFactorFreq=1 --plot=1 --savePlot=1 --write=1 --writeBack=0 --writeMasks=1 --doSubstitution=1 --doSumThreshold=1 --blocksPerRead=1 --startTime=0.0 --generateMasks=1 --datasetPath=/home/cbm/deRFI/output --enableCuda=0
+
+// B0355+54_20191110_tracking_1-M01-P1-c2048b1.fits
+// B0355+54_20191110_tracking_1-M02-P1-c2048b1.fits
+// B0355+54_20191110_tracking_2-M01-P1-c2048b1.fits
+// B1929+10_20210106_tracking-M01-P1-c1024b1.fits
+
+// J1539+5027_20190805_tracking-M01-P1-c2048b1.fits
+// J1539+5027_20190805_tracking-M01-P2-c2048b1.fits
+// J1901+0659_20191110_tracking-M01-P1-c2048b1.fits
+// J193754+191232_20221105_tracking-M01-P1-c2048b1.fits
+// J195137+283648_20240726_tracking-M01-P1-c512b1.fits
+
+// G28.58+3.81_20220914_snapshot-M06-P2-c2048b1.fits
+// G30.00+6.44_20240120_snapshot-M09-P4-c2048b1.fits
+// G30.54+4.66_20190917_snapshot-M05-P4-c2048b1.fits
+// G31.37+2.20_20201111_snapshot-M07-P1-c2048b1.fits
+// G33.18-1.44_20220711_snapshot-M13-P2-c2048b1.fits
+// G44.14+6.52_20210628_snapshot-M06-P3-c2048b1.fits
+// G45.56+2.71_20230825_snapshot-M07-P3-c2048b1.fits
+// G50.94+1.02_20210822_snapshot-M02-P1-c2048b1.fits
+// G57.49-0.17_20190321_snapshot-M01-P1-c2048b1.fits
+// G57.49-0.17_20211221_snapshot-M03-P2-c2048b1.fits
+// G57.54+0.25_20201102_snapshot-M01-P1-c2048b1.fits
+// G65.07+1.10_20230604_snapshot-M12-P4-c2048b1.fits
+// G69.04+0.00_20190320_snapshot-M06-P2-c2048b1.fits
+// G70.89+0.00_20200219_snapshot-M06-P3-c2048b1.fits
+// G80.92-0.08_20210226_snapshot-M05-P4-c2048b1.fits
+// G82.54-2.20_20240120_snapshotzcal-M07-P2-c2048b1.fits
+// G90.22-0.08_20220808_snapshot-M19-P4-c2048b1.fits
+// G120.82-21.31_20240812_snapshotdec-M16-P1-c1024b1.fits
+// G135.96-8.90_20220225_snapshot-M10-P3-c1024b1.fits
+// G136.25-9.57_20210524_snapshot-M05-P4-c1024b1.fits
+// G152.25-3.05_20190509_snapshot-M04-P1-c2048b1.fits
+// G152.35-2.20_20200104_snapshot-M05-P3-c2048b1.fits
+// G166.34-0.17_20221108_snapshot-M13-P2-c1024b1.fits
+// G167.71+2.03_20241127_snapshot-M04-P4-c1024b1.fits
+// G174.90-0.08_20200109_snapshot-M03-P3-c2048b1.fits
+// G184.63-5.93_20210526_snapshot-M14-P4-c1024b1.fits
+// G191.19+2.54_20250408_snapshot-M05-P2-c1024b1.fits
+// G200.14+2.80_20250409_snapshot-M05-P1-c1024b1.fits
+// G200.48+2.54_20250409_snapshot-M01-P1-c1024b1.fits
+// G200.53+2.97_20250409_snapshot-M01-P2-c1024b1.fits
+// G213.40+1.69_20191223_snapshot-M05-P3-c2048b1.fits

@@ -63,7 +63,7 @@ def get_num(name):
 def main():
     parser = argparse.ArgumentParser(description="Split deRFI dataset into train/val sets.")
     parser.add_argument("--new_name", required=True, help="New name for the output folder.")
-    parser.add_argument("--val_ratio", type=float, default=0.1, help="Ratio of samples for validation (default: 0.1).")
+    parser.add_argument("--val_ratio", type=float, default=0.2, help="Ratio of samples for validation (default: 0.2).")
     args = parser.parse_args()
 
     output_dir = Path("output")
@@ -72,7 +72,7 @@ def main():
 
     # Check FITS files count
     fits_files = sorted(output_dir.glob("*.fits"))
-    if len(fits_files) < 4000:
+    if len(fits_files) < 100:
         raise ValueError(f"Error: Found only {len(fits_files)} FITS files in 'output'. At least 4000 required.")
 
     # Create image and mask folders
@@ -111,6 +111,11 @@ def main():
             # Move to train
             shutil.move(str(img_file), str(train_image_dir / img_file.name))
             shutil.move(str(mask_file), str(train_mask_dir / mask_file.name))
+
+    # Move txt files to top level
+    txt_files = list(output_dir.glob("*.txt"))
+    for txt_file in txt_files:
+        shutil.move(str(txt_file), str(output_dir / txt_file.name))
 
     # Count samples
     train_count = len(list(train_image_dir.glob('*.fits')))

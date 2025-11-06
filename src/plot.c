@@ -234,9 +234,16 @@ void plotTimeFreqSED(Metadata *m, int numReads, float *dsDataT, float *dsFreqArr
     float rightPanel_x1 = mainPanelRight, rightPanel_x2 = 1.0 - globalMargin, rightPanel_y1 = globalMargin, rightPanel_y2 = mainPanelTop;
     float topPanel_x1 = globalMargin, topPanel_x2 = mainPanelRight, topPanel_y1 = mainPanelTop, topPanel_y2 = 1.0 - globalMargin;
 
-    int nsampPlot = m->nsampBinned; // Use binned samples for plotting
+    // Effective plotting geometry:
+    // We may aggregate multiple SUBINT rows per iteration when binFactorTime>1.
+    // The caller passes `numReads` as the number of SUBINT rows aggregated this iteration
+    // (often m.blocksPerRead * m.binFactorTime). The actual binned time samples per plot
+    // should therefore be (nsblk * numReads) / binFactorTime, while the time resolution is
+    // tbin * binFactorTime so the total time span expands by binFactorTime.
+    int binT = (m->binFactorTime > 0) ? m->binFactorTime : 1;
+    int nsampPlot = (m->nsblk * numReads) / binT;
     int nchanPlot = m->nchanBinned;
-    float tbinPlot = m->tbinBinned;
+    float tbinPlot = m->tbin * binT;
     float chan_bwPlot = m->chan_bwBinned;
 
     float tmin = startTime + currentBlock * nsampPlot * tbinPlot + 0.5 * tbinPlot;
@@ -246,13 +253,11 @@ void plotTimeFreqSED(Metadata *m, int numReads, float *dsDataT, float *dsFreqArr
     float fstep = chan_bwPlot;
     float fmax = dsFreqArray[nchanPlot - 1] - 0.5 * chan_bwPlot;
 
-    // == Allocate memory for profiles ===
-    float *dsDataT_deRFI = malloc(sizeof(float) * m->nsampBinned * m->nchanBinned);
-    float *dsTimeProfile_mean = malloc(sizeof(float) * m->nsampBinned);
-    float *dsFreqProfile_mean = malloc(sizeof(float) * m->nchanBinned);
-    float *dsTimeProfile_std = malloc(sizeof(float) * m->nsampBinned);
-    float *dsFreqProfile_std = malloc(sizeof(float) * m->nchanBinned);
-    int *dsChannelMask = calloc(m->nchanBinned, sizeof(int));
+    // == Allocate memory for profiles (align sizes to current plot geometry) ===
+    float *dsTimeProfile_mean = (float *)malloc(sizeof(float) * nsampPlot);
+    float *dsFreqProfile_mean = (float *)malloc(sizeof(float) * nchanPlot);
+    float *dsTimeProfile_std  = (float *)malloc(sizeof(float) * nsampPlot);
+    float *dsFreqProfile_std  = (float *)malloc(sizeof(float) * nchanPlot);
 
     // Calculate both mean and std profiles
     getProfile(dsDataT, nsampPlot, nchanPlot, dsFreqProfile_mean, dsTimeProfile_mean, mask);
@@ -381,12 +386,10 @@ void plotTimeFreqSED(Metadata *m, int numReads, float *dsDataT, float *dsFreqArr
     cpgsch(1.0);
 
     // === Clean up ===
-    free(dsDataT_deRFI);
     free(dsTimeProfile_mean);
     free(dsFreqProfile_mean);
     free(dsTimeProfile_std);
     free(dsFreqProfile_std);
-    free(dsChannelMask);
 }
 
 

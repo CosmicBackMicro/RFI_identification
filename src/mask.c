@@ -149,7 +149,7 @@ void logicalOR(bool *restrict globalMask, const bool *restrict mask, int nsamp, 
 }
 
 void writeAllMasksPNG(const IdentNSigmaMasks *masks, int nsamp, int nchan,
-                      const char *datasetPath, int index, int merge)
+                      const char *datasetPath, int index, int merge, const char *sourceName)
 {
     if (!masks || !datasetPath) return;
     char filename[512];
@@ -185,7 +185,7 @@ void writeAllMasksPNG(const IdentNSigmaMasks *masks, int nsamp, int nchan,
             for (int i = 0; i < total; i++) if (masks->pointMask[i]) indexMask[i] = classIndex;
         }
 
-        snprintf(filename, sizeof(filename), "%smask_merged_%d.png", datasetPath, index);
+        snprintf(filename, sizeof(filename), "%s%s_block%d.png", datasetPath, sourceName, index);
         writeClassIndexMaskPNG(indexMask, nsamp, nchan, filename);
         free(indexMask);
         return; // merged 模式下直接返回
@@ -193,7 +193,7 @@ void writeAllMasksPNG(const IdentNSigmaMasks *masks, int nsamp, int nchan,
 
     // horizontal
     if (masks->horizontalMask) {
-        snprintf(filename, sizeof(filename), "%smask_horizontal_%d.png", datasetPath, index);
+        snprintf(filename, sizeof(filename), "%s%s_block%d_horizontal.png", datasetPath, sourceName, index);
         writeIndexMaskPNG(masks->horizontalMask, nsamp, nchan, filename);
     }
 
@@ -211,7 +211,7 @@ void writeAllMasksPNG(const IdentNSigmaMasks *masks, int nsamp, int nchan,
 
     // point
     if (masks->pointMask) {
-        snprintf(filename, sizeof(filename), "%smask_point_%d.png", datasetPath, index);
+        snprintf(filename, sizeof(filename), "%s%s_block%d_point.png", datasetPath, sourceName, index);
         writeIndexMaskPNG(masks->pointMask, nsamp, nchan, filename);
     }
 

@@ -158,31 +158,43 @@ void writeAllMasksPNG(const IdentNSigmaMasks *masks, int nsamp, int nchan,
         int *indexMask = (int *)calloc(total, sizeof(int));
         if (!indexMask) return;
 
-        /*
-         * 合并优先级(低 -> 高): horizontal < complex < dark < bright < point
-         * 低优先级先写入获得较小类号, 高优先级后写入覆盖并拥有较大类号。
-         * 类号分配: 1:horizontal 2:complex 3:dark 4:bright 5:point
-         */
+    /*
+     * 合并优先级(低 -> 高): horizontal < vertical < complex < dark < bright < point < block
+     * 类号分配:
+     * 1:horizontal 2:vertical 3:complex 4:dark 5:bright 6:point 7:block
+     * 仍遵循后写覆盖前写的原则。
+     */
         int classIndex = 1;
 
         if (masks->horizontalMask) {
             for (int i = 0; i < total; i++) if (masks->horizontalMask[i]) indexMask[i] = classIndex;
         }
         classIndex++;
+        if (masks->verticalMask) {
+            for (int i = 0; i < total; i++) if (masks->verticalMask[i]) indexMask[i] = classIndex;
+        }
+        classIndex++;
+        // complex (currently disabled)
         // if (masks->chanComplexMask) {
         //     for (int i = 0; i < total; i++) if (masks->chanComplexMask[i]) indexMask[i] = classIndex;
         // }
         classIndex++;
+        // dark (currently disabled)
         // if (masks->chanDarkMask) {
         //     for (int i = 0; i < total; i++) if (masks->chanDarkMask[i]) indexMask[i] = classIndex;
         // }
         classIndex++;
+        // bright (currently disabled)
         // if (masks->chanBrightMask) {
         //     for (int i = 0; i < total; i++) if (masks->chanBrightMask[i]) indexMask[i] = classIndex;
         // }
         classIndex++;
         if (masks->pointMask) {
             for (int i = 0; i < total; i++) if (masks->pointMask[i]) indexMask[i] = classIndex;
+        }
+        classIndex++;
+        if (masks->blockMask) { // block (highest priority)
+            for (int i = 0; i < total; i++) if (masks->blockMask[i]) indexMask[i] = classIndex;
         }
 
         snprintf(filename, sizeof(filename), "%s%s_block%d.png", datasetPath, sourceName, index);
@@ -238,6 +250,8 @@ void allocIdentNSigmaMasks(IdentNSigmaMasks *m, int nsamp, int nchan) {
     if (!m) return;
     m->horizontalMask = (bool *)calloc(nsamp * nchan, sizeof(bool));
     m->verticalMask   = (bool *)calloc(nsamp * nchan, sizeof(bool));
+    m->blockMask      = (bool *)calloc(nsamp * nchan, sizeof(bool));  // New: allocate blockMask
+    m->periodicMask   = (bool *)calloc(nsamp * nchan, sizeof(bool)); // New: allocate periodicMask
     m->globalMask     = (bool *)calloc(nsamp * nchan, sizeof(bool));
     m->pointMask      = (bool *)calloc(nsamp * nchan, sizeof(bool));
     m->chanBrightMask = (bool *)calloc(nsamp * nchan, sizeof(bool));
@@ -249,6 +263,8 @@ void clearIdentNSigmaMasks(IdentNSigmaMasks *m, int nsamp, int nchan) {
     if (!m) return;
     memset(m->horizontalMask,    0, sizeof(bool)*nsamp*nchan);
     memset(m->verticalMask,      0, sizeof(bool)*nsamp*nchan);
+    memset(m->blockMask,         0, sizeof(bool)*nsamp*nchan);  // New: clear blockMask
+    memset(m->periodicMask,      0, sizeof(bool)*nsamp*nchan);  // New: clear periodicMask
     memset(m->globalMask,        0, sizeof(bool)*nsamp*nchan);
     memset(m->pointMask,         0, sizeof(bool)*nsamp*nchan);
     memset(m->chanBrightMask,    0, sizeof(bool)*nsamp*nchan);
@@ -260,6 +276,8 @@ void freeIdentNSigmaMasks(IdentNSigmaMasks *m) {
     if (!m) return;
     free(m->horizontalMask);
     free(m->verticalMask);
+    free(m->blockMask);  // New: free blockMask
+    free(m->periodicMask); // New: free periodicMask
     free(m->globalMask);
     free(m->pointMask);
     free(m->chanBrightMask);

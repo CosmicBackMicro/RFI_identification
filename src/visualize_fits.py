@@ -390,8 +390,9 @@ def test_load_fits_image(output_dir: str, verbose: bool=False, mask_dir: Optiona
         ax_top.set_xlim(x_left, x_right)
 
         # Frequency profile: mean over time (axis=1) -> length nchan
+        # Flip vertically to match the displayed image orientation
         freq_profile = image.mean(axis=1)
-        freq_y = np.linspace(y_bottom + 0.5, y_top - 0.5, nchan)
+        freq_y = np.linspace(y_top - 0.5, y_bottom + 0.5, nchan)
         left_line.set_data(freq_profile, freq_y)
         # Set x-limits with small padding
         if np.isfinite(freq_profile).any():

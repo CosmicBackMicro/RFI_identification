@@ -39,6 +39,8 @@ void subChanMed(float *data, int nsamp, int nchan, float *channel_medians, float
 typedef struct IdentNSigmaMasks {
     bool *horizontalMask;
     bool *verticalMask;
+    bool *blockMask;  // New: block RFI mask
+    bool *periodicMask; // New: periodic point RFI mask (subset of pointMask)
     bool *globalMask;
     bool *pointMask;
     bool *chanBrightMask;
@@ -52,10 +54,51 @@ void identSubstNSigma(
     IdentNSigmaMasks *masks,
     float *finalMedian, float *finalStd, int cudaReady, int *flaggedChans,
     int *identSubst_goodSamps, int *identSubst_randIdxs, float *identSubst_medTemp,
-    float *inChanScratch, size_t inChanScratchCount);
+    float *inChanScratch, size_t inChanScratchCount,
+    /* Vertical-stripe detection scratch buffers (allocated by caller) */
+    float *vs_time_means_buf, unsigned char *vs_flag_time_buf);
 
 // Histogram functions
 // OutChannel comparison histogram function
 void drawOutChannelComparisonHist(float *initial_stats, float *final_stats, int nchan, 
                                   int initial_flagged_count, int final_flagged_count,
                                   int iterations, float nsigma_out, float nsigma_in);
+
+// Detect broadband vertical stripes (all or most channels active at the same time index)
+// using peaks on the time-mean and/or time-std sequences.
+// verticalMask is set to 1 for all channels at flagged time indices.
+void detectVerticalStripesByTimeProfiles(
+    const float *data,
+    int nsamp,
+    int nchan,
+    const bool *pointMask,      // exclude: per-pixel point-level RFI
+    const bool *horizontalMask, // exclude: fully-flagged channels expanded to 2D
+    bool *verticalMask,
+    float nsigma_mean,
+    int min_run,
+    int plot,
+    /* Scratch buffers provided by caller to avoid internal allocations */
+    float *time_means_buf,
+    unsigned char *flag_time_buf);
+
+// Simple block RFI detection using connected components
+void detectBlockRFI(
+    const bool *binaryMask, // input binary mask (e.g., pointMask). Will NOT be modified
+    int nsamp, int nchan,
+    bool *blockMask, // output block RFI mask
+    int min_area, float min_density, // simple thresholds
+    int dilate_radius, int dilate_iterations // extra dilation applied internally on a copy
+);
+
+// Detect periodic point RFI strictly within pointMask.
+// For each channel independently, search period in [min_period, max_period] using a simple
+// autocorrelation-on-binary approach, then mark only those pointMask pixels that participate
+// in the best period as periodic. The output periodicMask is a subset of pointMask.
+void detectPeriodicPointRFI(
+    const bool *pointMask,
+    int nsamp, int nchan,
+    bool *periodicMask,
+    int min_period, int max_period,
+    int min_pairs,          // minimum matched pairs x[t] & x[t+T]
+    float min_align_frac    // s[T]/sum(x) threshold to accept periodicity
+);

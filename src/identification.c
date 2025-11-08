@@ -1959,10 +1959,13 @@ void identSubstNSigma(
     IdentNSigmaMasks *masks,
     float *finalMedian, float *finalStd, int cudaReady, int *flaggedChans,
     int *identSubst_goodSamps, int *identSubst_randIdxs, float *identSubst_medTemp,
-    float *inChanScratch, size_t inChanScratchCount)
+    float *inChanScratch, size_t inChanScratchCount,
+    float *vs_time_means_buf, unsigned char *vs_flag_time_buf)
 {
     bool *horizontalMask = masks->horizontalMask;
     bool *verticalMask = masks->verticalMask;
+    bool *blockMask = masks->blockMask;  // New: local pointer for blockMask
+    bool *periodicMask = masks->periodicMask; // New: local pointer for periodicMask
     bool *globalMask = masks->globalMask;
     bool *pointMask = masks->pointMask;
     bool *brightMask = masks->chanBrightMask;
@@ -1970,6 +1973,8 @@ void identSubstNSigma(
     bool *complexMask = masks->chanComplexMask;
     memset(horizontalMask, 0, nsamp * nchan * sizeof(bool));
     memset(verticalMask, 0, nsamp * nchan * sizeof(bool));
+    memset(blockMask, 0, nsamp * nchan * sizeof(bool));  // New: initialize blockMask
+    memset(periodicMask, 0, nsamp * nchan * sizeof(bool)); // New: initialize periodicMask
     memset(globalMask, 0, nsamp * nchan * sizeof(bool));
     memset(pointMask, 0, nsamp * nchan * sizeof(bool));
     memset(brightMask, 0, nsamp * nchan * sizeof(bool));
@@ -2050,6 +2055,53 @@ void identSubstNSigma(
         // outChanPixelsSubstituted = flaggedChanCount * nsamp;  // Disabled - no actual substitution performed
     }
     printf("outChannel substitution: replaced %d pixels\n", outChanPixelsSubstituted);
+
+    // === (NEW) 5.5 Vertical Stripe Detection ===
+    // Detect broadband vertical stripes via time mean/std peak analysis.
+    // Parameters chosen conservatively; can be externalized later.
+    float vsigma_mean = 4.0f; // N-sigma threshold on time means
+    int   v_min_run   = 1;    // minimum contiguous time samples to accept (1 = single sample)
+    if (nsamp >= 4 && nchan >= 8) { // basic sanity to avoid tiny arrays
+        // Build exclusion mask: combine point-level and channel-level masks so vertical detection ignores already flagged RFI
+        // Allocate a temporary bool array (nsamp*nchan) set true where pixel should be excluded
+        // Directly pass pointMask and horizontalMask for exclusion; avoid allocating a combined excludeMask
+        // Exclusion rule moved inside detectVerticalStripesByTimeProfiles
+        detectVerticalStripesByTimeProfiles(
+            data, nsamp, nchan,
+            pointMask,
+            horizontalMask,
+            verticalMask,
+            vsigma_mean,
+            v_min_run,
+            plot,
+            vs_time_means_buf,
+            vs_flag_time_buf);
+        // Merge vertical stripes into global
+        logicalOR(globalMask, verticalMask, nsamp, nchan);
+    } else {
+        memset(verticalMask, 0, (size_t)nsamp * (size_t)nchan * sizeof(bool));
+    }
+    
+    // === (NEW) 6. Block RFI Detection ===
+    // Simple block detection using connected components on pointMask
+    // Apply internal dilation (radius=3 iterations=1) to bridge sparse gaps before CCA
+    detectBlockRFI(pointMask, nsamp, nchan, blockMask,
+                   5000, 0.7f,   // min_area, min_density tuned for large radar-like blocks
+                   7, 1);        // dilate radius, iterations (adjust if over-merging)
+    // High priority: directly overwrite globalMask
+    for (int idx = 0; idx < nsamp * nchan; ++idx) {
+        if (blockMask[idx]) globalMask[idx] = true;
+    }
+
+    // === (DISABLED) Periodic point RFI detection ===
+    // 保留实现但不启用：如需启用，取消以下注释。
+    // int min_period = 3;
+    // int max_period = (nsamp > 200) ? 100 : (nsamp / 2 > 5 ? nsamp/2 : 5);
+    // int min_pairs = 3;
+    // float min_align_frac = 0.30f;
+    // detectPeriodicPointRFI(pointMask, nsamp, nchan, periodicMask,
+    //                        min_period, max_period, min_pairs, min_align_frac);
+    // logicalOR(globalMask, periodicMask, nsamp, nchan);
     
     int nFlaggedChans = 0;
     for (i = 0; i < nchan; i++) {
@@ -2232,4 +2284,291 @@ void drawOutChannelComparisonHist(float *initial_stats, float *final_stats,
     free(kept_hist);
     free(flagged_hist);
     printf("Consistent-shape %s histogram (new) completed!\n", stat_name);
+}
+
+/* -------------------------------------------------------------------------
+ * Broadband vertical stripe detection by time-profile peaks
+ * ------------------------------------------------------------------------- */
+void detectVerticalStripesByTimeProfiles(
+    const float *data,
+    int nsamp,
+    int nchan,
+    const bool *pointMask,
+    const bool *horizontalMask,
+    bool *verticalMask,
+    float nsigma_mean,
+    int min_run,
+    int plot,
+    float *time_means,
+    unsigned char *flag_time)
+{
+    memset(verticalMask, 0, (size_t)nsamp * (size_t)nchan * sizeof(bool));
+    if (!time_means || !flag_time) {
+        fprintf(stderr, "detectVerticalStripesByTimeProfiles: NULL scratch buffers provided.\n");
+        return;
+    }
+
+    // Compute per-time-sample mean & std across channels
+    // data layout: channel-major (channel * nsamp + t)
+    // We'll iterate time index outer for better locality when gathering across channels.
+    for (int t = 0; t < nsamp; ++t) {
+        double sum = 0.0;
+        int count = 0;
+        // First pass: mean over unexcluded pixels
+        for (int c = 0; c < nchan; ++c) {
+            size_t idx = (size_t)c * (size_t)nsamp + (size_t)t;
+            if ((pointMask && pointMask[idx]) || (horizontalMask && horizontalMask[idx])) continue;
+            sum += (double)data[c * nsamp + t];
+            count++;
+        }
+        if (count == 0) {
+            time_means[t] = 0.0f;
+            continue;
+        }
+        double mean = sum / (double)count;
+        time_means[t] = (float)mean;
+    }
+
+    // Simple (non-robust) statistics: mean and standard deviation of time-means for sigma-clip
+    float mean_means, std_means;
+    findMeanStd(time_means, nsamp, &mean_means, &std_means);
+
+    float thr_mean = mean_means + nsigma_mean * std_means;
+
+    // Initial flag arrays
+    memset(flag_time, 0, (size_t)nsamp);
+
+    for (int t = 0; t < nsamp; ++t) {
+        if (time_means[t] > thr_mean) {
+            flag_time[t] = 1;
+        }
+    }
+
+    // Merge adjacent runs shorter than min_run (if min_run>1). We'll perform run-length pass.
+    if (min_run > 1) {
+        int start = 0;
+        while (start < nsamp) {
+            while (start < nsamp && !flag_time[start]) start++;
+            if (start >= nsamp) break;
+            int end = start + 1;
+            while (end < nsamp && flag_time[end]) end++;
+            int run_len = end - start;
+            if (run_len < min_run) { // clear short run
+                for (int k = start; k < end; ++k) flag_time[k] = 0;
+            }
+            start = end;
+        }
+    }
+
+    // Write vertical mask: for each flagged time index, mark all channels
+    int flagged_times = 0;
+    for (int t = 0; t < nsamp; ++t) {
+        if (!flag_time[t]) continue;
+        flagged_times++;
+        for (int c = 0; c < nchan; ++c) {
+            verticalMask[c * nsamp + t] = true;
+        }
+    }
+
+    if (flagged_times > 0) {
+        printf("Vertical stripe detection: flagged %d time indices (%.2f%%) mean_mean=%.3f std_mean=%.3f thr_mean=%.3f\n",
+               flagged_times, (float)flagged_times / nsamp * 100.0f,
+               mean_means, std_means,
+               thr_mean);
+    } else {
+        printf("Vertical stripe detection: no time indices flagged mean_mean=%.3f std_mean=%.3f thr_mean=%.3f\n",
+               mean_means, std_means,
+               thr_mean);
+    }
+}
+
+/* -------------------------------------------------------------------------
+ * Simple block RFI detection using connected components
+ * ------------------------------------------------------------------------- */
+void detectBlockRFI(
+    const bool *binaryMask, // input binary mask (e.g., pointMask)
+    int nsamp, int nchan,
+    bool *blockMask, // output block RFI mask
+    int min_area, float min_density, // simple thresholds
+    int dilate_radius, int dilate_iterations // extra dilation on a local copy
+) {
+    memset(blockMask, 0, (size_t)nsamp * (size_t)nchan * sizeof(bool));
+
+    // Make a local working copy so we can apply extra dilation without touching the original mask
+    bool *workMask = (bool *)malloc((size_t)nsamp * (size_t)nchan * sizeof(bool));
+    if (!workMask) return;
+    memcpy(workMask, binaryMask, (size_t)nsamp * (size_t)nchan * sizeof(bool));
+    if (dilate_radius > 0 && dilate_iterations > 0) {
+        // Note: dilateMask signature is (mask, width=nsamp, height=nchan, radius, iterations)
+        dilateMask(workMask, nsamp, nchan, dilate_radius, dilate_iterations);
+    }
+
+    int *componentLabels = (int *)malloc((size_t)nsamp * (size_t)nchan * sizeof(int));
+    if (!componentLabels) { free(workMask); return; }
+    memset(componentLabels, 0, (size_t)nsamp * (size_t)nchan * sizeof(int));
+    
+    int label = 1;
+    // Stack for flood fill (to avoid recursion)
+    int *stack = (int *)malloc((size_t)nsamp * (size_t)nchan * sizeof(int));
+    if (!stack) { free(componentLabels); free(workMask); return; }
+    
+    // Directions for 8-connectivity
+    int dirs[8][2] = {{-1,-1}, {-1,0}, {-1,1}, {0,-1}, {0,1}, {1,-1}, {1,0}, {1,1}};
+    
+    for (int c = 0; c < nchan; ++c) {
+        for (int t = 0; t < nsamp; ++t) {
+            if (workMask[c * nsamp + t] && componentLabels[c * nsamp + t] == 0) {
+                // Start new component
+                int top = -1;
+                stack[++top] = c * nsamp + t;  // push
+                componentLabels[c * nsamp + t] = label;
+                int pixel_count = 0;
+                int min_c = c, max_c = c, min_t = t, max_t = t;
+                
+                while (top >= 0) {
+                    int idx = stack[top--];  // pop
+                    int cc = idx / nsamp;
+                    int tt = idx % nsamp;
+                    pixel_count++;
+                    
+                    // Update bounds
+                    if (cc < min_c) min_c = cc;
+                    if (cc > max_c) max_c = cc;
+                    if (tt < min_t) min_t = tt;
+                    if (tt > max_t) max_t = tt;
+                    
+                    // Check 8 neighbors
+                    for (int d = 0; d < 8; ++d) {
+                        int nc = cc + dirs[d][0];
+                        int nt = tt + dirs[d][1];
+                        if (nc >= 0 && nc < nchan && nt >= 0 && nt < nsamp &&
+                            workMask[nc * nsamp + nt] && componentLabels[nc * nsamp + nt] == 0) {
+                            componentLabels[nc * nsamp + nt] = label;
+                            stack[++top] = nc * nsamp + nt;  // push
+                        }
+                    }
+                }
+                
+                // Evaluate component
+                int width = max_c - min_c + 1;
+                int height = max_t - min_t + 1;
+                int bb_area = width * height;
+                float density = (float)pixel_count / bb_area;
+                
+                if (pixel_count >= min_area && density >= min_density) {
+                    // Mark bounding box as block RFI
+                    for (int bc = min_c; bc <= max_c; ++bc) {
+                        for (int bt = min_t; bt <= max_t; ++bt) {
+                            blockMask[bc * nsamp + bt] = true;
+                        }
+                    }
+                }
+                
+                label++;
+            }
+        }
+    }
+    
+    free(stack);
+    free(componentLabels);
+    free(workMask);
+}
+
+/* -------------------------------------------------------------------------
+ * Periodic point RFI detection (subset of pointMask)
+ * ------------------------------------------------------------------------- */
+void detectPeriodicPointRFI(
+    const bool *pointMask,
+    int nsamp, int nchan,
+    bool *periodicMask,
+    int min_period, int max_period,
+    int min_pairs,
+    float min_align_frac)
+{
+    if (!pointMask || !periodicMask || nsamp <= 0 || nchan <= 0) return;
+    memset(periodicMask, 0, (size_t)nsamp * (size_t)nchan * sizeof(bool));
+
+    if (min_period < 2) min_period = 2; // ignore period=1 (too trivial)
+    if (max_period <= min_period) max_period = min_period + 1;
+    if (max_period > nsamp - 1) max_period = nsamp - 1;
+    if (max_period < min_period) return;
+    if (min_pairs < 2) min_pairs = 2;
+    if (min_align_frac < 0.0f) min_align_frac = 0.0f;
+    if (min_align_frac > 1.0f) min_align_frac = 1.0f;
+
+    int total_periodic_pixels = 0;
+    // Per-channel search
+    for (int c = 0; c < nchan; ++c) {
+        const bool *row = pointMask + (size_t)c * (size_t)nsamp;
+        int flagged_count = 0;
+        for (int t = 0; t < nsamp; ++t) if (row[t]) flagged_count++;
+        if (flagged_count < min_pairs) continue; // not enough points to form periodic structure
+
+        int best_period = 0;
+        int best_score_pairs = 0;
+        float best_align_frac = 0.0f;
+
+        // Precompute indices of flagged points to accelerate pair scan
+        int *flag_times = (int *)malloc((size_t)flagged_count * sizeof(int));
+        if (!flag_times) return; // abort all if allocation fails
+        int fc = 0;
+        for (int t = 0; t < nsamp; ++t) if (row[t]) flag_times[fc++] = t;
+
+        // For each candidate period T, count pairs (t, t+T) where both flagged
+        for (int T = min_period; T <= max_period; ++T) {
+            int pair_count = 0;
+            // Use two-pointer membership test on sorted flag_times (already sorted by construction)
+            int i = 0, j = 0;
+            while (i < flagged_count && j < flagged_count) {
+                int a = flag_times[i];
+                int b_target = a + T;
+                // Advance j until flag_times[j] >= b_target
+                while (j < flagged_count && flag_times[j] < b_target) j++;
+                if (j < flagged_count && flag_times[j] == b_target) {
+                    pair_count++;
+                }
+                i++;
+            }
+
+            if (pair_count >= min_pairs) {
+                float align_frac = (float)pair_count / (float)flagged_count; // fraction of points participating
+                if (align_frac >= min_align_frac) {
+                    // Prefer higher pair_count; tie-breaker: higher align_frac; then smaller T
+                    if (pair_count > best_score_pairs ||
+                        (pair_count == best_score_pairs && align_frac > best_align_frac) ||
+                        (pair_count == best_score_pairs && fabsf(align_frac - best_align_frac) < 1e-6f && T < best_period)) {
+                        best_period = T;
+                        best_score_pairs = pair_count;
+                        best_align_frac = align_frac;
+                    }
+                }
+            }
+        }
+
+        if (best_period > 0 && best_score_pairs >= min_pairs && best_align_frac >= min_align_frac) {
+            // Mark periodic points: only those that have partner at +best_period (keep subset to avoid over-marking)
+            bool *dst = periodicMask + (size_t)c * (size_t)nsamp;
+            int pairs_marked = 0;
+            int i = 0, j = 0;
+            while (i < flagged_count && j < flagged_count) {
+                int a = flag_times[i];
+                int b_target = a + best_period;
+                while (j < flagged_count && flag_times[j] < b_target) j++;
+                if (j < flagged_count && flag_times[j] == b_target) {
+                    dst[a] = true;
+                    dst[b_target] = true; // include partner pixel
+                    pairs_marked++;
+                }
+                i++;
+            }
+            total_periodic_pixels += pairs_marked * 2; // approximate
+        }
+        free(flag_times);
+    }
+
+    if (total_periodic_pixels > 0) {
+        printf("Periodic point RFI: marked ~%d pixels (subset of pointMask)\n", total_periodic_pixels);
+    } else {
+        printf("Periodic point RFI: no periodic structures detected (criteria unmet)\n");
+    }
 }

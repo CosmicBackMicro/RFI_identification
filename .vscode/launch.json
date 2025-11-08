@@ -9,12 +9,12 @@
             "preLaunchTask": "build",
             "program": "${workspaceFolder}/build/ReadFASTData",
             "args": [
-                "--filename=/mnt/d/FASTData/FITSFiles/G213.40+1.69_20191223_snapshot-M05-P3-c2048b1.fits",
-                "--blocksPerRead=16",
-                "--binFactorTime=16", 
+                "--filename=/mnt/d/FASTData/FITSFiles/G200.14+2.80_20250409_snapshot-M05-P1-c1024b1.fits",
+                "--blocksPerRead=1",
+                "--binFactorTime=1", 
                 // 生成训练数据时，一般blocksPerRead应与binFactorTime相等，这样可以保持生成图片的尺寸一致
                 "--binFactorFreq=1",
-                "--plot=1",
+                "--plot=0",
                 "--savePlot=1",
                 "--write=1",
                 "--writeBack=0",

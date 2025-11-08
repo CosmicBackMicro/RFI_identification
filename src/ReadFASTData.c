@@ -82,6 +82,48 @@ static inline void close_thread_read_fptr(void) {
         tls_read_fptr = NULL;
     }
 }
+/* ------------------------------
+ * PostScript -> PDF conversion helper (later use)
+ * ------------------------------ */
+static char g_last_plot_device[1024] = {0};
+
+int convert_ps_to_pdf(const char *deviceName, int remove_ps)
+{
+    if (!deviceName || !*deviceName) return -1;
+    char psname[512];
+    char pdfname[512];
+    memset(psname, 0, sizeof(psname));
+    strncpy(psname, deviceName, sizeof(psname)-1);
+    // Strip trailing "/VCPS" (or other) after .ps
+    char *last_slash = strrchr(psname, '/');
+    if (!last_slash) return -1;
+    *last_slash = '\0';
+    char *ext = strstr(psname, ".ps");
+    if (!ext) return -1;
+    strncpy(pdfname, psname, sizeof(pdfname)-1);
+    pdfname[sizeof(pdfname)-1] = '\0';
+    char *pdfext = strstr(pdfname, ".ps");
+    if (!pdfext) return -1;
+    strcpy(pdfext, ".pdf");
+    int have_ps2pdf = (system("command -v ps2pdf >/dev/null 2>&1") == 0);
+    char cmd[1200];
+    if (have_ps2pdf) {
+        snprintf(cmd, sizeof(cmd), "ps2pdf %s %s", psname, pdfname);
+    } else {
+        snprintf(cmd, sizeof(cmd), "gs -dNOPAUSE -dBATCH -sDEVICE=pdfwrite -sOutputFile=%s %s", pdfname, psname);
+    }
+    int rc = system(cmd);
+    if (rc != 0) {
+        fprintf(stderr, "Warning: ps->pdf conversion failed for '%s' (rc=%d)\n", psname, rc);
+        return -1;
+    }
+    if (remove_ps) {
+        snprintf(cmd, sizeof(cmd), "rm -f %s", psname);
+        system(cmd);
+    }
+    printf("Converted PostScript to PDF: %s -> %s\n", psname, pdfname);
+    return 0;
+}
 /* Monotonic timer helper to avoid negative durations when system clock slews */
 #ifdef CLOCK_MONOTONIC
 static inline double mono_time_sec(void) {
@@ -911,6 +953,7 @@ int main(int argc, char *argv[])
         memset(saveName, 0, requiredSize);
         snprintf(saveName, requiredSize, "%s/%s_%.2f_%d_%d.ps/VCPS",
                  m.datasetPath, sourceName, 0.0, m.binFactorTime, m.binFactorFreq);
+        strncpy(g_last_plot_device, saveName, sizeof(g_last_plot_device)-1); // store for later ps->pdf
         if (ensure_pgplot_device(saveName)) {
             // Set a 2x5 subdivision to mimic original cpgbeg layout
             cpgsubp(2, 5);
@@ -1018,6 +1061,10 @@ int main(int argc, char *argv[])
     if (inChanScratchCount > 0) {
         inChanScratch = (float *)malloc(sizeof(float) * inChanScratchCount);
     }
+
+    // Scratch buffers for vertical stripe detection (moved out of inner functions)
+    float *vs_time_means_all = (float *)malloc(sizeof(float) * (size_t)nsampBinned * (size_t)maxScratchThreads);
+    unsigned char *vs_flag_time_all = (unsigned char *)malloc((size_t)nsampBinned * (size_t)maxScratchThreads);
 
     // Accumulators for loop timing stats
     double loop_total_time = 0.0;
@@ -1219,10 +1266,12 @@ int main(int argc, char *argv[])
                 float *medTemp   = SLICE_PTR(identSubst_medTemp,   (size_t)nsampBinned * (size_t)nchanBinned, tid);
                 float *inChanSlice = SLICE_PTR(inChanScratch, nsampBinned, tid);
                 size_t inChanSliceCount = (size_t)nsampBinned;
+                float *vs_time_means = SLICE_PTR(vs_time_means_all, nsampBinned, tid);
+                unsigned char *vs_flag_time = SLICE_PTR(vs_flag_time_all, nsampBinned, tid);
                 identSubstNSigma(outDataT, nsampBinned, nchanBinned, NSigmaInChan, NSigmaOutChan, ii, doPlotThisIter,
                                 maskSetPtr, finalMedian, finalStd, m.cudaReady, flaggedChans,
-                                goodSamps, randIdxs, medTemp,
-                                inChanSlice, inChanSliceCount);
+                                goodSamps, randIdxs, medTemp, inChanSlice, inChanSliceCount,
+                                vs_time_means, vs_flag_time);
                 double rfi_time = mono_time_sec() - rfi_start; if (rfi_time < 0) rfi_time = 0;
                 printf("RFI detection time: %.4f seconds\n", rfi_time);
 
@@ -1373,7 +1422,12 @@ int main(int argc, char *argv[])
     //     stop_reader_thread_prefetch();
     // }
     // Cleanup
-    if (m.plot) cpgend();
+    if (m.plot) {
+        cpgend();
+        if (g_last_plot_device[0]) {
+            convert_ps_to_pdf(g_last_plot_device, 1);
+        }
+    }
     if (wfptr) { int st=0; fits_close_file(wfptr, &st); wfptr=NULL; }
     close_thread_read_fptr();
     free(freqArray);
@@ -1407,6 +1461,8 @@ int main(int argc, char *argv[])
     free(identSubst_randIdxs);
     free(identSubst_medTemp);
     free(inChanScratch);
+    free(vs_time_means_all);
+    free(vs_flag_time_all);
 
     // Print loop timing summary (if any iteration executed)
     {

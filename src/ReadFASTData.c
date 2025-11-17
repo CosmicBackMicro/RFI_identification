@@ -140,10 +140,6 @@ static inline double mono_time_sec(void) {
 }
 #endif
 /* ===========================
- * Minimal async reader (single-slot prefetch)
- * =========================== */
-
-/* ===========================
  * Human-readable generation summary writer
  * =========================== */
 static void write_generation_summary(
@@ -178,13 +174,7 @@ static void write_generation_summary(
     char timestr[64] = {0};
     if (tmv) strftime(timestr, sizeof(timestr), "%Y-%m-%d %H:%M:%S", tmv);
 
-    int maskClassesEnabled = 0;
-    // Count enabled mask-producing algorithms (heuristic)
-    if (m->generateMasks) {
-        if (m->doSubstitution) maskClassesEnabled++;
-        if (m->doSumThreshold) maskClassesEnabled++;
-        // Future algorithms (e.g., CLFD/IQRM) can be added here when enabled
-    }
+    // Note: We now report enabled output mask classes for PNG merge instead of internal algorithms count.
 
     fprintf(fp,
         "# deRFI generation summary (human-readable)\n"
@@ -223,7 +213,15 @@ static void write_generation_summary(
     fprintf(fp, "  Enable SumThreshold: %s\n", m->doSumThreshold ? "yes" : "no");
     fprintf(fp, "  NSigma threshold (in-channel): %.3f\n", NSigmaInChan);
     fprintf(fp, "  NSigma threshold (cross-channel): %.3f\n", NSigmaOutChan);
-    fprintf(fp, "  Number of enabled mask categories (algorithms): %d\n", maskClassesEnabled);
+    // Enabled output classes: horizontal, vertical, point, block (periodic disabled)
+    fprintf(fp, "  Enabled mask classes (PNG merge): %d\n", 4);
+    fprintf(fp, "    - horizontal\n");
+    fprintf(fp, "    - vertical\n");
+    fprintf(fp, "    - point\n");
+    fprintf(fp, "    - block\n");
+    // Keep users aware of PNG index mapping as implemented in writeAllMasksPNG
+    fprintf(fp, "  PNG class index mapping: horizontal=1, vertical=2, point=6, block=7\n");
+    fprintf(fp, "  Periodic point RFI detection: disabled\n");
     fprintf(fp, "\n");
 
     fprintf(fp, "[Acceleration / Misc]\n");
@@ -1065,6 +1063,8 @@ int main(int argc, char *argv[])
     // Scratch buffers for vertical stripe detection (moved out of inner functions)
     float *vs_time_means_all = (float *)malloc(sizeof(float) * (size_t)nsampBinned * (size_t)maxScratchThreads);
     unsigned char *vs_flag_time_all = (unsigned char *)malloc((size_t)nsampBinned * (size_t)maxScratchThreads);
+    // Fallback channel means buffer (per-thread slices) for outChanDetection 保底均值检测，避免循环内 malloc
+    float *fallback_chan_means_all = (float *)malloc(sizeof(float) * (size_t)nchanBinned * (size_t)maxScratchThreads);
 
     // Accumulators for loop timing stats
     double loop_total_time = 0.0;
@@ -1092,8 +1092,10 @@ int main(int argc, char *argv[])
 
     int ii;
     // thresholds used for NSigma (kept here to also record into summary)
-    float NSigmaInChan = 3.0f; // Updated to use 3-sigma threshold for iterative outlier detection
-    float NSigmaOutChan = 3.0f; // Use 3-sigma threshold for out-of-channel detection as well
+    const float NSigmaInChan = m.NSigmaInChan;   // configurable via CLI (default 3.0)
+    const float NSigmaOutChan = m.NSigmaOutChan; // configurable via CLI (default 3.0)
+    // 配置保底均值检测 σ 倍数（默认 2.0，可由命令行 -F 指定）
+    setFallbackMeanNSigma(m.FallbackMeanNSigma);
     #pragma omp parallel for schedule(static) reduction(+:loop_total_time) reduction(min:loop_min_time) reduction(max:loop_max_time)
     for (ii = 0; ii < numReads; ii++)
     {
@@ -1268,6 +1270,8 @@ int main(int argc, char *argv[])
                 size_t inChanSliceCount = (size_t)nsampBinned;
                 float *vs_time_means = SLICE_PTR(vs_time_means_all, nsampBinned, tid);
                 unsigned char *vs_flag_time = SLICE_PTR(vs_flag_time_all, nsampBinned, tid);
+                // 设定线程局部的保底均值缓冲区（仅一次即可，无需在 outChanDetection 内重复分配）
+                setFallbackChannelMeansBuffer(SLICE_PTR(fallback_chan_means_all, nchanBinned, tid), (size_t)nchanBinned);
                 identSubstNSigma(outDataT, nsampBinned, nchanBinned, NSigmaInChan, NSigmaOutChan, ii, doPlotThisIter,
                                 maskSetPtr, finalMedian, finalStd, m.cudaReady, flaggedChans,
                                 goodSamps, randIdxs, medTemp, inChanSlice, inChanSliceCount,
@@ -1463,6 +1467,7 @@ int main(int argc, char *argv[])
     free(inChanScratch);
     free(vs_time_means_all);
     free(vs_flag_time_all);
+    free(fallback_chan_means_all);
 
     // Print loop timing summary (if any iteration executed)
     {

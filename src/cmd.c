@@ -59,6 +59,9 @@ int parseCommandLineArguments(int argc, char *argv[], Metadata *m) {
         {"writeBack", required_argument, 0, 'B'},
         {"writeMasks", required_argument, 0, 'k'},
         {"enableCuda", required_argument, 0, 'c'},
+        {"inChanNSigma", required_argument, 0, 'I'},
+        {"outChanNSigma", required_argument, 0, 'O'},
+        {"fallbackMeanNSigma", required_argument, 0, 'F'},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
     };
@@ -77,9 +80,12 @@ int parseCommandLineArguments(int argc, char *argv[], Metadata *m) {
     m->enableCuda = 1;  // Default: enable CUDA if available
     m->writeBack = 0;    // Default: do not write back to original file
     m->writeMasks = 1;   // Default: write mask images
+    m->NSigmaInChan = 3.0f;   // Default NSigma thresholds
+    m->NSigmaOutChan = 3.0f;
+    m->FallbackMeanNSigma = 2.0f; // 默认均值兜底 2σ
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "i:S:d:s:t:f:r:e:M:p:n:P:W:B:k:c:T:h", long_options, NULL))) {
+    while ((opt = getopt_long(argc, argv, "i:S:d:s:t:f:r:e:M:p:n:P:W:B:k:c:I:O:F:T:h", long_options, NULL))) {
         if (opt == -1) break;
 
         switch (opt) {
@@ -131,6 +137,16 @@ int parseCommandLineArguments(int argc, char *argv[], Metadata *m) {
             case 'c':
                 m->enableCuda = atoi(optarg);
                 break;
+            case 'I':
+                m->NSigmaInChan = atof(optarg);
+                break;
+            case 'O':
+                m->NSigmaOutChan = atof(optarg);
+                break;
+            case 'F':
+                m->FallbackMeanNSigma = atof(optarg);
+                if (m->FallbackMeanNSigma <= 0.0f) m->FallbackMeanNSigma = 2.0f; // 合理性保护
+                break;
             case 'h':
                 printf("Usage: %s [OPTIONS]\n", argv[0]);
                 printf("Options:\n");
@@ -148,6 +164,9 @@ int parseCommandLineArguments(int argc, char *argv[], Metadata *m) {
                 printf("  -B, --writeBack=MODE          Write back modified data to original FITS file (dangerous!)\n");
                 printf("  -k, --writeMasks=MODE         Write mask images to PNG files\n");
                 printf("  -c, --enableCuda=MODE         Enable CUDA acceleration (1=enable, 0=disable)\n");
+                printf("  -I, --inChanNSigma=VALUE      NSigma threshold for in-channel outlier detection (default 3.0)\n");
+                printf("  -O, --outChanNSigma=VALUE     NSigma threshold for cross-channel detection (default 3.0)\n");
+                printf("  -F, --fallbackMeanNSigma=VAL   Fallback mean-based channel sigma clip (default 2.0)\n");
                 printf("  -h, --help                    Show this help message\n");
                 return 1; // Return non-zero to indicate no further processing
         }

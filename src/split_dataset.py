@@ -1,45 +1,7 @@
 #!/usr/bin/env python3
 """
-Dataset Spl    # Check     # Crea    # Create image and mask folders if not exist
-    image_dir = output_dir / "image"
-    mask_dir = output_dir / "mask"
-    image_dir.mkdir(parents=True, exist_ok=True)
-    mask_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Check if they are not empty
-    image_files = list(image_dir.glob("*.fits"))
-    mask_files = list(mask_dir.glob("*_mask.png"))
-    if not image_files or not mask_files:
-        raise ValueError("Error: 'image' and/or 'mask' subfolders are empty. Please generate the files first.")d mask folders if not exist
-    image_dir = output_dir / "image"
-    mask_dir = output_dir / "mask"
-    image_dir.mkdir(parents=True, exist_ok=True)
-    mask_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Check if they are not empty
-    image_files = list(image_dir.glob("*.fits"))
-    mask_files = list(mask_dir.glob("*_mask.png"))
-    if not image_files or not mask_files:
-        raise ValueError("Error: 'image' and/or 'mask' subfolders are empty. Please generate the files first.")d mask folders exist and are not empty
-    image_dir = output_dir / "image"
-    mask_dir = output_dir / "mask"
-    if not image_dir.exists():
-        image_dir.mkdir(parents=True, exist_ok=True)
-    if not mask_dir.exists():
-        mask_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Check if they are not empty
-    image_files = list(image_dir.glob("*.fits"))
-    mask_files = list(mask_dir.glob("*_mask.png"))
-    if not image_files or not mask_files:
-        raise ValueError("Error: 'image' and/or 'mask' subfolders are empty. Please generate the files first.")eRFI Output
-
 This script processes the 'output' folder containing FITS files and corresponding image/mask pairs.
 It performs stratified sampling to split data into train/val sets, then renames the output folder.
-
-Requirements:
-- 'output' folder must exist with at least 4000 FITS files.
-- Corresponding 'image' and 'mask' subfolders with matching file pairs (e.g., sample_0.png, sample_0_mask.png).
 
 Usage:
     python split_dataset.py --new_name <new_folder_name> [--val_ratio 0.1]
@@ -55,8 +17,6 @@ import re
 from pathlib import Path
 
 def get_num(name):
-    # For FITS: block(\d+)
-    # For PNG: mask_merged_(\d+)
     match = re.search(r'(?:block|mask_merged_)(\d+)', name)
     return int(match.group(1)) if match else 0
 
@@ -72,7 +32,7 @@ def main():
 
     # Check FITS files count
     fits_files = sorted(output_dir.glob("*.fits"))
-    if len(fits_files) < 100:
+    if len(fits_files) < 10:
         raise ValueError(f"Error: Found only {len(fits_files)} FITS files in 'output'. At least 4000 required.")
 
     # Create image and mask folders

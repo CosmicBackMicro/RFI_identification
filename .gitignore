@@ -14,20 +14,17 @@ a.out
 Datasets/
 test_output/
 output/
-lot/
 src/dataset*/
-src/profile_masking.py
-src/spike_finding.py
 
 # Intermediate results
-IntermediateResults/
+results/
 profile/
 
 # Pretrained weights
 pretrained_weights/
 
 # Training logs and checkpoints
-lightning_logs/
+training_logs/
 checkpoints*/
 final_model.ckpt
 

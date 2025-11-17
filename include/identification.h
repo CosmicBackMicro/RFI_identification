@@ -28,6 +28,11 @@ void binarySIR(int *mask, int nsamp, int nchan, int win_samp, int win_chan, floa
 void outChanDetection(float *data, int nsamp, int nchan, int *channelFlagged,
                               float *channel_stds, float *channel_stds_temp, float channel_std_threshold, float nsigma_in, int plot);
 
+/* 设置线程局部的保底均值缓冲区（用于 outChanDetection 的 ±kσ 均值兜底检测，避免并行循环内重复 malloc）*/
+void setFallbackChannelMeansBuffer(float *buf, size_t size);
+/* 设置保底均值检测的 σ 倍数（默认 2.0，可通过命令行参数配置）*/
+void setFallbackMeanNSigma(float v);
+
 int meanOutlierDetection(float *data, int nsamp, int nchan, int *channelFlagged);
 
 int inChanDetection(float *data, int nsamp, int nchan, float Nsigma,
@@ -81,6 +86,26 @@ void detectVerticalStripesByTimeProfiles(
     float *time_means_buf,
     unsigned char *flag_time_buf);
 
+// Detect vertical "string" interference caused by duplicated time samples:
+// identifies runs where adjacent time columns are nearly identical across channels.
+// For each time index t>0, compute an error metric err[t] = mean(|col(t)-col(t-1)|) over unmasked pixels.
+// Flag times with err[t] <= max(abs_epsilon, rel_sigma*std(err)) and group runs with length >= min_run.
+// The function ORs results into verticalMask (does not clear it).
+void detectVerticalRepeatedColumns(
+    const float *data,
+    int nsamp,
+    int nchan,
+    const bool *pointMask,
+    const bool *horizontalMask,
+    bool *verticalMask,
+    float abs_epsilon,     // absolute floor for near-zero detection (e.g., 1e-6)
+    float rel_sigma,       // relative threshold vs std(err), e.g., 0.25
+    int min_run,           // minimum consecutive times to accept
+    int plot,              // reserved for future visualization
+    float *err_buf,        // length >= nsamp (reused scratch buffer)
+    unsigned char *flag_time_buf // length >= nsamp (0/1 flags)
+);
+
 // Simple block RFI detection using connected components
 void detectBlockRFI(
     const bool *binaryMask, // input binary mask (e.g., pointMask). Will NOT be modified
@@ -102,3 +127,14 @@ void detectPeriodicPointRFI(
     int min_pairs,          // minimum matched pairs x[t] & x[t+T]
     float min_align_frac    // s[T]/sum(x) threshold to accept periodicity
 );
+
+// If a channel has > ratio_thresh of its samples flagged in pointMask,
+// consider it point-dominated and clear its horizontalMask; also clear flaggedChans[ch].
+// Returns the number of channels whose horizontalMask was canceled.
+int cancelHorizontalMaskForPointDominantChannels(
+    const bool *pointMask,
+    int nsamp,
+    int nchan,
+    float ratio_thresh,      // e.g., 0.30f
+    bool *horizontalMask,
+    int *flaggedChans);

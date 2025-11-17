@@ -173,6 +173,42 @@ float gaus(float x, float med, float sigma)
     return expf(-(x - med) * (x - med) / (2 * sigma * sigma)) / (sqrtf(2 * PI) * sigma);
 }
 
+// Helper: judge whether two time columns are nearly identical across channels
+static inline int columns_similar_cols(
+    const float *data,
+    int nsamp,
+    int nchan,
+    int ta,
+    int tb,
+    float abs_epsilon,
+    float rel_sigma)
+{
+    double sum_abs_diff = 0.0;
+    double sum_abs_base = 0.0;
+    int eq_cnt = 0;
+    for (int c = 0; c < nchan; ++c) {
+        size_t ia = (size_t)c * (size_t)nsamp + (size_t)ta;
+        size_t ib = (size_t)c * (size_t)nsamp + (size_t)tb;
+        float va = data[ia];
+        float vb = data[ib];
+        float dv = va - vb;
+        float ad = fabsf(dv);
+        sum_abs_diff += (double)ad;
+        sum_abs_base += (double)(0.5f * (fabsf(va) + fabsf(vb)));
+        if (ad <= abs_epsilon) eq_cnt++;
+    }
+    double mean_diff = sum_abs_diff / (double)nchan;
+    double mean_base = sum_abs_base / (double)nchan;
+    // 更严格：同时满足绝对和相对两个门槛（取更小者）
+    double thr_abs = (double)abs_epsilon;
+    double thr_rel = rel_sigma * mean_base;
+    double thr = (thr_abs < thr_rel) ? thr_abs : thr_rel;
+    // 要求绝大多数通道几乎相等，避免整体偏移引发误判
+    const double eq_frac_min = 0.98; // 至少98%的通道在 abs_epsilon 内
+    double eq_frac = (double)eq_cnt / (double)nchan;
+    return (mean_diff <= thr && eq_frac >= eq_frac_min) ? 1 : 0;
+}
+
 // Simple Gaussian fit: use mean and std as mu and sigma
 // void fit_gaussian(float *data, int n, float *mu, float *sigma) {
 //     float sum = 0.0f, sum_sq = 0.0f;
@@ -938,6 +974,24 @@ int meanOutlierDetection(float *data, int nsamp, int nchan, int *channelFlagged)
     return additional_flagged;
 }
 
+/* 线程局部保底均值缓冲区，避免在并行循环内频繁 malloc/free */
+static _Thread_local float *tls_fallback_channel_means = NULL;
+static _Thread_local size_t tls_fallback_channel_means_size = 0;
+void setFallbackChannelMeansBuffer(float *buf, size_t size) {
+    tls_fallback_channel_means = buf;
+    tls_fallback_channel_means_size = size;
+}
+
+/* 全局保底均值检测 σ 倍数（默认 2.0，可外部配置） */
+static float g_fallback_mean_nsigma = 2.0f;
+void setFallbackMeanNSigma(float v) {
+    if (v <= 0.0f) {
+        g_fallback_mean_nsigma = 2.0f; // 回退到默认
+    } else {
+        g_fallback_mean_nsigma = v;
+    }
+}
+
 /// @brief Flag channels based on their standard deviation statistics using iterative 3-sigma outlier detection
 /// @param data Input data array (nsamp * nchan)
 /// @param nsamp Number of time samples
@@ -1087,6 +1141,36 @@ void outChanDetection(float *data, int nsamp, int nchan, int *channelFlagged,
     final_flagged_count += additional_flagged;
     printf("Mean-based outlier check: flagged %d additional channels (total now: %d)\n", 
            additional_flagged, final_flagged_count);
+
+    // === 保底：全局通道均值分布 ±2σ 检测（使用线程局部预分配缓冲区）===
+    if (tls_fallback_channel_means && tls_fallback_channel_means_size >= (size_t)nchan && nchan >= 3) {
+        float *buf = tls_fallback_channel_means;
+        for (int ci = 0; ci < nchan; ++ci) {
+            float ch_mean, ch_std_dummy;
+            findMeanStd(data + (size_t)ci * (size_t)nsamp, nsamp, &ch_mean, &ch_std_dummy);
+            buf[ci] = ch_mean;
+        }
+        float global_mean, global_std;
+        findMeanStd(buf, nchan, &global_mean, &global_std);
+        if (global_std > 0.0f) {
+            float thresh = g_fallback_mean_nsigma * global_std;
+            float upper_b = global_mean + thresh;
+            float lower_b = global_mean - thresh;
+            int fallback_flagged = 0;
+            for (int ci = 0; ci < nchan; ++ci) {
+                if (!channelFlagged[ci]) {
+                    float val = buf[ci];
+                    if (val > upper_b || val < lower_b) {
+                        channelFlagged[ci] = 1;
+                        fallback_flagged++;
+                    }
+                }
+            }
+            if (fallback_flagged > 0) {
+                final_flagged_count += fallback_flagged; // 仅在有新增时更新统计；不打印冗长提示
+            }
+        }
+    }
     
     // Create final statistics array (mark flagged channels with negative values)
     float *final_channel_stds = (float *)malloc(nchan * sizeof(float));
@@ -1708,97 +1792,37 @@ int inChanDetection(float *data, int nsamp, int nchan, float Nsigma,
 }
 
 
-/**
- * @brief Apply killThresh analysis to flag heavily contaminated channels
- * @param pointMask Input point-wise mask (pixels flagged in-channel)
- * @param channelFlagged Output 1D array indicating which channels are fully flagged
- * @param nsamp Number of time samples
- * @param nchan Number of channels
- * @param killThresh Threshold for flagging entire channels
- * @param flaggedAfterSIR Initial flagged pixel count (after binarySIR)
- * @param killedChannels Output: number of channels killed
- * @param localRFISkipped Output: number of channels skipped due to localized RFI
- * @param totalFlaggedAfter Output: total flagged pixels after killThresh
- */
-void applyKillThresh(const bool *pointMask, int *channelFlagged, int nsamp, int nchan, float killThresh, 
-                    int flaggedAfterSIR, int *killedChannels, int *localRFISkippedPtr, 
-                    int *totalFlaggedAfter)
+// If a channel has > ratio_thresh fraction of samples flagged in pointMask,
+// treat it as point-dominated: clear that channel's horizontalMask and flaggedChans.
+// Returns number of channels canceled.
+int cancelHorizontalMaskForPointDominantChannels(
+    const bool *pointMask,
+    int nsamp,
+    int nchan,
+    float ratio_thresh,
+    bool *horizontalMask,
+    int *flaggedChans)
 {
-    *killedChannels = 0;
-    *localRFISkippedPtr = 0;
-    *totalFlaggedAfter = 0;
-    float rangeThreshold = 0.5f;  // If flagged pixels span <50% of channel, don't kill entire channel
-    
-    printf("\n=== killThresh Analysis (threshold=%.3f) ===\n", killThresh);
-    
-    int i, j;
-    int localKilledChannels = 0;
-    int localRFISkipped = 0;
-    
-    for (i = 0; i < nchan; i++) {
-        int maskedCount = 0;
-        int firstFlagged = -1, lastFlagged = -1;
-        
-        // First pass: count flagged pixels and find range
-        for (j = 0; j < nsamp; j++) {
-            int idx = j + i * nsamp;
-            if (pointMask[idx]) {
-                maskedCount++;
-                if (firstFlagged == -1) firstFlagged = j;
-                lastFlagged = j;
-            }
+    if (nsamp <= 0 || nchan <= 0) return 0;
+    int canceled = 0;
+    for (int ch = 0; ch < nchan; ++ch) {
+        int pm_count = 0;
+        size_t base = (size_t)ch * (size_t)nsamp;
+        for (int t = 0; t < nsamp; ++t) {
+            if (pointMask[base + (size_t)t]) pm_count++;
         }
-        
-        float maskedRatio = (float)maskedCount / nsamp;
-        int shouldKillChannel = 0;
-        
-        if (maskedRatio > killThresh) {
-            if (firstFlagged != -1 && lastFlagged != -1) {
-                int flaggedRange = lastFlagged - firstFlagged + 1;
-                float rangeRatio = (float)flaggedRange / nsamp;
-                
-                if (rangeRatio >= rangeThreshold) {
-                    shouldKillChannel = 1;
-                } else {
-                    localRFISkipped++;
-                }
-            } else {
-                shouldKillChannel = 1;
+        float pm_ratio = (float)pm_count / (float)nsamp;
+        if (pm_ratio > ratio_thresh) {
+            // Clear horizontal mask for this channel
+            for (int t = 0; t < nsamp; ++t) {
+                horizontalMask[base + (size_t)t] = 0;
             }
-        }
-        
-        if (shouldKillChannel) {
-            localKilledChannels++;
-            channelFlagged[i] = 1;  // Mark channel as flagged
+            // Keep bookkeeping consistent
+            if (flaggedChans) flaggedChans[ch] = 0;
+            canceled++;
         }
     }
-    
-    // Assign local variables to output parameters
-    *killedChannels = localKilledChannels;
-    *localRFISkippedPtr = localRFISkipped;
-    
-    // Count total flagged pixels after killThresh
-    int localTotalFlaggedAfter = 0;
-    int idx;
-    for (idx = 0; idx < nsamp * nchan; idx++) {
-        // Union of pointMask and flagged channels
-        int chan = idx / nsamp;
-        if (pointMask[idx] || channelFlagged[chan]) localTotalFlaggedAfter++;
-    }
-    
-    *totalFlaggedAfter = localTotalFlaggedAfter;
-    
-    // Print killThresh summary
-    printf("killThresh Results:\n");
-    printf("  - Killed channels: %d/%d (%.2f%%)\n", *killedChannels, nchan, 
-           (float)(*killedChannels)/nchan*100);
-    printf("  - Localized RFI skipped: %d/%d (%.2f%%)\n", *localRFISkippedPtr, nchan, 
-           (float)(*localRFISkippedPtr)/nchan*100);
-    printf("  - Flagged pixels before: %d/%d (%.2f%%)\n", flaggedAfterSIR, nsamp*nchan, 
-           (float)flaggedAfterSIR/(nsamp*nchan)*100);
-    printf("  - Flagged pixels after: %d/%d (%.2f%%)\n", *totalFlaggedAfter, nsamp*nchan, 
-           (float)(*totalFlaggedAfter)/(nsamp*nchan)*100);
-    printf("  - Additional pixels flagged: %d\n", *totalFlaggedAfter - flaggedAfterSIR);
+    return canceled;
 }
 
 /**
@@ -1984,7 +2008,6 @@ void identSubstNSigma(
     memset(flaggedChans, 0, sizeof(int) * nchan);
     memcpy(identSubst_medTemp, data, (size_t)nsamp * (size_t)nchan * sizeof(float));
     
-    float killThresh = 0.2f;
     int i;
     
     if (plot)
@@ -2016,19 +2039,7 @@ void identSubstNSigma(
     double subst_time = omp_get_wtime() - subst_start;
     printf("inChannel substitution: replaced %d pixels (%.4f seconds)\n", inChanPixelsSubstituted, subst_time);
 
-    // === 3. killThresh Analysis ===
-    double killthresh_start = omp_get_wtime();
-    // Count flagged pixels before killThresh
-    int flaggedBeforeKillThresh = 0;
-    for (i = 0; i < nsamp * nchan; i++) {
-        if (pointMask[i] == 1) flaggedBeforeKillThresh++;
-    }
-
-    int killedChannels, localRFISkipped, totalFlaggedAfter;
-    applyKillThresh(pointMask, flaggedChans, nsamp, nchan, killThresh, flaggedBeforeKillThresh,
-                   &killedChannels, &localRFISkipped, &totalFlaggedAfter);
-    double killthresh_time = omp_get_wtime() - killthresh_start;
-    printf("=== End killThresh Analysis (%.4fs) ===\n", killthresh_time);
+    // (Removed) killThresh: disabled per user request
     
     // === 4. outChannel Detection ===
     printf("=== Performing channel-level outlier detection ===\n");
@@ -2041,9 +2052,18 @@ void identSubstNSigma(
     
     // Expand 1D flaggedChans to 2D horizontalMask
     expandChannelMask(flaggedChans, horizontalMask, nsamp, nchan);
+
+    // 新逻辑：按通道统计 pointMask 比例，若超过 30%，认为被点干扰主导，取消该通道的 horizontalMask 标记
+    int canceled_horizontal_channels = cancelHorizontalMaskForPointDominantChannels(
+        pointMask, nsamp, nchan, 0.30f, horizontalMask, flaggedChans);
+    if (canceled_horizontal_channels > 0) {
+        printf("Horizontal mask canceled on %d channels due to point-dominated (>30%%) interference.\n",
+               canceled_horizontal_channels);
+    }
+
     free(channel_stds);
     free(channel_stds_temp);
-    // Accumulate channel-wise mask into global
+    // Accumulate channel-wise mask into global（注意：在清理 horizontalMask 之后再合并）
     logicalOR(globalMask, horizontalMask, nsamp, nchan);
 
     // === 5. Out-Chan Cross-channel substitution for fully flagged channels ===
@@ -2078,6 +2098,22 @@ void identSubstNSigma(
             vs_flag_time_buf);
         // Merge vertical stripes into global
         logicalOR(globalMask, verticalMask, nsamp, nchan);
+        // Additional detector: repeated columns (duplicated time samples)
+        // Use conservative near-zero thresholding
+        float rep_abs_eps = 1e-6f;
+        float rep_rel_sigma = 0.02f; // 更严格的相对阈值，避免过度匹配
+        int   rep_min_run = 16; // require at least ~16 consecutive identical columns
+        detectVerticalRepeatedColumns(
+            data, nsamp, nchan,
+            pointMask,
+            horizontalMask,
+            verticalMask,
+            rep_abs_eps,
+            rep_rel_sigma,
+            rep_min_run,
+            plot,
+            vs_time_means_buf, // reuse as err buffer
+            vs_flag_time_buf);
     } else {
         memset(verticalMask, 0, (size_t)nsamp * (size_t)nchan * sizeof(bool));
     }
@@ -2138,14 +2174,8 @@ void identSubstNSigma(
     printf("  - inChannel pixels substituted: %d\n", inChanPixelsSubstituted);
     printf("  - outChannel pixels substituted: %d\n", outChanPixelsSubstituted);
     printf("  - Total pixels substituted: %d\n", totalPixelsSubstituted);
-    printf("  - Channels killed by killThresh: %d\n", killedChannels);
 
-    float outlierRatio = (float)pixelOutliers / (nsamp * nchan);
-    if (outlierRatio > killThresh)
-    {
-        printf("WARNING: High outlier ratio %.4f > %.2f detected - data may be corrupted\n",
-               outlierRatio, killThresh);
-    }
+    // Removed killThresh-based warning
 
     // Buffers are managed by caller
 
@@ -2383,6 +2413,60 @@ void detectVerticalStripesByTimeProfiles(
 }
 
 /* -------------------------------------------------------------------------
+ * Detect vertical "string" interference from duplicated time samples
+ * ------------------------------------------------------------------------- */
+void detectVerticalRepeatedColumns(
+    const float *data,
+    int nsamp,
+    int nchan,
+    const bool *pointMask,
+    const bool *horizontalMask,
+    bool *verticalMask,
+    float abs_epsilon,
+    float rel_sigma,
+    int min_run,
+    int plot,
+    float *err_buf,
+    unsigned char *flag_time)
+{
+    if (!data || !verticalMask || nsamp <= 1 || nchan <= 0) return;
+
+    // 忽略其他掩码，按用户要求直接做双指针相邻列比较。
+    // 列相等判据：mean(|col(t)-col(s)|) <= max(abs_epsilon, rel_sigma * mean( (|col(t)|+|col(s)|)/2 ))
+
+    int t = 1;
+    while (t < nsamp) {
+    if (columns_similar_cols(data, nsamp, nchan, t, t - 1, abs_epsilon, rel_sigma)) {
+            int anchor = t;        // 后指针固定为较新的这一列
+            int start = t - 1;     // 初始起点
+            int end = t;           // 初始终点
+
+            // 向右扩展：前指针前进，直到不相似
+            int u = end + 1;
+            while (u < nsamp && columns_similar_cols(data, nsamp, nchan, u, anchor, abs_epsilon, rel_sigma)) { end = u; u++; }
+
+            // 可选向左扩展：包含更早相同列（避免从中间才触发时丢失左边界）
+            int v = start - 1;
+            while (v >= 0 && columns_similar_cols(data, nsamp, nchan, v, anchor, abs_epsilon, rel_sigma)) { start = v; v--; }
+
+            // 最小长度过滤（如果需要）。min_run<=1 则不启用过滤
+            if (min_run < 1) min_run = 1;
+            if ((end - start + 1) >= min_run) {
+                for (int k = start; k <= end; ++k) {
+                    for (int c = 0; c < nchan; ++c) {
+                        verticalMask[(size_t)c * (size_t)nsamp + (size_t)k] = true;
+                    }
+                }
+                printf("Vertical repeat (two-pointer): [%d,%d] len=%d\n", start, end, end - start + 1);
+            }
+            t = end + 1; // 跳过已处理片段
+        } else {
+            t++;
+        }
+    }
+}
+
+/* -------------------------------------------------------------------------
  * Simple block RFI detection using connected components
  * ------------------------------------------------------------------------- */
 void detectBlockRFI(
@@ -2454,8 +2538,13 @@ void detectBlockRFI(
                 int height = max_t - min_t + 1;
                 int bb_area = width * height;
                 float density = (float)pixel_count / bb_area;
+                float wh_ratio = (height > 0) ? ((float)width / (float)height) : 0.0f;
+                // New constraint: width/height must be in [1/5, 5]
+                const float RATIO_MIN = 0.2f;
+                const float RATIO_MAX = 5.0f;
+                int ratio_ok = (wh_ratio >= RATIO_MIN && wh_ratio <= RATIO_MAX);
                 
-                if (pixel_count >= min_area && density >= min_density) {
+                if (pixel_count >= min_area && density >= min_density && ratio_ok) {
                     // Mark bounding box as block RFI
                     for (int bc = min_c; bc <= max_c; ++bc) {
                         for (int bt = min_t; bt <= max_t; ++bt) {

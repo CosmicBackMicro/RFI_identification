@@ -15,6 +15,10 @@ typedef struct {
     int doSumThreshold;
     int enableCuda;  // 0 = disable CUDA, 1 = enable CUDA (default)
     int cudaReady;   // 0 = CUDA not available/initialized, 1 = CUDA ready to use
+    // NSigma thresholds (configurable via CLI), defaults set in parseCommandLineArguments
+    float NSigmaInChan;   // iterative in-channel outlier threshold (sigma)
+    float NSigmaOutChan;  // cross-channel (out-of-channel) threshold (sigma)
+    float FallbackMeanNSigma; // fallback mean-based channel sigma clip threshold (default 2.0)
 
     /* From FITS Header */
     int nchan;

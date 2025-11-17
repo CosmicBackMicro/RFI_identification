@@ -22,6 +22,8 @@ static struct option long_options[] = {
     {"doSubstitution", required_argument, NULL, 'e'},   // --doSubstitution
     {"doSumThreshold", required_argument, NULL, 'r'},   // --doSumThreshold
     {"enableCuda", required_argument, NULL, 'c'},       // --enableCuda
+    {"inChanNSigma", required_argument, NULL, 'I'},     // --inChanNSigma
+    {"outChanNSigma", required_argument, NULL, 'O'},    // --outChanNSigma
     {"help", no_argument, NULL, 'h'},                   // --help
     {NULL, 0, NULL, 0}                                  // End Mark for Options
 };

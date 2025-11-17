@@ -3,6 +3,8 @@
 #include <string.h>
 #include <png.h>
 #include <omp.h>
+#include <errno.h>   // for strerror(errno)
+#include <unistd.h>  // for fsync
 
 #include "mask.h"
 #include "identification.h" // for IdentNSigmaMasks definition
@@ -11,7 +13,10 @@
 void writeIndexMaskPNG(const bool *mask, int nsamp, int nchan, char *filename)
 {
     FILE *fp = fopen(filename, "wb");
-    if (!fp) return;
+    if (!fp) {
+        fprintf(stderr, "[Error] fopen('%s') failed: %s\n", filename, strerror(errno));
+        return;
+    }
     png_structp png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
     if (!png_ptr) { fclose(fp); return; }
     png_infop info_ptr = png_create_info_struct(png_ptr);
@@ -51,6 +56,9 @@ void writeIndexMaskPNG(const bool *mask, int nsamp, int nchan, char *filename)
     for (i = 0; i < nchan; i++) free(row_pointers[i]);
     free(row_pointers);
     png_destroy_write_struct(&png_ptr, &info_ptr);
+    fflush(fp);
+    int fd = fileno(fp);
+    if (fd >= 0) fsync(fd);
     fclose(fp);
 }
 
@@ -59,7 +67,10 @@ void writeClassIndexMaskPNG(const int *indexMask, int nsamp, int nchan, char *fi
 {
     if (!indexMask || nsamp <= 0 || nchan <= 0 || !filename) return;
     FILE *fp = fopen(filename, "wb");
-    if (!fp) return;
+    if (!fp) {
+        fprintf(stderr, "[Error] fopen('%s') failed: %s\n", filename, strerror(errno));
+        return;
+    }
     png_structp png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
     if (!png_ptr) { fclose(fp); return; }
     png_infop info_ptr = png_create_info_struct(png_ptr);
@@ -107,6 +118,9 @@ void writeClassIndexMaskPNG(const int *indexMask, int nsamp, int nchan, char *fi
     for (int i = 0; i < nchan; i++) free(row_pointers[i]);
     free(row_pointers);
     png_destroy_write_struct(&png_ptr, &info_ptr);
+    fflush(fp);
+    int fd = fileno(fp);
+    if (fd >= 0) fsync(fd);
     fclose(fp);
 }
 
@@ -197,7 +211,12 @@ void writeAllMasksPNG(const IdentNSigmaMasks *masks, int nsamp, int nchan,
             for (int i = 0; i < total; i++) if (masks->blockMask[i]) indexMask[i] = classIndex;
         }
 
-        snprintf(filename, sizeof(filename), "%s%s_block%d.png", datasetPath, sourceName, index);
+        int _n = snprintf(filename, sizeof(filename), "%s%s_block%d.png", datasetPath, sourceName, index);
+        if (_n < 0) {
+            fprintf(stderr, "[Error] snprintf failed building merged mask filename\n");
+        } else if ((size_t)_n >= sizeof(filename)) {
+            fprintf(stderr, "[Warn] merged mask filename truncated (len=%d, cap=%zu): '%s%s_block%d.png'\n", _n, sizeof(filename), datasetPath, sourceName, index);
+        }
         writeClassIndexMaskPNG(indexMask, nsamp, nchan, filename);
         free(indexMask);
         return; // merged 模式下直接返回
@@ -205,7 +224,12 @@ void writeAllMasksPNG(const IdentNSigmaMasks *masks, int nsamp, int nchan,
 
     // horizontal
     if (masks->horizontalMask) {
-        snprintf(filename, sizeof(filename), "%s%s_block%d_horizontal.png", datasetPath, sourceName, index);
+        int _n = snprintf(filename, sizeof(filename), "%s%s_block%d_horizontal.png", datasetPath, sourceName, index);
+        if (_n < 0) {
+            fprintf(stderr, "[Error] snprintf failed building horizontal mask filename\n");
+        } else if ((size_t)_n >= sizeof(filename)) {
+            fprintf(stderr, "[Warn] horizontal mask filename truncated (len=%d, cap=%zu)\n", _n, sizeof(filename));
+        }
         writeIndexMaskPNG(masks->horizontalMask, nsamp, nchan, filename);
     }
 
@@ -223,7 +247,12 @@ void writeAllMasksPNG(const IdentNSigmaMasks *masks, int nsamp, int nchan,
 
     // point
     if (masks->pointMask) {
-        snprintf(filename, sizeof(filename), "%s%s_block%d_point.png", datasetPath, sourceName, index);
+        int _n = snprintf(filename, sizeof(filename), "%s%s_block%d_point.png", datasetPath, sourceName, index);
+        if (_n < 0) {
+            fprintf(stderr, "[Error] snprintf failed building point mask filename\n");
+        } else if ((size_t)_n >= sizeof(filename)) {
+            fprintf(stderr, "[Warn] point mask filename truncated (len=%d, cap=%zu)\n", _n, sizeof(filename));
+        }
         writeIndexMaskPNG(masks->pointMask, nsamp, nchan, filename);
     }
 

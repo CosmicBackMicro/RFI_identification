@@ -208,7 +208,7 @@ def test_load_fits_image(output_dir: str, verbose: bool=False, mask_dir: Optiona
             import matplotlib.patches as mpatches
             # 放在图的左上方，使用 figure 相对坐标（避免遮挡主图）
             # 位置微调为靠近左侧空白区域
-            legend_ax = fig.add_axes((0.02, 0.72, 0.20, 0.18), frameon=False)
+            legend_ax = fig.add_axes((0.02, 0.80, 0.17, 0.18), frameon=False)
             legend_ax.axis('off')
             legend_patches = []
             legend_labels = []
@@ -224,7 +224,7 @@ def test_load_fits_image(output_dir: str, verbose: bool=False, mask_dir: Optiona
 
     # Leave space for a figure-level title (suptitle) above the top panel
     try:
-        fig.subplots_adjust(top=0.90)
+        fig.subplots_adjust(top=0.90, bottom=0.07, left=0.045, right=0.95)
     except Exception:
         pass
 

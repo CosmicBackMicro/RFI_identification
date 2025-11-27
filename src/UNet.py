@@ -2,7 +2,7 @@ import cv2
 import os, re
 import fitsio
 import numpy as np
-from typing import Any, cast
+from typing import Any, cast, Optional, List
 import albumentations as albu
 
 import sys
@@ -72,7 +72,7 @@ class FocalTverskyLoss(nn.Module):
         gamma: float = 1.333,
         smooth: float = 1e-6,
         reduction: str = 'mean',
-        ignore_index: int | None = None,
+    ignore_index: Optional[int] = None,
         label_smoothing: float = 0.0,
     ) -> None:
         super().__init__()
@@ -90,7 +90,7 @@ class FocalTverskyLoss(nn.Module):
         self,
         y_pred: torch.Tensor,  # (N, C, H, W) 
         y_true: torch.Tensor,  # (N, H, W)
-        class_weights: torch.Tensor | None = None,  # (C,)
+    class_weights: Optional[torch.Tensor] = None,  # (C,)
     ) -> torch.Tensor:
         if y_true.dtype != torch.long:
             y_true = y_true.long()
@@ -145,7 +145,7 @@ class FocalTverskyLoss(nn.Module):
 # MobileMamba 已移除 —— 保持代码库为 SegFormer-only，以简化运行并消除对本地 CUDA 扩展的依赖。
 
 class UNetLightningModule(pl.LightningModule):
-    def __init__(self, encoder_name="segformer-b2", classes=2, learning_rate=0.0001, scheduler_type="cosine_warmup", class_weights=None, focal_gamma: float = 2.0, loss_alpha: float = 0.7, loss_beta: float = 0.3, ce_weight: float = 0.5, ft_weight: float = 0.5, use_compile: bool = False, ft_warmup_epochs: int = 5, class_names: list | None = None):
+    def __init__(self, encoder_name="segformer-b2", classes=2, learning_rate=0.0001, scheduler_type="cosine_warmup", class_weights=None, focal_gamma: float = 2.0, loss_alpha: float = 0.7, loss_beta: float = 0.3, ce_weight: float = 0.5, ft_weight: float = 0.5, use_compile: bool = False, ft_warmup_epochs: int = 5, class_names: Optional[List[str]] = None):
         super().__init__()
         self.save_hyperparameters()
         self.scheduler_type = scheduler_type
@@ -325,13 +325,8 @@ class UNetLightningModule(pl.LightningModule):
         except Exception:
             pass
 
-        # 记录整体 TP/TN/FP/FN（按 epoch 聚合）
-    # 不再记录 TP/TN/FP/FN，避免日志噪声
-
-
-        # 在进度条显示每步的训练损失
+        # 记录整体 TP/TN/FP/FN（
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
-        # 隐藏含背景的 step 指标，避免误导
         self.log('train_iou', iou, on_step=False, on_epoch=True, prog_bar=False)
         self.log('train_f1', f1, on_step=False, on_epoch=True, prog_bar=False)
         self.log('train_miou', miou, on_step=False, on_epoch=True, prog_bar=False)
@@ -579,7 +574,7 @@ class FITSDataset(Dataset):
         cap_factor: float = 3.0,
         min_floor: float = 0.1,
         ratio_cap: float = 1e3,
-        sample_seed: int | None = None,
+    sample_seed: Optional[int] = None,
     ):
         """
         计算训练集的类别权重，用于平衡类别不平衡。
@@ -827,20 +822,56 @@ if __name__ == "__main__":
     val_mask_dir = os.path.join(mask_dir, "val")
 
     # ============ 超参数配置 ============
-    # 使用 SegFormer 作为默认编码器（回退到 SegFormer-only）
+    # 将与硬件无关的模型/数据超参数放在顶层共享配置（便于与硬件相关参数分离）
+    # 这些参数与训练机器（local/server）无关，便于统一修改和版本控制
     ENCODER = "segformer-b2"
     CLASSES = ["bkg", "horizontal", "vertical", "point", "block"]
-    LEARNING_RATE = 2e-4  # Prune微调学习率 * 0.1（原先5e-5）
-    BATCH_SIZE = 1
-    NUM_WORKERS = min(8, os.cpu_count() or 8)  # Worker过多CPU会瓶颈
-    MAX_EPOCHS = 100
-    ACCUMULATE_GRAD_BATCHES = 4  # 每2步累积，相当于有效batch_size=12
-    SCHEDULER_TYPE = "cosine_warmup"  # 线性 warmup -> 余弦退火
-
-    FOCAL_GAMMA = 2.0  # Focal Loss
-    LOSS_ALPHA = 0.7  # FocalTversky
-    LOSS_BETA = 0.3   # FocalTversky
+    SCHEDULER_TYPE = "cosine_warmup"
+    FOCAL_GAMMA = 2.0
+    LOSS_ALPHA = 0.7
+    LOSS_BETA = 0.3
     NORMALIZATION_METHOD = "median_sigma"
+
+    # 使用两套硬编码的配置集（`local` / `server`），通过 CONFIG_MODE 切换
+    # local: 轻量级开发机配置；server: 高并发、多核、多GPU 训练服务器配置
+    CONFIG_MODE = "server"  # 修改为 'local' 切换到本地开发配置
+
+    # 每套配置只包含与硬件/运行相关的参数（不再包含模型结构或损失超参）
+    configs = {
+        "local": {
+            "LEARNING_RATE": 2e-4,
+            "BATCH_SIZE": 1,
+            "NUM_WORKERS": max(0, min(4, (os.cpu_count() or 4) - 1)),
+            "MAX_EPOCHS": 50,
+            "ACCUMULATE_GRAD_BATCHES": 4,
+            "USE_COMPILE": False,
+            "PRECISION": 32,
+            "DEVICES": 1,
+        },
+        "server": {
+            "LEARNING_RATE": 2e-4,
+            "BATCH_SIZE": 4,
+            # 为避免把所有 CPU 核心占满，保留 1 个核给系统
+            "NUM_WORKERS": max(1, min(64, (os.cpu_count() or 128) - 2)),
+            "MAX_EPOCHS": 100,
+            "ACCUMULATE_GRAD_BATCHES": 4,
+            # 在老 PyTorch/CUDA 环境上禁用 torch.compile，以免不兼容
+            "USE_COMPILE": False,
+            # V100 在 PyTorch 1.12 上通常更稳定使用 fp32 或 fp16（非 bf16）
+            "PRECISION": 32,
+            "DEVICES": 1,  # 如果你想使用所有可见 GPU，设置为 torch.cuda.device_count() 或具体数字
+        }
+    }
+
+    cfg = configs.get(CONFIG_MODE, configs["local"])
+    LEARNING_RATE = cfg["LEARNING_RATE"]
+    BATCH_SIZE = cfg["BATCH_SIZE"]
+    NUM_WORKERS = cfg["NUM_WORKERS"]
+    MAX_EPOCHS = cfg["MAX_EPOCHS"]
+    ACCUMULATE_GRAD_BATCHES = cfg["ACCUMULATE_GRAD_BATCHES"]
+    USE_COMPILE = cfg.get("USE_COMPILE", False)
+    PRECISION = cfg.get("PRECISION", 32)
+    DEVICES = cfg.get("DEVICES", 1)
     # 预训练权重路径 (None表示随机初始化)
     # WEIGHTS_PATH = "/home/cbm/deRFI/pruned_best_model-epoch=21-fgF1_val_fg_macro_f1=0.7905.pt"
     WEIGHTS_PATH = None
@@ -927,7 +958,7 @@ if __name__ == "__main__":
         focal_gamma=FOCAL_GAMMA,
         loss_alpha=LOSS_ALPHA,
         loss_beta=LOSS_BETA,
-        use_compile=True,
+        use_compile=USE_COMPILE,
     )
     
     print(f"✅ 模型配置: {ENCODER} 编码器, {len(CLASSES)} 个类别 ({CLASSES})")
@@ -972,13 +1003,13 @@ if __name__ == "__main__":
     trainer = pl.Trainer(
         max_epochs=MAX_EPOCHS,
         accelerator='gpu' if torch.cuda.is_available() else 'cpu',
-        devices=1,
+        devices=DEVICES,
         callbacks=callbacks,
         logger=logger,  # 显式指定 TensorBoard 日志记录器
         log_every_n_steps=10,  # 减少日志频率以提高性能
         check_val_every_n_epoch=1,
         enable_progress_bar=True,
-        precision="bf16-mixed" if torch.cuda.is_available() else 32,
+        precision=PRECISION,
         enable_checkpointing=True,
         enable_model_summary=True,
         gradient_clip_val=2.0,  # 添加梯度裁剪防止训练不稳定

@@ -20,8 +20,6 @@ src/dataset*/
 results/
 profile/
 
-# Pretrained weights
-pretrained_weights/
 
 # Training logs and checkpoints
 training_logs/

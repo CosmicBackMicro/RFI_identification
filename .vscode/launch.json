@@ -19,7 +19,7 @@
                 "--write=1",
                 "--writeBack=0",
                 "--writeMasks=1",
-                "--doSubstitution=1",
+                "--doSubstitution=0",
                 "--doSumThreshold=1",
                 "--startTime=0.0",
                 "--generateMasks=1",

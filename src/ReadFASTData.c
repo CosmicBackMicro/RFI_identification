@@ -48,10 +48,20 @@ static inline int slice_index_from_iter(int iter, int maxThreads) {
 static _Thread_local fitsfile *tls_read_fptr = NULL; // per-thread read handle
 static _Thread_local int tls_read_hdu_ready = 0;     // per-thread SUBINT selected
 
+/* Mutex to serialize all CFITSIO calls when library is not reentrant
+    or to force serial I/O (方案A). This ensures correctness even if
+    libcfitsio is not built with thread-safety. */
+static pthread_mutex_t fits_io_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+#define FITS_IO_LOCK()   pthread_mutex_lock(&fits_io_mutex)
+#define FITS_IO_UNLOCK() pthread_mutex_unlock(&fits_io_mutex)
+
 static inline fitsfile* get_thread_read_fptr(const char *filename, int *status) {
     if (!tls_read_fptr) {
         int st = 0;
+        FITS_IO_LOCK();
         fits_open_file(&tls_read_fptr, filename, READONLY, &st);
+        FITS_IO_UNLOCK();
         if (status) *status = st;
     } else if (status) {
         *status = 0;
@@ -65,7 +75,9 @@ static inline fitsfile* ensure_thread_read_ready(const char *filename, int *stat
     if (status) *status = st;
     if (st) return f;
     if (!tls_read_hdu_ready) {
+        FITS_IO_LOCK();
         fits_movnam_hdu(f, BINARY_TBL, "SUBINT", 0, &st);
+        FITS_IO_UNLOCK();
         if (st) {
             if (status) *status = st;
         } else {
@@ -78,7 +90,9 @@ static inline fitsfile* ensure_thread_read_ready(const char *filename, int *stat
 static inline void close_thread_read_fptr(void) {
     if (tls_read_fptr) {
         int st = 0;
+        FITS_IO_LOCK();
         fits_close_file(tls_read_fptr, &st);
+        FITS_IO_UNLOCK();
         tls_read_fptr = NULL;
     }
 }
@@ -326,6 +340,7 @@ int readMetadata(Metadata *m)
     int status = 0;
     int nulval, anynul;
     fitsfile *fptr;
+    FITS_IO_LOCK();
     fits_open_file(&fptr, m->filename, READONLY, &status);
 
     fits_movnam_hdu(fptr, BINARY_TBL, "SUBINT  ", 0, &status);             // move to hdu by name
@@ -344,6 +359,7 @@ int readMetadata(Metadata *m)
     m->hifreq = freqArray[m->nchan - 1];
 
     fits_close_file(fptr, &status);
+    FITS_IO_UNLOCK();
 
     /* Calculate secondary parameters */
 
@@ -718,14 +734,15 @@ void readRawBlock(fitsfile *fptr, int blockIndex, int blocksPerRead, int nchan, 
     int anynul = 0;
     int col_scl = 0, col_offs = 0, col_data = 0;
     const long startRow = (long)(blockIndex * blocksPerRead + 1);
-
-    // Resolve column indices once
+    // Resolve column indices once and read rows under I/O lock
+    FITS_IO_LOCK();
     fits_get_colnum(fptr, CASEINSEN, "DAT_SCL",  &col_scl,  status);
     fits_get_colnum(fptr, CASEINSEN, "DAT_OFFS", &col_offs, status);
     fits_get_colnum(fptr, CASEINSEN, "DATA",     &col_data, status);
     if (*status) {
         fprintf(stderr, "Error locating columns for reading block %d\n", blockIndex);
         fits_report_error(stderr, *status);
+        FITS_IO_UNLOCK();
         return;
     }
 
@@ -744,6 +761,7 @@ void readRawBlock(fitsfile *fptr, int blockIndex, int blocksPerRead, int nchan, 
         fits_read_col(fptr, TBYTE,  col_data, row, 1, blockSize, NULL, outRawData + (size_t)k * (size_t)blockSize, &anynul, status);
         if (*status) break;
     }
+    FITS_IO_UNLOCK();
 
     // Also populate first-row scale/offset for backward compatibility if requested
     if (!*status && scale && scaleRows) {
@@ -766,7 +784,8 @@ void writeBlock(
 {
     int col1;
     int firstrow = blockIndex * blocksPerRead + 1;
-
+    /* Serialize FITS writes to be safe with non-reentrant CFITSIO */
+    FITS_IO_LOCK();
     fits_movnam_hdu(fptr, BINARY_TBL, "SUBINT", 0, status);
 
     int k;
@@ -794,6 +813,7 @@ void writeBlock(
         fprintf(stderr, "Error writing block %d to FITS file!\n", blockIndex);
         fits_report_error(stderr, *status);
     }
+    FITS_IO_UNLOCK();
 }
 
 void writeFITSDataset(unsigned char *outRawData, float *scale, float *offset, 
@@ -814,9 +834,12 @@ void writeFITSDataset(unsigned char *outRawData, float *scale, float *offset,
         exit(EXIT_FAILURE);
     }
 
+    /* Serialize all CFITSIO calls in this function */
+    FITS_IO_LOCK();
     fits_create_file(&fptr, filename, status);
     if (*status) {
         fits_report_error(stderr, *status);
+        FITS_IO_UNLOCK();
         free(sourceName);
         return;
     }
@@ -838,6 +861,7 @@ void writeFITSDataset(unsigned char *outRawData, float *scale, float *offset,
     if (*status) {
         fits_report_error(stderr, *status);
         fits_close_file(fptr, status);
+        FITS_IO_UNLOCK();
         free(sourceName);
         return;
     }
@@ -873,6 +897,7 @@ void writeFITSDataset(unsigned char *outRawData, float *scale, float *offset,
     } else {
         printf("Successfully wrote block %d to %s\n", blockIndex, filename);
     }
+    FITS_IO_UNLOCK();
     free(sourceName);
 }
 
@@ -935,9 +960,13 @@ int main(int argc, char *argv[])
         }
     }
 
-        // Initialize OpenMP and CUDA (use all available CPUs by default)
-        setup_openmp(omp_get_num_procs());
+    // Initialize OpenMP and CUDA (use configured CPU count, default 20)
+    setup_openmp(m.ncpus);
     if (setup_cuda(&m) != 0) return -1;
+
+    /* Propagate CLI toggles to identification module */
+    setUseIQRM(m.enableIQRM);
+    setUseCLFD(m.enableCLFD);
 
     fitsfile *wfptr = NULL; // optional writer handle (when writeBack)
     int fits_status = 0;
@@ -1009,7 +1038,10 @@ int main(int argc, char *argv[])
     // Read frequency array
     float *freqArray = malloc(sizeof(float) * nchan);
     float *dsFreqArray = malloc(sizeof(float) * nchanBinned);
+    /* serialize this CFITSIO call in case libcfitsio is not reentrant */
+    FITS_IO_LOCK();
     fits_read_col(rf0, TFLOAT, colnumFreq, 1, 1, nchan, &nulval, freqArray, &anynul, &fits_status);
+    FITS_IO_UNLOCK();
     downsamp1D(freqArray, nchan, binFactorFreq, dsFreqArray);
 
     // Determine thread count for per-thread scratch slicing
@@ -1066,6 +1098,11 @@ int main(int argc, char *argv[])
     // Fallback channel means buffer (per-thread slices) for outChanDetection 保底均值检测，避免循环内 malloc
     float *fallback_chan_means_all = (float *)malloc(sizeof(float) * (size_t)nchanBinned * (size_t)maxScratchThreads);
 
+     /* Preallocate channel-level masks to avoid per-iteration malloc/free inside the loop
+         Each thread gets a slice of size (nchanBinned * nsampBinned) */
+     int *mask_chan2d_all = (int *)malloc(sizeof(int) * (size_t)nchanBinned * (size_t)nsampBinned * (size_t)maxScratchThreads);
+     int *mask_CLFD_all    = (int *)malloc(sizeof(int) * (size_t)nchanBinned * (size_t)nsampBinned * (size_t)maxScratchThreads);
+
     // Accumulators for loop timing stats
     double loop_total_time = 0.0;
     double loop_min_time = DBL_MAX;
@@ -1074,10 +1111,12 @@ int main(int argc, char *argv[])
     // Optional write-back handle (open once if needed)
     int enable_writeback = (m.write && m.writeBack) ? 1 : 0;
     if (enable_writeback) {
+        FITS_IO_LOCK();
         fits_open_file(&wfptr, m.filename, READWRITE, &fits_status);
-        if (fits_status) { fits_report_error(stderr, fits_status); return fits_status; }
+        if (fits_status) { fits_report_error(stderr, fits_status); FITS_IO_UNLOCK(); return fits_status; }
         fits_movnam_hdu(wfptr, BINARY_TBL, "SUBINT", 0, &fits_status);
-        if (fits_status) { fits_report_error(stderr, fits_status); return fits_status; }
+        if (fits_status) { fits_report_error(stderr, fits_status); FITS_IO_UNLOCK(); return fits_status; }
+        FITS_IO_UNLOCK();
     }
 
     int numReads = naxis2 / blocksPerRead; // number of iterations (files)
@@ -1196,69 +1235,70 @@ int main(int argc, char *argv[])
                 printf("Warning: Median subtraction disabled. If channel RFI is severe, consider lowering outChanNSigma threshold.\n");
             }
 
-            // if (m.plot)
-            // {
-            //     cpgpage();
-            //     char text2[100];
-            //     snprintf(text2, sizeof(text2), "Result after subtracting channel median");
-            //     cpgmtxt("T", 3.5, 0.5, 0.5, text2);
-            //     plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, NULL, NULL);
-            // }
+            // =====================Channel IQR + IQRM（合并，一次可视化）============================
+            {
+                float q_chan = 1.5f;       // Tukey 系数
+                float thr = 3.0f;          // IQRM 阈值
+                int *mask_chan2d_ptr = SLICE_PTR(mask_chan2d_all, nchanBinned * nsampBinned, tid);
+                /* Ensure the preallocated buffer is zeroed */
+                memset(mask_chan2d_ptr, 0, sizeof(int) * (size_t)nchanBinned * (size_t)nsampBinned);
 
-            // =====================Channel IQR + IQRM（合并，一次可视化，封装调用）============================
-            // {
-            //     float q_chan = 1.5f;       // Tukey 系数
-            //     float thr = 3.0f;          // IQRM 阈值
-            //     int *mask_chan2d = NULL;   // 输出 2D 掩码（需 free）
+                if (m.enableIQRM) {
+                    /* IQRM currently allocates a mask and returns it; call it then copy into our preallocated slice */
+                    int *tmp_mask = NULL;
+                    int flagged_channels = IQRM(outDataT, nsampBinned, nchanBinned,
+                                                q_chan, thr,
+                                                &tmp_mask);
+                    if (tmp_mask) {
+                        memcpy(mask_chan2d_ptr, tmp_mask, sizeof(int) * (size_t)nchanBinned * (size_t)nsampBinned);
+                        free(tmp_mask);
+                    }
 
-            //     int flagged_channels = IQRM(
-            //         outDataT, nsampBinned, nchanBinned,
-            //         q_chan, thr,
-            //         &mask_chan2d);
+                    if (m.plot) {
+                        cpgpage();
+                        char t_before[160]; snprintf(t_before, sizeof(t_before), "Before Channel-IQR + IQRM (q=%.2f, thr=%.1f)", q_chan, thr);
+                        cpgmtxt("T", 3.0, 0.35, 0.5, t_before);
+                        plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, ii, NULL, 1, 1, NULL, NULL);
 
-            //     if (m.plot) {
-            //         cpgpage();
-            //         char t_before[160]; snprintf(t_before, sizeof(t_before), "Before Channel-IQR + IQRM (q=%.2f, thr=%.1f)", q_chan, thr);
-            //         cpgmtxt("T", 3.0, 0.35, 0.5, t_before);
-            //         plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, NULL, NULL);
+                        cpgpage();
+                        char t_after[200]; snprintf(t_after, sizeof(t_after), "After Channel-IQR + IQRM flagged %d/%d (q=%.2f, thr=%.1f)", flagged_channels, nchanBinned, q_chan, thr);
+                        cpgmtxt("T", 3.0, 0.35, 0.5, t_after);
+                        plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, ii, NULL, 1, 1, (bool*)mask_chan2d_ptr, NULL);
+                    }
 
-            //         cpgpage();
-            //         char t_after[200]; snprintf(t_after, sizeof(t_after), "After Channel-IQR + IQRM flagged %d/%d (q=%.2f, thr=%.1f)", flagged_channels, nchanBinned, q_chan, thr);
-            //         cpgmtxt("T", 3.0, 0.35, 0.5, t_after);
-            //         plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, mask_chan2d, NULL);
-            //     }
-
-            //     if (writeMasks && mask_chan2d) {
-            //         char mask_CHAN_filename[256];
-            //         sprintf(mask_CHAN_filename, "%smask_CHAN_%d.png", m.datasetPath, ii);
-            //         writeIndexMaskPNG(mask_chan2d, nsampBinned, nchanBinned, mask_CHAN_filename);
-            //     }
-
-            //     free(mask_chan2d);
-            // }
+                    if (m.writeMasks) {
+                        char mask_CHAN_filename[256];
+                        snprintf(mask_CHAN_filename, sizeof(mask_CHAN_filename), "%smask_CHAN_%d.png", m.datasetPath, ii);
+                        writeIndexMaskPNG((const bool*)mask_chan2d_ptr, nsampBinned, nchanBinned, mask_CHAN_filename);
+                    }
+                }
+            }
 
             // =====================CLFD (启用)====================================================
-            // CLFD(outDataT, nsampBinned, nchanBinned, 3.0f, NULL, 0, mask_CLFD);
-            // for (int idx = 0; idx < nsampBinned * nchanBinned; idx++) {
-            //     if (mask_SPIKE[idx]) mask_CLFD[idx] = 1; // 如果有 spike 掩码，合并
-            // }
-            // substPixels2D(outDataT, nsampBinned, nchanBinned, mask_CLFD);
-            // if (writeMasks) {
-            //     char mask_CLFD_filename[256];
-            //     sprintf(mask_CLFD_filename, "%smask_CLFD_%d.png", m.datasetPath, ii);
-            //     writeIndexMaskPNG(mask_CLFD, nsampBinned, nchanBinned, mask_CLFD_filename);
-            // }
-            // if (m.plot) {
-            //     cpgpage(); cpgmtxt("T", 3.0, 0.35, 0.5, "Before CLFD");
-            //     plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, NULL, NULL);
-            //     cpgpage(); cpgmtxt("T", 3.0, 0.35, 0.5, "After CLFD");
-            //     plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, numiter, NULL, 1, 1, mask_CLFD, NULL);
-            // }
+            {
+                if (m.enableCLFD) {
+                    int *mask_CLFD = SLICE_PTR(mask_CLFD_all, nchanBinned * nsampBinned, tid);
+                    memset(mask_CLFD, 0, sizeof(int) * (size_t)nchanBinned * (size_t)nsampBinned);
+                    CLFD(outDataT, nsampBinned, nchanBinned, 3.0f, NULL, 0, mask_CLFD);
+                    for (int idx = 0; idx < nsampBinned * nchanBinned; idx++) {
+                        if (/* mask_SPIKE may be present elsewhere */ 0) mask_CLFD[idx] = 1; // 如果有 spike 掩码，合并
+                    }
+                    substPixels2D(outDataT, nsampBinned, nchanBinned, mask_CLFD);
+                    if (m.writeMasks) {
+                        char mask_CLFD_filename[256];
+                        snprintf(mask_CLFD_filename, sizeof(mask_CLFD_filename), "%smask_CLFD_%d.png", m.datasetPath, ii);
+                        writeIndexMaskPNG((const bool*)mask_CLFD, nsampBinned, nchanBinned, mask_CLFD_filename);
+                    }
+                    if (m.plot) {
+                        cpgpage(); cpgmtxt("T", 3.0, 0.35, 0.5, "Before CLFD");
+                        plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, ii, NULL, 1, 1, NULL, NULL);
+                        cpgpage(); cpgmtxt("T", 3.0, 0.35, 0.5, "After CLFD");
+                        plotTimeFreqSED(&m, blocksPerRead, outDataT, dsFreqArray, startTime, ii, NULL, 1, 1, (bool*)mask_CLFD, NULL);
+                    }
+                }
+            }
 
-
-
-            // NSigma thresholds are defined before the parallel loop to record in summary later
-            if (m.doSubstitution)
+            // =======================NSigma Identification + Substitution=============================================
             {
                 double rfi_start = mono_time_sec();
                 printf("=== Using CPU RFI detection ===\n");
@@ -1270,15 +1310,14 @@ int main(int argc, char *argv[])
                 size_t inChanSliceCount = (size_t)nsampBinned;
                 float *vs_time_means = SLICE_PTR(vs_time_means_all, nsampBinned, tid);
                 unsigned char *vs_flag_time = SLICE_PTR(vs_flag_time_all, nsampBinned, tid);
-                // 设定线程局部的保底均值缓冲区（仅一次即可，无需在 outChanDetection 内重复分配）
                 setFallbackChannelMeansBuffer(SLICE_PTR(fallback_chan_means_all, nchanBinned, tid), (size_t)nchanBinned);
                 identSubstNSigma(outDataT, nsampBinned, nchanBinned, NSigmaInChan, NSigmaOutChan, ii, doPlotThisIter,
-                                maskSetPtr, finalMedian, finalStd, m.cudaReady, flaggedChans,
+                                m.doSubstitution, maskSetPtr, finalMedian, finalStd, m.cudaReady, flaggedChans,
                                 goodSamps, randIdxs, medTemp, inChanSlice, inChanSliceCount,
+                                SLICE_PTR(mask_CLFD_all, nchanBinned * nsampBinned, tid),
                                 vs_time_means, vs_flag_time);
                 double rfi_time = mono_time_sec() - rfi_start; if (rfi_time < 0) rfi_time = 0;
                 printf("RFI detection time: %.4f seconds\n", rfi_time);
-
             }
             if (m.writeMasks)
             {
@@ -1433,6 +1472,7 @@ int main(int argc, char *argv[])
         }
     }
     if (wfptr) { int st=0; fits_close_file(wfptr, &st); wfptr=NULL; }
+    if (wfptr) { int st=0; FITS_IO_LOCK(); fits_close_file(wfptr, &st); FITS_IO_UNLOCK(); wfptr=NULL; }
     close_thread_read_fptr();
     free(freqArray);
     free(dsFreqArray);
@@ -1468,6 +1508,8 @@ int main(int argc, char *argv[])
     free(vs_time_means_all);
     free(vs_flag_time_all);
     free(fallback_chan_means_all);
+    free(mask_chan2d_all);
+    free(mask_CLFD_all);
 
     // Print loop timing summary (if any iteration executed)
     {

@@ -23,6 +23,11 @@
 #include "plot.h"
 #include "cuda_acceleration.h"
 #include "mask.h"
+/* Algorithm headers (declare IQRM and CLFD) */
+#include "include/alg_IQRM.h"
+#include "include/alg_CLFD.h"
+#include "include/alg_CLFD.h"
+#include "include/alg_IQRM.h"
 
 #ifndef PI
 #define PI 3.14159265358979323846
@@ -247,7 +252,11 @@ int gaussian_residual_f_fixed_amp(const gsl_vector *params, void *data, gsl_vect
         sigma = 1e-6;
     }
     
-    int i;
+     int i;
+     /* Prepare channel_stds buffers here so we can free them at function end
+         without conditional redeclaration in branches. */
+     float *channel_stds = NULL;
+     float *channel_stds_temp = NULL;
     for (i = 0; i < n; i++) {
         double xi = x[i];
         double yi = y[i];
@@ -868,6 +877,25 @@ void substPixels(float *data, int size, int *mask, int *goodSamps, int *randIdx)
     }
 }
 
+/// @brief 2D wrapper: perform substitution per-channel using substPixels
+/// @param data channel-major layout: channel * nsamp + t
+/// @param nsamp number of time samples per channel
+/// @param nchan number of channels
+/// @param mask int mask array (channel-major) where 1 means masked
+void substPixels2D(float *data, int nsamp, int nchan, int *mask) {
+    if (!data || !mask || nsamp <= 0 || nchan <= 0) return;
+    /* Allocation success is assumed by caller (user accepted risk) */
+    int *goodSamps = (int *)malloc((size_t)nsamp * sizeof(int));
+    int *randIdx = (int *)malloc((size_t)nsamp * sizeof(int));
+    for (int ch = 0; ch < nchan; ++ch) {
+        float *chanData = data + (size_t)ch * (size_t)nsamp;
+        int *chanMask = mask + (size_t)ch * (size_t)nsamp;
+        substPixels(chanData, nsamp, chanMask, goodSamps, randIdx);
+    }
+    free(goodSamps);
+    free(randIdx);
+}
+
 void binarySIR(
     int *mask, int nsamp, int nchan,
     int win_samp, int win_chan, float thr_up, float thr_down) 
@@ -991,6 +1019,12 @@ void setFallbackMeanNSigma(float v) {
         g_fallback_mean_nsigma = v;
     }
 }
+
+/* Global toggles controlled by caller (default disabled) */
+static int g_useIQRM = 0;
+static int g_useCLFD = 0;
+void setUseIQRM(int v) { g_useIQRM = (v != 0); }
+void setUseCLFD(int v) { g_useCLFD = (v != 0); }
 
 /// @brief Flag channels based on their standard deviation statistics using iterative 3-sigma outlier detection
 /// @param data Input data array (nsamp * nchan)
@@ -1979,11 +2013,12 @@ void classifyChannels(float *data, int nsamp, int nchan, int *flaggedChans, bool
 void identSubstNSigma(
     float *data, int nsamp, int nchan,
     float NSigmaInChan, float NSigmaOutChan,
-    int iterationIndex, int plot,
+    int iterationIndex, int plot, int doSubstitute,
     IdentNSigmaMasks *masks,
     float *finalMedian, float *finalStd, int cudaReady, int *flaggedChans,
     int *identSubst_goodSamps, int *identSubst_randIdxs, float *identSubst_medTemp,
     float *inChanScratch, size_t inChanScratchCount,
+    int *clfd_mask_buf,
     float *vs_time_means_buf, unsigned char *vs_flag_time_buf)
 {
     bool *horizontalMask = masks->horizontalMask;
@@ -2010,6 +2045,8 @@ void identSubstNSigma(
     
     int i;
     
+    printf("identSubstNSigma: doSubstitute=%d\n", doSubstitute);
+
     if (plot)
     {
         printf("=== Generating Channel STD sigma_j Histogram (Iteration %d) ===\n", iterationIndex);
@@ -2034,8 +2071,15 @@ void identSubstNSigma(
     
     // === 2. inChannel Pixel Substitution ===
     double subst_start = omp_get_wtime();
-    int inChanPixelsSubstituted = 0;  // Initialize to 0 since substitution is disabled
-    // inChanSubstitution(data, pointMask, nsamp, nchan, &inChanPixelsSubstituted);
+    int inChanPixelsSubstituted = 0;
+    if (doSubstitute) {
+        inChanSubstitution(data, pointMask, nsamp, nchan, &inChanPixelsSubstituted);
+    } else {
+        // detection-only mode: do not modify data
+        if (plot || 1) {
+            printf("inChannel substitution: skipped (detection-only mode)\n");
+        }
+    }
     double subst_time = omp_get_wtime() - subst_start;
     printf("inChannel substitution: replaced %d pixels (%.4f seconds)\n", inChanPixelsSubstituted, subst_time);
 
@@ -2044,14 +2088,75 @@ void identSubstNSigma(
     // === 4. outChannel Detection ===
     printf("=== Performing channel-level outlier detection ===\n");
     double outchan_start = omp_get_wtime();
-    float *channel_stds = (float *)malloc(nchan * sizeof(float));
-    float *channel_stds_temp = (float *)malloc(nchan * sizeof(float));
-    outChanDetection(data, nsamp, nchan, flaggedChans, channel_stds, channel_stds_temp, NSigmaOutChan, NSigmaInChan, plot);
-    double outchan_time = omp_get_wtime() - outchan_start;
-    printf("outChannel detection completed (%.4f seconds)\n", outchan_time);
-    
-    // Expand 1D flaggedChans to 2D horizontalMask
-    expandChannelMask(flaggedChans, horizontalMask, nsamp, nchan);
+
+     /* Allocate channel_stds buffers on-demand and keep pointers in outer scope
+         so we can free them once at the end of this section. */
+     float *channel_stds = NULL;
+     float *channel_stds_temp = NULL;
+
+    if (g_useIQRM) {
+        // Use IQRM to generate a 2D mask (will allocate a temporary mask which we copy into horizontalMask)
+        int *tmp_mask2d = NULL;
+        float q_chan = 1.5f;
+        float thr = 3.0f;
+        int flagged_channels = IQRM(data, nsamp, nchan, q_chan, thr, &tmp_mask2d);
+        if (tmp_mask2d) {
+            // copy into horizontalMask (channel-major layout expected)
+            for (int ch = 0; ch < nchan; ++ch) {
+                for (int t = 0; t < nsamp; ++t) {
+                    horizontalMask[ch * nsamp + t] = (tmp_mask2d[ch * nsamp + t] != 0);
+                }
+            }
+            free(tmp_mask2d);
+        }
+        // populate flaggedChans from horizontalMask
+        for (int ch = 0; ch < nchan; ++ch) {
+            int flagged = 0;
+            for (int t = 0; t < nsamp; ++t) if (horizontalMask[ch * nsamp + t]) { flagged = 1; break; }
+            flaggedChans[ch] = flagged;
+        }
+        double outchan_time = omp_get_wtime() - outchan_start; (void)outchan_time;
+        printf("IQRM-based outChannel detection done, flagged %d channels (approx)\n", flagged_channels);
+    }
+    else if (g_useCLFD) {
+        // Use caller-provided CLFD mask buffer to avoid per-call malloc/free
+        int *mask_buf = clfd_mask_buf;
+        if (!mask_buf) {
+            // fallback
+            fprintf(stderr, "Warning: CLFD buffer not provided to identSubstNSigma; falling back to outChanDetection\n");
+            float *channel_stds = (float *)malloc(nchan * sizeof(float));
+            float *channel_stds_temp = (float *)malloc(nchan * sizeof(float));
+            outChanDetection(data, nsamp, nchan, flaggedChans, channel_stds, channel_stds_temp, NSigmaOutChan, NSigmaInChan, plot);
+            free(channel_stds);
+            free(channel_stds_temp);
+            expandChannelMask(flaggedChans, horizontalMask, nsamp, nchan);
+        } else {
+            memset(mask_buf, 0, sizeof(int) * (size_t)nchan * (size_t)nsamp);
+            CLFD(data, nsamp, nchan, 3.0f, NULL, 0, mask_buf);
+            // copy int mask_buf into horizontalMask (bool) and flaggedChans
+            for (int ch = 0; ch < nchan; ++ch) {
+                int any_flag = 0;
+                size_t base = (size_t)ch * (size_t)nsamp;
+                for (int t = 0; t < nsamp; ++t) {
+                    int v = mask_buf[base + (size_t)t];
+                    horizontalMask[base + (size_t)t] = (v != 0);
+                    if (v) any_flag = 1;
+                }
+                flaggedChans[ch] = any_flag;
+            }
+        }
+    }
+    else {
+        float *channel_stds = (float *)malloc(nchan * sizeof(float));
+        float *channel_stds_temp = (float *)malloc(nchan * sizeof(float));
+        outChanDetection(data, nsamp, nchan, flaggedChans, channel_stds, channel_stds_temp, NSigmaOutChan, NSigmaInChan, plot);
+        double outchan_time = omp_get_wtime() - outchan_start;
+        printf("outChannel detection completed (%.4f seconds)\n", outchan_time);
+        // Expand 1D flaggedChans to 2D horizontalMask
+        expandChannelMask(flaggedChans, horizontalMask, nsamp, nchan);
+        free(channel_stds);
+        free(channel_stds_temp);
+    }
 
     // 新逻辑：按通道统计 pointMask 比例，若超过 30%，认为被点干扰主导，取消该通道的 horizontalMask 标记
     int canceled_horizontal_channels = cancelHorizontalMaskForPointDominantChannels(
@@ -2071,8 +2176,13 @@ void identSubstNSigma(
     int flaggedChanCount = 0;
     for (i = 0; i < nchan; i++) if (flaggedChans[i]) flaggedChanCount++;
     if (flaggedChanCount > 0) {
-        // outChanSubstitution(data, flaggedChans, pointMask, nsamp, nchan);
-        // outChanPixelsSubstituted = flaggedChanCount * nsamp;  // Disabled - no actual substitution performed
+        if (doSubstitute) {
+            outChanSubstitution(data, flaggedChans, (const int*)pointMask, nsamp, nchan);
+            // estimate substituted pixels as fully substituted channels * nsamp (conservative estimate)
+            outChanPixelsSubstituted = flaggedChanCount * nsamp;
+        } else {
+            printf("outChannel substitution: skipped (detection-only mode), %d channels flagged\n", flaggedChanCount);
+        }
     }
     printf("outChannel substitution: replaced %d pixels\n", outChanPixelsSubstituted);
 

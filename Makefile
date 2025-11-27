@@ -17,8 +17,8 @@ MODE ?= turbo
 
 
 # 基础编译选项
-BASE_CFLAGS := -Wall -Wno-format-security -D_GNU_SOURCE
-BASE_CXXFLAGS := -Wall -Wno-format-security -D_GNU_SOURCE 
+BASE_CFLAGS := -Wall -Wno-format-security -D_GNU_SOURCE -pthread
+BASE_CXXFLAGS := -Wall -Wno-format-security -D_GNU_SOURCE -pthread
 
 # 调试模式
 ifeq ($(MODE), debug)

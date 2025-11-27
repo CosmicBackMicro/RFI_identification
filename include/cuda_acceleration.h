@@ -57,7 +57,7 @@ void cuda_transpose(const float *input, float *output, int rows, int cols);
 int cuda_identSubstNSigma(
     float *data, int nsamp, int nchan,
     float NSigmaInChan, float NSigmaOutChan,
-    int iterationIndex, int plot,
+    int iterationIndex, int plot, int doSubstitute,
     void *masks,
     float *finalMedian, float *finalStd, int *flaggedChans);
 

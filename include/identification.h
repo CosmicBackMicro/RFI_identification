@@ -23,6 +23,8 @@ void outChanSubstitution(float *data, const int *channelMask, const int *pointMa
 // Substitute in-channel outliers using local statistics
 void inChanSubstitution(float *data, int *globalMask, int nsamp, int nchan, int *pixelsSubstituted);
 void substPixels(float *data, int size, int *mask, int *goodSamps, int *randIdx);
+// 2D variant: substitute masked pixels per-channel using unmasked samples from same channel
+void substPixels2D(float *data, int nsamp, int nchan, int *mask);
 void binarySIR(int *mask, int nsamp, int nchan, int win_samp, int win_chan, float thrup, float thrdown);
 
 void outChanDetection(float *data, int nsamp, int nchan, int *channelFlagged,
@@ -54,14 +56,18 @@ typedef struct IdentNSigmaMasks {
 } IdentNSigmaMasks;
 
 void identSubstNSigma(
-    float *data, int nsamp, int nchan,
-    float NSigmaInChan, float NSigmaOutChan, int iterationIndex, int plot,
-    IdentNSigmaMasks *masks,
-    float *finalMedian, float *finalStd, int cudaReady, int *flaggedChans,
-    int *identSubst_goodSamps, int *identSubst_randIdxs, float *identSubst_medTemp,
-    float *inChanScratch, size_t inChanScratchCount,
-    /* Vertical-stripe detection scratch buffers (allocated by caller) */
-    float *vs_time_means_buf, unsigned char *vs_flag_time_buf);
+     float *data, int nsamp, int nchan,
+     float NSigmaInChan, float NSigmaOutChan, int iterationIndex, int plot, int doSubstitute,
+     IdentNSigmaMasks *masks,
+     float *finalMedian, float *finalStd, int cudaReady, int *flaggedChans,
+     int *identSubst_goodSamps, int *identSubst_randIdxs, float *identSubst_medTemp,
+     float *inChanScratch, size_t inChanScratchCount,
+     /* Caller-provided CLFD mask buffer (int array of size nsamp*nchan, per-thread slice)
+         This avoids allocating inside CLFD hot paths.
+     */
+     int *clfd_mask_buf,
+     /* Vertical-stripe detection scratch buffers (allocated by caller) */
+     float *vs_time_means_buf, unsigned char *vs_flag_time_buf);
 
 // Histogram functions
 // OutChannel comparison histogram function
@@ -138,3 +144,7 @@ int cancelHorizontalMaskForPointDominantChannels(
     float ratio_thresh,      // e.g., 0.30f
     bool *horizontalMask,
     int *flaggedChans);
+
+/* Global toggles for alternative channel-detection algorithms (set from caller) */
+void setUseIQRM(int v);
+void setUseCLFD(int v);

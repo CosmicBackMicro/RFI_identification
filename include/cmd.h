@@ -24,6 +24,7 @@ static struct option long_options[] = {
     {"enableCuda", required_argument, NULL, 'c'},       // --enableCuda
     {"inChanNSigma", required_argument, NULL, 'I'},     // --inChanNSigma
     {"outChanNSigma", required_argument, NULL, 'O'},    // --outChanNSigma
+    {"ncpus", required_argument, NULL, 'T'},             // --ncpus
     {"help", no_argument, NULL, 'h'},                   // --help
     {NULL, 0, NULL, 0}                                  // End Mark for Options
 };

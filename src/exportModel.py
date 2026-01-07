@@ -23,7 +23,7 @@ import sys
 
 from UNet import UNetLightningModule
 
-def build_tensorrt_engine(onnx_path, engine_path, fp16=True, input_shape=(1, 1, 512, 512)):
+def build_tensorrt_engine(onnx_path, engine_path, fp16=True, input_shape=(1, 1, 512, 512), is_static=False):
     """
     Build TensorRT engine from ONNX file.
     """
@@ -37,10 +37,33 @@ def build_tensorrt_engine(onnx_path, engine_path, fp16=True, input_shape=(1, 1, 
     logger = trt.Logger(trt.Logger.INFO)
     builder = trt.Builder(logger)
     
-    # EXPLICIT_BATCH is required for ONNX models with dynamic shapes
+    # EXPLICIT_BATCH is required for ONNX models
     network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
     parser = trt.OnnxParser(network, logger)
     config = builder.create_builder_config()
+
+    # Set memory pool limit for workspace (e.g., 4GB for large models)
+    memory_pool_type = getattr(trt, "MemoryPoolType", None)
+    workspace_size = 4096 * 1024 * 1024 # 4GB
+    if hasattr(config, "set_memory_pool_limit") and memory_pool_type:
+        config.set_memory_pool_limit(getattr(memory_pool_type, "WORKSPACE"), workspace_size)
+        print(f"[TRT] Workspace limit set to {workspace_size/(1024**2):.0f}MB.")
+    elif hasattr(config, "max_workspace_size"):
+        config.max_workspace_size = workspace_size
+        print(f"[TRT] Workspace limit set to {workspace_size/(1024**2):.0f}MB.")
+
+    # Tactic Sources: Try to disable CUBLAS_LT if it causes crashes due to library mismatch
+    tactic_source_enum = getattr(trt, "TacticSource", None)
+    if tactic_source_enum and hasattr(config, "set_tactic_sources"):
+        try:
+            # Use getattr to safely get enum values
+            cublas = getattr(tactic_source_enum, "CUBLAS")
+            cudnn = getattr(tactic_source_enum, "CUDNN")
+            mask = (1 << int(cublas)) | (1 << int(cudnn))
+            config.set_tactic_sources(mask)
+            print("[TRT] Tactic Sources: Restricted to CUBLAS and CUDNN (disabled CUBLAS_LT for stability).")
+        except Exception as e:
+            print(f"[TRT] Could not restrict Tactic Sources: {e}")
 
     # Parse ONNX
     with open(onnx_path, 'rb') as f:
@@ -53,28 +76,49 @@ def build_tensorrt_engine(onnx_path, engine_path, fp16=True, input_shape=(1, 1, 
     # Enable FP16 if requested and supported
     if fp16:
         if builder.platform_has_fast_fp16:
-            config.set_flag(trt.BuilderFlag.FP16)
-            print("[TRT] FP16 mode enabled.")
+            # Use getattr to avoid linter errors on different TRT versions
+            builder_flag = getattr(trt, "BuilderFlag", None)
+            if builder_flag and hasattr(config, "set_flag"):
+                config.set_flag(getattr(builder_flag, "FP16"))
+                print("[TRT] FP16 mode enabled (via set_flag).")
+            elif hasattr(builder, "fp16_mode"):
+                builder.fp16_mode = True
+                print("[TRT] FP16 mode enabled (via fp16_mode).")
+            else:
+                print("[TRT] Could not enable FP16 (API mismatch).")
         else:
             print("[TRT] FP16 requested but not supported by platform. Falling back to FP32.")
 
-    # Optimization Profile for dynamic shapes
-    profile = builder.create_optimization_profile()
+    # Optimization Profile
     input_tensor = network.get_input(0)
     input_name = input_tensor.name
     
-    b, c, h, w = input_shape
-    # Define min, opt, max shapes
-    # Min: 1x1x(h/2)x(w/2) - heuristic
-    min_shape = (1, c, h // 2, w // 2)
-    opt_shape = (b, c, h, w)
-    # Max: Set equal to opt_shape to save memory on Laptop GPUs (avoid OOM)
-    # If you need larger inputs, increase --height/--width or manually adjust here
-    max_shape = (b, c, h, w)
+    # Check if input has dynamic shapes (-1)
+    has_dynamic = any(d == -1 or d is None for d in input_tensor.shape)
     
-    print(f"[TRT] Optimization Profile: min={min_shape}, opt={opt_shape}, max={max_shape}")
-    profile.set_shape(input_name, min_shape, opt_shape, max_shape)
-    config.add_optimization_profile(profile)
+    if has_dynamic:
+        print(f"[TRT] Dynamic ONNX detected. Creating optimization profile for {input_name}...")
+        profile = builder.create_optimization_profile()
+        b, c, h, w = input_shape
+        
+        if is_static:
+            # Even if ONNX is dynamic, we can force TRT to be static for better optimization
+            min_shape = (b, c, h, w)
+            opt_shape = (b, c, h, w)
+            max_shape = (b, c, h, w)
+            print(f"[TRT] Forcing static shapes in TRT for efficiency: {opt_shape}")
+        else:
+            # Dynamic axes: allow some range
+            min_shape = (1, c, h // 2, w // 2)
+            opt_shape = (b, c, h, w)
+            max_shape = (b, c, h, w)
+        
+        profile.set_shape(input_name, min_shape, opt_shape, max_shape)
+        config.add_optimization_profile(profile)
+    else:
+        print(f"[TRT] Static ONNX detected (shape={input_tensor.shape}).")
+        if is_static:
+            print("[TRT] Static mode: TensorRT will perform maximum optimization for this fixed shape.")
 
     # Build engine
     serialized_engine = builder.build_serialized_network(network, config)
@@ -93,7 +137,7 @@ def main():
     parser.add_argument('--checkpoint', required=True, help='Path to Lightning .ckpt file')
     default_output = os.path.join('checkpoints', 'tensorrt', 'model.engine')
     parser.add_argument('--output', required=False, default=default_output, help=f'Output TensorRT engine path (default: {default_output}). ONNX will be saved with same basename.')
-    parser.add_argument('--opset', type=int, default=17, help='ONNX opset version')
+    parser.add_argument('--opset', type=int, default=11, help='ONNX opset version (default: 11 for compatibility)')
     parser.add_argument('--batch', type=int, default=1, help='Example batch size')
     parser.add_argument('--height', type=int, default=512, help='Example height')
     parser.add_argument('--width', type=int, default=512, help='Example width')
@@ -170,7 +214,8 @@ def main():
         onnx_path, 
         engine_path, 
         fp16=args.fp16, 
-        input_shape=(args.batch, 1, args.height, args.width)
+        input_shape=(args.batch, 1, args.height, args.width),
+        is_static=args.static
     )
 
 if __name__ == '__main__':

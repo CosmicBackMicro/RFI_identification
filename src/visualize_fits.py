@@ -192,7 +192,7 @@ def load_psrfits_row(fits_path, row_idx):
 import argparse
 from typing import Optional
 
-def test_load_fits_image(input_source, mode='dir', verbose: bool=False, mask_dir: Optional[str]=None, mask_alpha: float=0.7):
+def test_load_fits_image(input_source, mode='dir', verbose: bool=False, mask_dir: Optional[str]=None, mask_alpha: float=0.7, blocksperread: int=1):
     """Use left/right arrow keys for bidirectional browsing (←/→), press J to jump to index, Esc to quit.
     When verbose=True, per-frame loading logs will be printed, default off to reduce I/O.
     input_source: directory path (mode='dir') or file path (mode='file')
@@ -244,14 +244,23 @@ def test_load_fits_image(input_source, mode='dir', verbose: bool=False, mask_dir
             n_rows = hdu.get_nrows()
             
         print(f"Opened Large FITS: {input_source}")
-        print(f"Total Subints (Rows): {n_rows}")
+        print(f"Total Subints (Rows): {n_rows}, Blocks per read: {blocksperread}")
         
-        data_provider['count'] = n_rows
-        data_provider['get_name'] = lambda i: f"Row/Subint {i}"
-        data_provider['get_path'] = lambda i: f"row_{i}" # Virtual path used for mask
+        data_provider['count'] = (n_rows + blocksperread - 1) // blocksperread
+        data_provider['get_name'] = lambda i: f"Rows {i*blocksperread} to {min((i+1)*blocksperread-1, n_rows-1)}"
+        data_provider['get_path'] = lambda i: f"row_{i*blocksperread}" # Virtual path used for mask
         # Load function
         def _load_idx(i):
-            return load_psrfits_row(input_source, i)
+            if blocksperread <= 1:
+                return load_psrfits_row(input_source, i)
+            
+            images = []
+            tbin = 1.0
+            for r in range(i * blocksperread, min((i + 1) * blocksperread, n_rows)):
+                img, tb = load_psrfits_row(input_source, r)
+                images.append(img)
+                tbin = tb
+            return np.concatenate(images, axis=1), tbin
         data_provider['load'] = _load_idx
 
     total_frames = data_provider['count']
@@ -1030,6 +1039,8 @@ if __name__ == "__main__":
                         help='Directory containing FITS files to visualize.')
     parser.add_argument('--psrfits', nargs='?', const=True, default=None,
                         help='Path to a large PSRFITS file to view row-by-row. If set without value, opens file dialog.')
+    parser.add_argument('--blocksperread', type=int, default=1,
+                        help='Number of subints to show at once in PSRFITS mode (default: 1).')
     parser.add_argument('--browse', action='store_true',
                         help='Force opening a selection dialog.')
     parser.add_argument('--verbose', action='store_true',
@@ -1088,17 +1099,17 @@ if __name__ == "__main__":
 
     # Handle Mask
     mask_dir = None
-    if not args.no_mask:
+    if mode == 'dir' and not args.no_mask:
         if isinstance(args.mask, str):
             mask_dir = args.mask
         elif args.mask is True:
             # If user didn't specify mask path, ask for it
             print("Select Mask Directory (Cancel to disable overlay)...")
-            init_mask_dir = target_path if mode == 'dir' else os.path.dirname(target_path)
+            init_mask_dir = target_path
             mask_dir = _choose_directory_via_gui(initial_dir=init_mask_dir, title="Select Mask Directory (Cancel to disable overlay)")
         
         if mask_dir and not os.path.isdir(mask_dir):
             print(f"[Warn] Invalid mask path provided: {mask_dir}, mask overlay will be disabled.")
             mask_dir = None
 
-    test_load_fits_image(target_path, mode=mode, verbose=args.verbose, mask_dir=mask_dir, mask_alpha=args.mask_alpha)
+    test_load_fits_image(target_path, mode=mode, verbose=args.verbose, mask_dir=mask_dir, mask_alpha=args.mask_alpha, blocksperread=args.blocksperread)

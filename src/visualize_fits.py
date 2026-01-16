@@ -287,18 +287,20 @@ def test_load_fits_image(input_source, mode='dir', verbose: bool=False, mask_dir
             print(f"[Info] Found {len(mask_map)} mask PNG(s) in: {mask_dir}")
 
     # Class names and color mapping (for legend and rendering), can be adjusted as needed
-    # Convention: 0=background, 1=horizontal, 2=vertical, 3=point, 4=block
+    # Convention: 0=background, 1=horizontal, 2=vertical, 6=point, 7=block, 8=pulse
     class_names = {
         1: 'horizontal',
         2: 'vertical',
         6: 'point',
-        4: 'block',
+        7: 'block',
+        8: 'pulse',
     }
     class_color_map = {
-        1: (0.0, 1.0, 1.0),  # horizontal -> cyan
+        1: (0.0, 1.0, 1.0),   # horizontal -> cyan
         2: (1.0, 0.0, 1.0),   # vertical -> magenta
         6: (0.0, 0.0, 1.0),   # point -> blue
-        4: (0.0, 1.0, 0.0),   # block -> green
+        7: (1.0, 1.0, 0.0),   # block -> yellow
+        8: (1.0, 0.0, 0.0),   # pulse -> red
     }
 
     # Create figure and axes with expanded layout adding two sigma panels:

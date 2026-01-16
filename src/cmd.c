@@ -66,6 +66,18 @@ int parseCommandLineArguments(int argc, char *argv[], Metadata *m) {
         {"ncpus", required_argument, 0, 'T'},
         {"fallbackMeanNSigma", required_argument, 0, 'F'},
         {"help", no_argument, 0, 'h'},
+        {"hasPulse", no_argument, 0, 'u'},
+        {"pulseDM", required_argument, 0, 'D'},
+        {"pulseP0", required_argument, 0, 'y'},
+        {"pulseWidth", required_argument, 0, 'w'},
+        {"pulseT0", required_argument, 0, 'o'},
+        {"interpulse", no_argument, 0, 'U'},
+        {"interpulseWidth", required_argument, 0, 'V'},
+        {"interpulset0", required_argument, 0, 'X'},
+        {"noBlock", no_argument, 0, 'N'},
+        {"noVertical", no_argument, 0, 'Y'}, // Use 'Y' since 'V' is taken for interpulseWidth
+        {"pulselofreq", required_argument, 0, 'L'},
+        {"pulsehifreq", required_argument, 0, 'H'},
         {0, 0, 0, 0}
     };
 
@@ -80,6 +92,8 @@ int parseCommandLineArguments(int argc, char *argv[], Metadata *m) {
     m->timeDuration = 0.0f;
     m->doSubstitution = 1;
     m->doSumThreshold = 1;
+    m->noBlock = 0;      // Default: enable block detection
+    m->noVertical = 0;   // Default: enable vertical detection
     m->enableCuda = 1;  // Default: enable CUDA if available
     m->writeBack = 0;    // Default: do not write back to original file
     m->writeMasks = 1;   // Default: write mask images
@@ -90,8 +104,21 @@ int parseCommandLineArguments(int argc, char *argv[], Metadata *m) {
     m->FallbackMeanNSigma = 2.0f; // 默认均值兜底 2σ
     m->ncpus = 20; // default threads
 
+    /* Pulse mask defaults (disabled) */
+    m->hasPulse = 0;
+    m->pulseDM = 0.0f;
+    m->pulseP0 = 0.0f;
+    m->pulseWidth = 0.0f;
+    m->pulseT0Local = 0.0f;
+    m->interpulse = 0;
+    m->interpulseWidth = 0.01f;
+    m->interpulseT0 = -1.0f; // -1 means default: t0 + 0.5*P
+    m->pulselofreq = 0.0f;
+    m->pulsehifreq = 1e6f;
+
     int opt;
-    while ((opt = getopt_long(argc, argv, "i:S:d:s:t:f:r:e:M:p:n:P:W:B:k:c:I:O:F:T:h", long_options, NULL))) {
+    /* Added short options: u (hasPulse), D (pulseDM), y (pulseP0), w (pulseWidth), o (pulseT0), U (interpulse), V (interpulseWidth), X (interpulset0), N (noBlock), Y (noVertical), L (pulselofreq), H (pulsehifreq) */
+    while ((opt = getopt_long(argc, argv, "i:S:d:s:t:f:r:e:M:p:n:P:W:B:k:c:I:O:F:T:huD:y:w:o:UV:X:NYL:H:", long_options, NULL))) {
         if (opt == -1) break;
 
         switch (opt) {
@@ -163,6 +190,43 @@ int parseCommandLineArguments(int argc, char *argv[], Metadata *m) {
                 m->ncpus = atoi(optarg);
                 if (m->ncpus <= 0) m->ncpus = 1;
                 break;
+            case 'u':
+                /* --hasPulse : enable pulse mask generation (no argument) */
+                m->hasPulse = 1;
+                break;
+            case 'D':
+                m->pulseDM = atof(optarg);
+                break;
+            case 'y':
+                m->pulseP0 = atof(optarg);
+                break;
+            case 'w':
+                m->pulseWidth = atof(optarg);
+                break;
+            case 'o':
+                m->pulseT0Local = atof(optarg);
+                break;
+            case 'U':
+                m->interpulse = 1;
+                break;
+            case 'V':
+                m->interpulseWidth = atof(optarg);
+                break;
+            case 'X':
+                m->interpulseT0 = atof(optarg);
+                break;
+            case 'N':
+                m->noBlock = 1;
+                break;
+            case 'Y':
+                m->noVertical = 1;
+                break;
+            case 'L':
+                m->pulselofreq = atof(optarg);
+                break;
+            case 'H':
+                m->pulsehifreq = atof(optarg);
+                break;
             case 'h':
                 printf("Usage: %s [OPTIONS]\n", argv[0]);
                 printf("Options:\n");
@@ -186,7 +250,20 @@ int parseCommandLineArguments(int argc, char *argv[], Metadata *m) {
                 printf("  -O, --outChanNSigma=VALUE     NSigma threshold for cross-channel detection (default 3.0)\n");
                 printf("  -F, --fallbackMeanNSigma=VAL   Fallback mean-based channel sigma clip (default 2.0)\n");
                 printf("  -T, --ncpus=N                 Number of CPU threads to use (default 20)\n");
-                printf("  -h, --help                    Show this help message\n");
+                printf("  -h, --help                    Display this help\n");
+                printf("Pulse mask options (use --hasPulse to enable pulse mask generation):\n");
+                printf("      --hasPulse                Enable pulse mask generation (no argument)\n");
+                printf("      --pulseDM=DM              Pulse DM for masking\n");
+                printf("      --pulseP0=PERIOD          Pulse Period (s) for masking\n");
+                printf("      --pulseWidth=WIDTH        Pulse width (s)\n");
+                printf("      --pulseT0=T0              Pulse T0 (s) on absolute file timeline\n");
+                printf("      --interpulse              Enable interpulse\n");
+                printf("      --interpulseWidth=WIDTH   Interpulse width (s)\n");
+                printf("      --interpulset0=T0         Interpulse T0 (s) on absolute timeline\n");
+                printf("      --noBlock                 Disable block RFI detection\n");
+                printf("      --noVertical              Disable vertical RFI detection\n");
+                printf("      --pulselofreq=FREQ        Min freq for pulse masking (MHz)\n");
+                printf("      --pulsehifreq=FREQ        Max freq for pulse masking (MHz)\n");
                 return 1; // Return non-zero to indicate no further processing
         }
     }
@@ -242,6 +319,29 @@ int parseCommandLineArguments(int argc, char *argv[], Metadata *m) {
     if (m->enableIQRM && m->enableCLFD) {
         fprintf(stderr, "Error: --enableIQRM and --enableCLFD are mutually exclusive. Please enable only one.\n");
         return -1;
+    }
+
+    /* If user requested pulse mask generation, perform basic validation of required parameters.
+       We require a positive period and width; DM must be non-negative; T0_local may be zero.
+       The help text warns that these parameters are expected when --hasPulse is present.
+    */
+    if (m->hasPulse) {
+        if (m->pulseP0 <= 0.0f) {
+            fprintf(stderr, "Error: --hasPulse requires --pulseP0 (pulse period > 0).\n");
+            return -1;
+        }
+        if (m->pulseWidth <= 0.0f) {
+            fprintf(stderr, "Error: --hasPulse requires --pulseWidth (pulse width > 0).\n");
+            return -1;
+        }
+        if (m->pulseDM < 0.0f) {
+            fprintf(stderr, "Error: --pulseDM must be >= 0.\n");
+            return -1;
+        }
+        if (m->pulseT0Local < 0.0f) {
+            fprintf(stderr, "Error: --pulseT0 must be >= 0 (window-local seconds).\n");
+            return -1;
+        }
     }
 
     return 0; // Success

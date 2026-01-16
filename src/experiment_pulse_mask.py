@@ -142,64 +142,59 @@ def calculate_dispersion_delay(f_mhz, f_ref_mhz, dm):
     f_ref_mhz = max(f_ref_mhz, 1e-6)
     return k_dm * dm * (1.0/(f_mhz**2) - 1.0/(f_ref_mhz**2))
 
-def generate_mask(data_shape, freqs, tbin, dm, period, t0, width_s):
+def generate_mask(data_shape, freqs, tbin, dm, period, t0, width_s, 
+                  enable_interpulse=False, interpulse_width_s=0.0, interpulse_t0=None,
+                  lo_freq_mhz=None, hi_freq_mhz=None):
     """
-    生成脉冲 Mask
-    t0: 第一个脉冲到达最高频率的时间 (秒)
-    width_s: 脉冲宽度 (秒)
+    生成脉冲 Mask (支持主脉冲 + 可选的间脉冲)
     """
     nchan, nsamp = data_shape
     mask = np.zeros(data_shape, dtype=np.float32)
+    
+    # 频率范围过滤
+    chan_valid = np.ones(nchan, dtype=bool)
+    if lo_freq_mhz is not None:
+        chan_valid &= (freqs >= lo_freq_mhz)
+    if hi_freq_mhz is not None:
+        chan_valid &= (freqs <= hi_freq_mhz)
     
     # 确定参考频率 (通常取最高频，因为高频先到)
     f_ref = np.max(freqs)
     
     # 计算每个通道相对于 f_ref 的延迟
     delays_sec = calculate_dispersion_delay(freqs, f_ref, dm)
-    delays_samp = (delays_sec / tbin).astype(int)
-    
-    width_samp = int(width_s / tbin)
-    if width_samp < 1: width_samp = 1
-    
     duration_sec = nsamp * tbin
-    
-    # 找到所有在当前时间窗口内的脉冲
-    # t_pulse = t0 + k * Period
-    # 我们需要 t_pulse + delay_min < duration_sec 且 t_pulse + delay_max > 0
-    
-    # 估算 k 的范围
-    # t0 + k*P > -max_delay
-    # k > (-max_delay - t0) / P
-    k_min = int(np.floor((-np.max(delays_sec) - t0) / period))
-    # t0 + k*P < duration
-    k_max = int(np.ceil((duration_sec - t0) / period))
-    
-    for k in range(k_min, k_max + 2):
-        pulse_arrival_t0 = t0 + k * period
+
+    def draw_pulse_sequence(start_t0, w_s):
+        width_samp = int(w_s / tbin)
+        if width_samp < 1: width_samp = 1
         
-        # 简单的 mask 生成：遍历通道 (可以向量化优化，但 Python 循环 nchan 1024 次通常够快)
-        # 向量化版本:
-        t_starts = (pulse_arrival_t0 / tbin) + (delays_sec / tbin)
-        t_starts_idx = t_starts.astype(int)
+        k_min = int(np.floor((-np.max(delays_sec) - start_t0) / period))
+        k_max = int(np.ceil((duration_sec - start_t0) / period))
         
-        # 这是一个简单的矩形脉冲模型。如果需要高斯，可以修改这里。
-        # 为了速度，我们使用 numpy 的广播或切片
-        
-        # 由于每个通道的 t_start 不一样，完全向量化赋值比较麻烦，
-        # 我们按通道循环，或者构建网格。
-        # 对于 Mask 生成，按通道循环最直观且易于移植到 C。
-        
-        for c in range(nchan):
-            center_samp = t_starts_idx[c]
-            start_samp = center_samp - width_samp // 2
-            end_samp = center_samp + width_samp // 2
+        delays_samp_float = delays_sec / tbin
+
+        for k in range(k_min, k_max + 2):
+            pulse_arrival_t0 = start_t0 + k * period
+            t_starts_idx = (pulse_arrival_t0 / tbin + delays_samp_float).astype(int)
             
-            # 边界检查
-            s0 = max(0, start_samp)
-            s1 = min(nsamp, end_samp)
-            
-            if s0 < s1:
-                mask[c, s0:s1] = 1.0
+            for c in range(nchan):
+                if not chan_valid[c]:
+                    continue
+                center_samp = t_starts_idx[c]
+                s0 = max(0, center_samp - width_samp // 2)
+                s1 = min(nsamp, center_samp + width_samp // 2)
+                
+                if s0 < s1:
+                    mask[c, s0:s1] = 1.0
+
+    # Draw Main Pulse
+    draw_pulse_sequence(t0, width_s)
+    
+    # Draw Interpulse
+    if enable_interpulse:
+        it0 = interpulse_t0 if interpulse_t0 is not None else (t0 + 0.5 * period)
+        draw_pulse_sequence(it0, interpulse_width_s)
                 
     return mask
 
@@ -219,6 +214,11 @@ def main():
         ),
     )
     parser.add_argument("--width", type=float, default=0.02, help="Pulse width (s)")
+    parser.add_argument("--interpulse", action="store_true", help="Enable interpulse")
+    parser.add_argument("--interpulseWidth", type=float, default=0.01, help="Interpulse width (s)")
+    parser.add_argument("--interpulset0", type=float, default=None, help="Interpulse T0 (s). If None, defaults to t0 + 0.5*period")
+    parser.add_argument("--pulselofreq", type=float, default=None, help="Lowest frequency (MHz) to mask the pulse")
+    parser.add_argument("--pulsehifreq", type=float, default=None, help="Highest frequency (MHz) to mask the pulse")
     parser.add_argument(
         "--block",
         type=int,
@@ -315,7 +315,7 @@ def main():
 
     # 交互式绘图
     fig, ax = plt.subplots(figsize=(12, 8))
-    plt.subplots_adjust(bottom=0.25)
+    plt.subplots_adjust(bottom=0.35)
     
     # 显示原始数据 (flipud 以便低频在下，符合直觉)
     # 注意：如果 freqs[0] 是高频，flipud 后 row 0 (bottom) 变成高频？
@@ -336,7 +336,7 @@ def main():
         display_img = np.flipud(data)
         display_freqs = np.flipud(freqs)
         
-    extent = [0, nsamp*info['tbin'], display_freqs[-1], display_freqs[0]]
+    extent = [start_time_s, start_time_s + nsamp*info['tbin'], display_freqs[-1], display_freqs[0]]
     origin = 'upper'
 
     # 归一化用于显示：整幅图像 mean ± 5σ
@@ -381,37 +381,59 @@ def main():
         ax.legend(handles=[pulse_patch], loc='upper right', frameon=True, fontsize=9)
 
     # Sliders (only meaningful when interactive)
-    ax_dm = plt.axes((0.15, 0.1, 0.65, 0.03))
-    ax_t0 = plt.axes((0.15, 0.05, 0.65, 0.03))
-    ax_width = plt.axes((0.15, 0.15, 0.65, 0.03))
-
-    s_dm = Slider(ax_dm, 'DM', args.dm * 0.8, args.dm * 1.2, valinit=args.dm)
-    # We show a "local" t0 (within one period) for easier interactive tweaking.
-    t0_local_init = (args.t0 - start_time_s) % args.period
-    print(
-        f"t0_abs={args.t0:.6f} s, t0_local_init={(t0_local_init):.6f} s (period={args.period:.6f} s)"
-    )
-    s_t0 = Slider(ax_t0, 'P (s)', 0, args.period, valinit=t0_local_init)
-    s_width = Slider(ax_width, 'Width (s)', 0.001, 0.1, valinit=args.width)
+    slider_height = 0.03
+    slider_spacing = 0.04
+    s_bottom = 0.05
     
+    ax_t0 = plt.axes((0.15, s_bottom, 0.65, slider_height))
+    ax_p0 = plt.axes((0.15, s_bottom + slider_spacing, 0.65, slider_height))
+    ax_dm = plt.axes((0.15, s_bottom + 2 * slider_spacing, 0.65, slider_height))
+    ax_width = plt.axes((0.15, s_bottom + 3 * slider_spacing, 0.65, slider_height))
+    
+    s_t0 = Slider(ax_t0, 'T0 (s)', 0, args.period, valinit=((args.t0 - start_time_s) % args.period))
+    s_p0 = Slider(ax_p0, 'Period (s)', args.period * 0.8, args.period * 1.2, valinit=args.period)
+    s_dm = Slider(ax_dm, 'DM', args.dm * 0.8, args.dm * 1.2, valinit=args.dm)
+    s_width = Slider(ax_width, 'Width (s)', 0.0001, 0.2, valinit=args.width)
+
+    s_iwidth = None
+    s_it0 = None
+    if args.interpulse:
+        ax_iwidth = plt.axes((0.15, s_bottom + 4 * slider_spacing, 0.65, slider_height))
+        s_iwidth = Slider(ax_iwidth, 'Inter W', 0.0001, 0.2, valinit=args.interpulseWidth)
+        
+        ax_it0 = plt.axes((0.15, s_bottom + 5 * slider_spacing, 0.65, slider_height))
+        # Default it0 local
+        if args.interpulset0 is not None:
+            it0_init = (args.interpulset0 - start_time_s) % args.period
+        else:
+            it0_init = (s_t0.val + 0.5 * args.period) % args.period
+        s_it0 = Slider(ax_it0, 'Inter T0', 0, args.period, valinit=it0_init)
+
     def update(val):
         if args.nomask:
             return
 
         dm = s_dm.val
+        period = s_p0.val
         t0_local = s_t0.val
         width = s_width.val
+        iwidth = s_iwidth.val if s_iwidth else 0.0
+        it0_local = s_it0.val if s_it0 else None
         
-        mask = generate_mask(data.shape, freqs, info['tbin'], dm, args.period, t0_local, width)
+        mask = generate_mask(
+            data.shape, freqs, info['tbin'], dm, period, t0_local, width,
+            enable_interpulse=args.interpulse,
+            interpulse_width_s=iwidth,
+            interpulse_t0=it0_local,
+            lo_freq_mhz=args.pulselofreq,
+            hi_freq_mhz=args.pulsehifreq
+        )
         
-        # Transform mask to display coordinates (flip if needed)
         if freqs[0] < freqs[-1]:
             display_mask = np.flipud(mask)
         else:
             display_mask = mask
             
-        # Update overlay
-        # We construct an RGBA image to handle transparency properly where mask is 0
         rgba = np.zeros((nchan, nsamp, 4))
         rgba[..., 2] = 1.0  # Blue
         rgba[..., 3] = display_mask * 0.5  # Alpha
@@ -421,9 +443,93 @@ def main():
         fig.canvas.draw_idle()
 
     s_dm.on_changed(update)
+    s_p0.on_changed(update)
     s_t0.on_changed(update)
     s_width.on_changed(update)
+    if s_iwidth:
+        s_iwidth.on_changed(update)
+    if s_it0:
+        s_it0.on_changed(update)
     
+    # --- Keyboard Navigation ---
+    current_block_idx = args.block
+
+    def change_block(step):
+        nonlocal current_block_idx, data, info
+        
+        # Calculate phase continuity to keep pulse position consistent
+        current_period = s_p0.val
+        current_t0_local = s_t0.val
+        old_start_time = float(info.get('start_time_s', 0.0))
+        abs_t0_ref = old_start_time + current_t0_local
+        
+        abs_it0_ref = None
+        if s_it0:
+            abs_it0_ref = old_start_time + s_it0.val
+
+        new_idx = current_block_idx + step
+        if new_idx < 0:
+            print("Already at the start.")
+            return
+
+        print(f"Loading block {new_idx}...")
+        try:
+            new_data, new_info = load_fits_data(args.fits_file, new_idx, args.numtoread)
+        except Exception as e:
+            print(f"Could not load block {new_idx} (maybe end of file?): {e}")
+            return
+            
+        current_block_idx = new_idx
+        data = new_data
+        info = new_info
+        
+        # Update display image
+        if freqs[0] > freqs[-1]:
+            display_img = data
+        else:
+            display_img = np.flipud(data)
+            
+        img_handle.set_data(display_img)
+        
+        # Update contrast
+        mean_v = float(np.mean(display_img))
+        std_v = float(np.std(display_img))
+        img_handle.set_clim(mean_v - 5*std_v, mean_v + 5*std_v)
+
+        # Update Extent (time axis might change if block size varies)
+        nsamp_new = new_data.shape[1]
+        new_start_time = float(info.get('start_time_s', 0.0))
+        new_extent = (new_start_time, new_start_time + nsamp_new*info['tbin'], float(display_freqs[-1]), float(display_freqs[0]))
+        img_handle.set_extent(new_extent)
+        if mask_overlay is not None:
+            mask_overlay.set_extent(new_extent)
+
+        # Update Title
+        duration_s = nsamp_new * info['tbin']
+        ax.set_title(
+            f"{fits_basename} (Block {current_block_idx})\n"
+            f"nsamp={nsamp_new}, T={duration_s:.6f} s, tbin={info['tbin']:.6e} s",
+            fontsize=9,
+        )
+        
+        # Calculate new local T0 and update slider (triggers mask update)
+        new_start_time = float(info.get('start_time_s', 0.0))
+        new_t0_local = (abs_t0_ref - new_start_time) % current_period
+        s_t0.set_val(new_t0_local)
+        
+        if s_it0 and abs_it0_ref is not None:
+             new_it0_local = (abs_it0_ref - new_start_time) % current_period
+             s_it0.set_val(new_it0_local)
+
+    def on_key_press(event):
+        if event.key == 'right':
+            change_block(args.numtoread)
+        elif event.key == 'left':
+            change_block(-args.numtoread)
+    
+    fig.canvas.mpl_connect('key_press_event', on_key_press)
+    print("Tip: Use Left/Right arrow keys to navigate between blocks.")
+
     # Initial update
     update(None)
 

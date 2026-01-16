@@ -1,38 +1,33 @@
-# Server specification:
-# CPU: AMD EPYC 7742 64-Core Processor
-# Architecture:          x86_64
-# CPU op-mode(s):        32-bit, 64-bit
-# CPU(s):                128
-# Thread(s) per core:    1
-# Model name:            AMD EPYC 7742 64-Core Processor
-# CPU MHz:               2000.000
-# CPU max MHz:           2250.0000
-# CPU min MHz:           1500.0000
-# BogoMIPS:              4491.57
-# Virtualization:        AMD-V
-# L1d cache:             32K
-# L1i cache:             32K
-# L2 cache:              512K
-# L3 cache:              16384K
-# GPU:
-# +-----------------------------------------------------------------------------+
-# | NVIDIA-SMI 440.95.01    Driver Version: 440.95.01    CUDA Version: 10.2     |
-# |-------------------------------+----------------------+----------------------+
-# | GPU  Name        Persistence-M| Bus-Id        Disp.A | Volatile Uncorr. ECC |
-# | Fan  Temp  Perf  Pwr:Usage/Cap|         Memory-Usage | GPU-Util  Compute M. |
-# |===============================+======================+======================|
-# |   0  Tesla V100S-PCI...  Off  | 00000000:41:00.0 Off |                    0 |
-# | N/A   36C    P0    38W / 250W |    317MiB / 32510MiB |      0%      Default |
-# +-------------------------------+----------------------+----------------------+
-# |   1  Tesla V100S-PCI...  Off  | 00000000:A1:00.0 Off |                    0 |
-# | N/A   34C    P0    35W / 250W |    317MiB / 32510MiB |      0%      Default |
-# +-------------------------------+----------------------+----------------------+
 import cv2
+# 优化点 1: 禁用 OpenCV 的内部多线程，防止在多进程环境下线程数溢出
+cv2.setNumThreads(0)
 import os, re
+
+# 彻底限制底层库的线程数，防止 DDP 模式下线程爆炸导致 "Resource temporarily unavailable"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
 import fitsio
 import numpy as np
-import sys
+import gc  # 导入垃圾回收
 from typing import Any, cast, Optional, List
+
+
+import sys
+
+# 避免 cudagraph 池相关错误
+os.environ['NO_ALBUMENTATIONS_UPDATE'] = '1'  # 这行必须在导入albumentations之前
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128" # 缓解显存碎片化
+os.environ['SMP_HUB_MODE'] = "original"
+os.environ["TORCHINDUCTOR_USE_CUDA_GRAPH"] = "0" 
+os.environ["TORCHINDUCTOR_CUDAGRAPHS"] = "0"
+os.environ["TORCHINDUCTOR_USE_CUDAGRAPHS"] = "0"
+os.environ["TORCH_CUDAGRAPHS"] = "0"
+
 import albumentations as albu
 import torch
 import torch.multiprocessing as mp
@@ -46,24 +41,7 @@ hf_logging.set_verbosity_error()  # 隐藏无关告警
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
 
-
-cv2.setNumThreads(0)
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
-os.environ['NO_ALBUMENTATIONS_UPDATE'] = '1'  # 这行必须在导入albumentations之前
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128" # 缓解显存碎片化
-os.environ['SMP_HUB_MODE'] = "original"
-os.environ["TORCHINDUCTOR_USE_CUDA_GRAPH"] = "0" 
-os.environ["TORCHINDUCTOR_CUDAGRAPHS"] = "0"
-os.environ["TORCHINDUCTOR_USE_CUDAGRAPHS"] = "0"
-os.environ["TORCH_CUDAGRAPHS"] = "0"
-
-
-
+#确保禁用 Inductor 的 CUDA Graphs
 try:
     import torch._inductor.config as inductor_config
     if hasattr(inductor_config, "triton") and hasattr(inductor_config.triton, "cudagraphs"):
@@ -982,9 +960,12 @@ if __name__ == "__main__":
     # 设置示例输入数组以便 TensorBoard 记录计算图
     model.example_input_array = torch.randn(1, 1, 512, 512)
     
+    # Get project root (one level up from src/)
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    
     callbacks = [
         ModelCheckpoint(
-            dirpath='checkpoints/train',
+            dirpath=os.path.join(project_root, 'checkpoints', 'train'),
             filename='best_model-{epoch:02d}-fgF1_{val_fg_macro_f1:.4f}',
             monitor='val_fg_macro_f1',
             mode='max',
@@ -1004,7 +985,7 @@ if __name__ == "__main__":
     # 配置 TensorBoard 日志记录器
     from pytorch_lightning.loggers import TensorBoardLogger
     logger = TensorBoardLogger(
-        save_dir='training_logs',  # 写到项目根的 training_logs 目录
+        save_dir=os.path.join(project_root, 'training_logs'),  # 写到项目根的 training_logs 目录
         name='',                  # 取消额外的子目录（不再创建 'unetpp_training' 层）
         version=None,  # 自动递增版本号
         log_graph=False,  # 关闭图记录，避免与 torch.compile/FX 冲突
@@ -1076,3 +1057,4 @@ if __name__ == "__main__":
     print("=" * 60)
     print("🎉 训练完成！模型已保存至checkpoints")
 
+# 需要减少内存和CPU侧的占用，尽量利用GPU

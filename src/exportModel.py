@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-Export Lightning SegFormer model to ONNX and optionally TensorRT.
+Export Lightning UNet model to ONNX and TensorRT.
 
 Features:
 - Load model from Lightning .ckpt.
-- Export with two outputs: logits and probs (after Softmax).
-- Default dynamic axes (batch, height, width).
-- Default opset 17.
-- Optional TensorRT engine build.
+- Export with two outputs: 'logits' and 'probs' (after Softmax).
+- Supports dynamic axes (batch, height, width) by default.
+- Default opset 11 for broad compatibility.
+- Automatic TensorRT engine build from the exported ONNX.
 
 Usage:
-python src/export_onnx.py \
-  --checkpoint checkpoints/best_model.ckpt \
-  --output model.engine \
-  --height 512 --width 512 --batch 1 \
+python src/exportModel.py \
+  --checkpoint path/to/checkpoint/checkpointxx.ckpt \
+  --output checkpoints/tensorrt/model.engine \
+  --batch 1 --height 512 --width 512 \
   --fp16
 """
 import argparse
@@ -135,7 +135,11 @@ def build_tensorrt_engine(onnx_path, engine_path, fp16=True, input_shape=(1, 1, 
 def main():
     parser = argparse.ArgumentParser(description="Export Lightning SegFormer model to ONNX/TensorRT")
     parser.add_argument('--checkpoint', required=True, help='Path to Lightning .ckpt file')
-    default_output = os.path.join('checkpoints', 'tensorrt', 'model.engine')
+    
+    # Get project root (one level up from src/)
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    default_output = os.path.join(project_root, 'checkpoints', 'tensorrt', 'model.engine')
+    
     parser.add_argument('--output', required=False, default=default_output, help=f'Output TensorRT engine path (default: {default_output}). ONNX will be saved with same basename.')
     parser.add_argument('--opset', type=int, default=11, help='ONNX opset version (default: 11 for compatibility)')
     parser.add_argument('--batch', type=int, default=1, help='Example batch size')

@@ -33,6 +33,114 @@
 #define PI 3.14159265358979323846
 #endif
 
+/* -------------------------------------------------------------------------
+ * Pulse-mask generation (Python parity with src/experiment_pulse_mask.py)
+ *
+ * Coordinate convention (matches the latest Python script):
+ * - Time axis for mask generation is *window-local*, i.e. t=0 corresponds to
+ *   the start of the currently displayed/processed block.
+ * - `t0_local` is the arrival time (seconds) of the first pulse at the highest
+ *   frequency within this window.
+ * - Mask is written in channel-major layout: mask[ch*nsamp + t].
+ *
+ * Threading:
+ * - This function does not allocate memory and touches only the output buffer
+ *   provided by caller, so it is safe to call from an OpenMP parallel loop as
+ *   long as each thread uses a distinct mask buffer slice.
+ * ------------------------------------------------------------------------- */
+
+static inline float dispersion_delay_sec(float f_mhz, float f_ref_mhz, float dm)
+{
+    /* dt = 4.148808e3 * DM * (f^-2 - f_ref^-2)  (seconds), same constant as Python */
+    const float k_dm = 4.148808e3f;
+    if (f_mhz < 1e-6f) f_mhz = 1e-6f;
+    if (f_ref_mhz < 1e-6f) f_ref_mhz = 1e-6f;
+    return k_dm * dm * (1.0f / (f_mhz * f_mhz) - 1.0f / (f_ref_mhz * f_ref_mhz));
+}
+
+void identPulse(
+    int hasPulse,
+    float DM,
+    float P0,
+    float width,
+    float T0_local,
+    float lo_freq,
+    float hi_freq,
+    const float *freqs_mhz,
+    int nchan,
+    float tbin_s,
+    int nsamp,
+    bool *pulseMask
+)
+{
+    if (!hasPulse) return;
+    if (!pulseMask || !freqs_mhz) return;
+    if (nchan <= 0 || nsamp <= 0) return;
+    if (tbin_s <= 0.0f) return;
+    if (P0 <= 0.0f) return;
+    if (width <= 0.0f) width = tbin_s; /* at least 1 sample after rounding */
+
+    /* Reference frequency = max(freqs) (highest frequency arrives first) */
+    float f_ref = freqs_mhz[0];
+    for (int c = 1; c < nchan; ++c) {
+        if (freqs_mhz[c] > f_ref) f_ref = freqs_mhz[c];
+    }
+
+    /* Compute per-channel delays and find max delay for k-range bounds */
+    float max_delay = 0.0f;
+    /* We avoid heap allocations; delay computed on-the-fly in channel loop. */
+    for (int c = 0; c < nchan; ++c) {
+        float d = dispersion_delay_sec(freqs_mhz[c], f_ref, DM);
+        if (d > max_delay) max_delay = d;
+    }
+
+    int width_samp = (int)floorf(width / tbin_s);
+    if (width_samp < 1) width_samp = 1;
+
+    const float duration_sec = (float)nsamp * tbin_s;
+
+    /* Match Python bounds:
+       k_min = floor((-max_delay - t0)/P)
+       k_max = ceil((duration - t0)/P)
+       iterate k in [k_min, k_max+1]
+     */
+    const int k_min = (int)floorf(((-max_delay) - T0_local) / P0);
+    const int k_max = (int)ceilf(((duration_sec) - T0_local) / P0);
+
+    /* Debug output for first call */
+    static int debug_printed = 0;
+    if (!debug_printed) {
+        printf("[identPulse info] DM=%.2f P0=%.4f Width=%.4f T0=%.4f Clamp=[%.1f, %.1f] MHz\n", 
+               DM, P0, width, T0_local, lo_freq, hi_freq);
+        printf("[identPulse info] f_ref=%.2f MHz, max_delay=%.4fs, tbin=%.2e s\n", f_ref, max_delay, tbin_s);
+        printf("[identPulse info] nsamp=%d width_samp=%d duration=%.4fs\n", nsamp, width_samp, duration_sec);
+        printf("[identPulse info] k_min=%d k_max=%d\n", k_min, k_max);
+        debug_printed = 1;
+    }
+
+    for (int k = k_min; k <= (k_max + 1); ++k) {
+        const float pulse_arrival_t0 = T0_local + (float)k * P0;
+
+        for (int c = 0; c < nchan; ++c) {
+            /* Clamp frequency range */
+            if (freqs_mhz[c] < lo_freq || freqs_mhz[c] > hi_freq) continue;
+
+            const float delay = dispersion_delay_sec(freqs_mhz[c], f_ref, DM);
+            const float t_start = (pulse_arrival_t0 + delay) / tbin_s;
+            const int center_samp = (int)floorf(t_start);
+
+            int s0 = center_samp - (width_samp / 2);
+            int s1 = s0 + width_samp;
+            if (s0 < 0) s0 = 0;
+            if (s1 > nsamp) s1 = nsamp;
+
+            for (int s = s0; s < s1; ++s) {
+                pulseMask[(size_t)c * (size_t)nsamp + (size_t)s] = true;
+            }
+        }
+    }
+}
+
 int eraseIsolatedPixels(bool *restrict mask, int width, int height, int N)
 {
     if (!mask || width <= 0 || height <= 0) {
@@ -253,10 +361,7 @@ int gaussian_residual_f_fixed_amp(const gsl_vector *params, void *data, gsl_vect
     }
     
      int i;
-     /* Prepare channel_stds buffers here so we can free them at function end
-         without conditional redeclaration in branches. */
-     float *channel_stds = NULL;
-     float *channel_stds_temp = NULL;
+     /* (Variables channel_stds/channel_stds_temp unused and removed) */
     for (i = 0; i < n; i++) {
         double xi = x[i];
         double yi = y[i];
@@ -845,7 +950,7 @@ void outChanSubstitution(float *data, const int *channelMask, const int *pointMa
 /// @param mask Mask array indicating which elements are masked (1 for masked, 0 for good).
 /// @param goodSamps Pre-allocated array of size `size` to hold indices of unmasked elements.
 /// @param randIdx Pre-allocated array of size `size` to hold random indices for replacement.
-void substPixels(float *data, int size, int *mask, int *goodSamps, int *randIdx) {
+void substPixels(float *data, int size, bool *mask, int *goodSamps, int *randIdx) {
     int i, goodCnt = 0;
     
     // Collect indices of good samples
@@ -887,13 +992,27 @@ void substPixels2D(float *data, int nsamp, int nchan, int *mask) {
     /* Allocation success is assumed by caller (user accepted risk) */
     int *goodSamps = (int *)malloc((size_t)nsamp * sizeof(int));
     int *randIdx = (int *)malloc((size_t)nsamp * sizeof(int));
+    bool *tempBoolMask = (bool *)malloc((size_t)nsamp * sizeof(bool)); // Allocate conversion buffer
+    
+    if (!goodSamps || !randIdx || !tempBoolMask) {
+        free(goodSamps); free(randIdx); free(tempBoolMask);
+        return;
+    }
+
     for (int ch = 0; ch < nchan; ++ch) {
         float *chanData = data + (size_t)ch * (size_t)nsamp;
         int *chanMask = mask + (size_t)ch * (size_t)nsamp;
-        substPixels(chanData, nsamp, chanMask, goodSamps, randIdx);
+        
+        // Convert int mask to bool mask for this channel
+        for (int k = 0; k < nsamp; k++) {
+            tempBoolMask[k] = (chanMask[k] != 0);
+        }
+        
+        substPixels(chanData, nsamp, tempBoolMask, goodSamps, randIdx);
     }
     free(goodSamps);
     free(randIdx);
+    free(tempBoolMask);
 }
 
 void binarySIR(
@@ -1023,8 +1142,12 @@ void setFallbackMeanNSigma(float v) {
 /* Global toggles controlled by caller (default disabled) */
 static int g_useIQRM = 0;
 static int g_useCLFD = 0;
+static int g_noBlock = 0;
+static int g_noVertical = 0;
 void setUseIQRM(int v) { g_useIQRM = (v != 0); }
 void setUseCLFD(int v) { g_useCLFD = (v != 0); }
+void setNoBlock(int v) { g_noBlock = (v != 0); }
+void setNoVertical(int v) { g_noVertical = (v != 0); }
 
 /// @brief Flag channels based on their standard deviation statistics using iterative 3-sigma outlier detection
 /// @param data Input data array (nsamp * nchan)
@@ -1498,13 +1621,12 @@ void drawChanStatHist(float *data, int nsamp, int nchan, int plot)
     float curve_step = (plot_max - plot_min) / curve_points;
     
     for (i = 0; i < curve_points; i++) {
-        float x = plot_min + i * curve_step;
-        float y = gaus_with_amplitude(x, main_hist_amplitude, global_fitted_mu, global_fitted_sigma);
-        
+        float x_curve = plot_min + (float)i * curve_step;
+        float y_curve = main_hist_amplitude * expf(-(x_curve - global_fitted_mu) * (x_curve - global_fitted_mu) / (2 * global_fitted_sigma * global_fitted_sigma));
         if (i == 0) {
-            cpgmove(x, y);
+            cpgmove(x_curve, y_curve);
         } else {
-            cpgdraw(x, y);
+            cpgdraw(x_curve, y_curve);
         }
     }
     
@@ -1612,15 +1734,16 @@ void drawChanStatHist(float *data, int nsamp, int nchan, int plot)
             cpgsci(1);
             cpgsls(1);
             
+            float x_zoom, y_zoom;
             float zoom_curve_points = 200;
-            for (i = 0; i < zoom_curve_points; i++) {
-                float x = zoom_min + i * (zoom_max - zoom_min) / (zoom_curve_points - 1);
-                float y = gaus_with_amplitude(x, zoom_hist_amplitude, global_fitted_mu, global_fitted_sigma);
+            for (i = 0; i < (int)zoom_curve_points; i++) {
+                x_zoom = zoom_min + (float)i * (zoom_max - zoom_min) / (zoom_curve_points - 1.0f);
+                y_zoom = gaus_with_amplitude(x_zoom, zoom_hist_amplitude, global_fitted_mu, global_fitted_sigma);
                 
                 if (i == 0) {
-                    cpgmove(x, y);
+                    cpgmove(x_zoom, y_zoom);
                 } else {
-                    cpgdraw(x, y);
+                    cpgdraw(x_zoom, y_zoom);
                 }
             }
             
@@ -1867,7 +1990,7 @@ int cancelHorizontalMaskForPointDominantChannels(
  * @param nchan Number of channels
  * @param pixelsSubstituted Output: number of pixels substituted
  */
-void inChanSubstitution(float *data, int *globalMask, int nsamp, int nchan, int *pixelsSubstituted)
+void inChanSubstitution(float *data, bool *globalMask, int nsamp, int nchan, int *pixelsSubstituted)
 {
     *pixelsSubstituted = 0;
     printf("\n=== Pixel Substitution ===\n");
@@ -1880,7 +2003,7 @@ void inChanSubstitution(float *data, int *globalMask, int nsamp, int nchan, int 
         int channelMaskedCount = 0;
         for (int samp = 0; samp < nsamp; samp++) {
             int idx = samp + i * nsamp;
-            if (globalMask[idx] == 1) {
+            if (globalMask[idx]) {
                 channelMaskedCount++;
             }
         }
@@ -1893,7 +2016,7 @@ void inChanSubstitution(float *data, int *globalMask, int nsamp, int nchan, int 
         
         // Substitute pixels in this channel
         float *channelData = data + i * nsamp;
-        int *channelMask = globalMask + i * nsamp;
+        bool *channelMask = globalMask + i * nsamp;
         
         // Allocate temporary arrays for this channel
         int *goodSamples = (int *)malloc(nsamp * sizeof(int));
@@ -2089,11 +2212,6 @@ void identSubstNSigma(
     printf("=== Performing channel-level outlier detection ===\n");
     double outchan_start = omp_get_wtime();
 
-     /* Allocate channel_stds buffers on-demand and keep pointers in outer scope
-         so we can free them once at the end of this section. */
-     float *channel_stds = NULL;
-     float *channel_stds_temp = NULL;
-
     if (g_useIQRM) {
         // Use IQRM to generate a 2D mask (will allocate a temporary mask which we copy into horizontalMask)
         int *tmp_mask2d = NULL;
@@ -2165,9 +2283,6 @@ void identSubstNSigma(
         printf("Horizontal mask canceled on %d channels due to point-dominated (>30%%) interference.\n",
                canceled_horizontal_channels);
     }
-
-    free(channel_stds);
-    free(channel_stds_temp);
     // Accumulate channel-wise mask into global（注意：在清理 horizontalMask 之后再合并）
     logicalOR(globalMask, horizontalMask, nsamp, nchan);
 
@@ -2187,11 +2302,11 @@ void identSubstNSigma(
     printf("outChannel substitution: replaced %d pixels\n", outChanPixelsSubstituted);
 
     // === (NEW) 5.5 Vertical Stripe Detection ===
-    // Detect broadband vertical stripes via time mean/std peak analysis.
-    // Parameters chosen conservatively; can be externalized later.
-    float vsigma_mean = 4.0f; // N-sigma threshold on time means
-    int   v_min_run   = 1;    // minimum contiguous time samples to accept (1 = single sample)
-    if (nsamp >= 4 && nchan >= 8) { // basic sanity to avoid tiny arrays
+    if (!g_noVertical && nsamp >= 4 && nchan >= 8) { 
+        // Detect broadband vertical stripes via time mean/std peak analysis.
+        // Parameters chosen conservatively; can be externalized later.
+        float vsigma_mean = 4.0f; // N-sigma threshold on time means
+        int   v_min_run   = 1;    // minimum contiguous time samples to accept (1 = single sample)
         // Build exclusion mask: combine point-level and channel-level masks so vertical detection ignores already flagged RFI
         // Allocate a temporary bool array (nsamp*nchan) set true where pixel should be excluded
         // Directly pass pointMask and horizontalMask for exclusion; avoid allocating a combined excludeMask
@@ -2231,12 +2346,16 @@ void identSubstNSigma(
     // === (NEW) 6. Block RFI Detection ===
     // Simple block detection using connected components on pointMask
     // Apply internal dilation (radius=3 iterations=1) to bridge sparse gaps before CCA
-    detectBlockRFI(pointMask, nsamp, nchan, blockMask,
-                   5000, 0.7f,   // min_area, min_density tuned for large radar-like blocks
-                   7, 1);        // dilate radius, iterations (adjust if over-merging)
-    // High priority: directly overwrite globalMask
-    for (int idx = 0; idx < nsamp * nchan; ++idx) {
-        if (blockMask[idx]) globalMask[idx] = true;
+    if (!g_noBlock) {
+        detectBlockRFI(pointMask, nsamp, nchan, blockMask,
+                       5000, 0.7f,   // min_area, min_density tuned for large radar-like blocks
+                       7, 1);        // dilate radius, iterations (adjust if over-merging)
+        // High priority: directly overwrite globalMask
+        for (int idx = 0; idx < nsamp * nchan; ++idx) {
+            if (blockMask[idx]) globalMask[idx] = true;
+        }
+    } else {
+        memset(blockMask, 0, (size_t)nsamp * (size_t)nchan * sizeof(bool));
     }
 
     // === (DISABLED) Periodic point RFI detection ===
@@ -2647,7 +2766,7 @@ void detectBlockRFI(
                 int width = max_c - min_c + 1;
                 int height = max_t - min_t + 1;
                 int bb_area = width * height;
-                float density = (float)pixel_count / bb_area;
+                float density = (float)pixel_count / (float)bb_area;
                 float wh_ratio = (height > 0) ? ((float)width / (float)height) : 0.0f;
                 // New constraint: width/height must be in [1/5, 5]
                 const float RATIO_MIN = 0.2f;

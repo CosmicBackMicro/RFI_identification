@@ -207,8 +207,12 @@ void writeAllMasksPNG(const IdentNSigmaMasks *masks, int nsamp, int nchan,
             for (int i = 0; i < total; i++) if (masks->pointMask[i]) indexMask[i] = classIndex;
         }
         classIndex++;
-        if (masks->blockMask) { // block (highest priority)
+        if (masks->blockMask) { // block (priority 7)
             for (int i = 0; i < total; i++) if (masks->blockMask[i]) indexMask[i] = classIndex;
+        }
+        classIndex++;
+        if (masks->pulseMask) { // pulse (priority 8 - Highest, covers all RFI)
+            for (int i = 0; i < total; i++) if (masks->pulseMask[i]) indexMask[i] = classIndex;
         }
 
         int _n = snprintf(filename, sizeof(filename), "%s%s_block%d.png", datasetPath, sourceName, index);
@@ -245,34 +249,23 @@ void writeAllMasksPNG(const IdentNSigmaMasks *masks, int nsamp, int nchan,
     //     writeIndexMaskPNG(masks->globalMask, nsamp, nchan, filename);
     // }
 
-    // point
-    if (masks->pointMask) {
-        int _n = snprintf(filename, sizeof(filename), "%s%s_block%d_point.png", datasetPath, sourceName, index);
+    // block
+    if (masks->blockMask) {
+        int _n = snprintf(filename, sizeof(filename), "%s%s_block%d_blockRFI.png", datasetPath, sourceName, index);
         if (_n < 0) {
-            fprintf(stderr, "[Error] snprintf failed building point mask filename\n");
+             fprintf(stderr, "[Error] snprintf failed building block mask filename\n");
         } else if ((size_t)_n >= sizeof(filename)) {
-            fprintf(stderr, "[Warn] point mask filename truncated (len=%d, cap=%zu)\n", _n, sizeof(filename));
+             fprintf(stderr, "[Warn] block mask filename truncated (len=%d, cap=%zu)\n", _n, sizeof(filename));
         }
-        writeIndexMaskPNG(masks->pointMask, nsamp, nchan, filename);
+        writeIndexMaskPNG(masks->blockMask, nsamp, nchan, filename);
     }
 
-    // // chanBright
-    // if (masks->chanBrightMask) {
-    //     snprintf(filename, sizeof(filename), "%smask_chanBright_%d.png", datasetPath, index);
-    //     writeIndexMaskPNG(masks->chanBrightMask, nsamp, nchan, filename);
-    // }
-
-    // // chanDark
-    // if (masks->chanDarkMask) {
-    //     snprintf(filename, sizeof(filename), "%smask_chanDark_%d.png", datasetPath, index);
-    //     writeIndexMaskPNG(masks->chanDarkMask, nsamp, nchan, filename);
-    // }
-
-    // // chanComplex
-    // if (masks->chanComplexMask) {
-    //     snprintf(filename, sizeof(filename), "%smask_chanComplex_%d.png", datasetPath, index);
-    //     writeIndexMaskPNG(masks->chanComplexMask, nsamp, nchan, filename);
-    // }
+    // pulse
+    if (masks->pulseMask) {
+        int _n = snprintf(filename, sizeof(filename), "%s%s_block%d_pulse.png", datasetPath, sourceName, index);
+        if (_n < 0) fprintf(stderr, "Error fmt pulse\n"); 
+        writeIndexMaskPNG(masks->pulseMask, nsamp, nchan, filename);
+    }
 }
 
 void allocIdentNSigmaMasks(IdentNSigmaMasks *m, int nsamp, int nchan) {
@@ -281,6 +274,7 @@ void allocIdentNSigmaMasks(IdentNSigmaMasks *m, int nsamp, int nchan) {
     m->verticalMask   = (bool *)calloc(nsamp * nchan, sizeof(bool));
     m->blockMask      = (bool *)calloc(nsamp * nchan, sizeof(bool));  // New: allocate blockMask
     m->periodicMask   = (bool *)calloc(nsamp * nchan, sizeof(bool)); // New: allocate periodicMask
+    m->pulseMask      = (bool *)calloc(nsamp * nchan, sizeof(bool)); // New: allocate pulseMask
     m->globalMask     = (bool *)calloc(nsamp * nchan, sizeof(bool));
     m->pointMask      = (bool *)calloc(nsamp * nchan, sizeof(bool));
     m->chanBrightMask = (bool *)calloc(nsamp * nchan, sizeof(bool));
@@ -294,6 +288,7 @@ void clearIdentNSigmaMasks(IdentNSigmaMasks *m, int nsamp, int nchan) {
     memset(m->verticalMask,      0, sizeof(bool)*nsamp*nchan);
     memset(m->blockMask,         0, sizeof(bool)*nsamp*nchan);  // New: clear blockMask
     memset(m->periodicMask,      0, sizeof(bool)*nsamp*nchan);  // New: clear periodicMask
+    memset(m->pulseMask,         0, sizeof(bool)*nsamp*nchan);  // New: clear pulseMask
     memset(m->globalMask,        0, sizeof(bool)*nsamp*nchan);
     memset(m->pointMask,         0, sizeof(bool)*nsamp*nchan);
     memset(m->chanBrightMask,    0, sizeof(bool)*nsamp*nchan);
@@ -307,6 +302,7 @@ void freeIdentNSigmaMasks(IdentNSigmaMasks *m) {
     free(m->verticalMask);
     free(m->blockMask);  // New: free blockMask
     free(m->periodicMask); // New: free periodicMask
+    free(m->pulseMask);    // New: free pulseMask
     free(m->globalMask);
     free(m->pointMask);
     free(m->chanBrightMask);

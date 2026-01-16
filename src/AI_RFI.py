@@ -1,3 +1,22 @@
+#!/usr/bin/env python3
+"""
+AI RFI Mitigation for PSRFITS Data (Production-grade Inference Pipeline)
+
+This script provides a high-performance, end-to-end solution for radio frequency interference (RFI) 
+mitigation in radio astronomy data. 
+
+Key Features:
+- 3-Stage Pipeline: Asynchronous Reader (CPU) -> Predictor (GPU/TensorRT) -> Writer (CPU) 
+  to maximize hardware utilization and throughput.
+- TensorRT Acceleration: Leverages pre-built TensorRT engines for ultra-fast deep learning inference.
+- Scientific Data Integration: Directly processes and repairs PSRFITS files, handling complex 
+  data structures (subints, poly-phase data, etc.).
+- Robust RFI Cleaning: Includes pixel-level mask generation and statistical-based sampling 
+  to replace RFI-contaminated pixels with clean background estimates.
+
+Usage:
+    python src/AI_RFI.py --fits <path_to_fits> --engine <path_to_trt_engine> --batch 4
+"""
 import fitsio
 import numpy as np
 import os

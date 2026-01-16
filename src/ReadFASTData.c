@@ -1103,6 +1103,9 @@ int main(int argc, char *argv[])
      int *mask_chan2d_all = (int *)malloc(sizeof(int) * (size_t)nchanBinned * (size_t)nsampBinned * (size_t)maxScratchThreads);
      int *mask_CLFD_all    = (int *)malloc(sizeof(int) * (size_t)nchanBinned * (size_t)nsampBinned * (size_t)maxScratchThreads);
 
+     /* Optional pulse mask (per-thread slice) */
+     bool *mask_pulse_all = (bool *)calloc((size_t)nchanBinned * (size_t)nsampBinned * (size_t)maxScratchThreads, sizeof(bool));
+
     // Accumulators for loop timing stats
     double loop_total_time = 0.0;
     double loop_min_time = DBL_MAX;
@@ -1135,6 +1138,8 @@ int main(int argc, char *argv[])
     const float NSigmaOutChan = m.NSigmaOutChan; // configurable via CLI (default 3.0)
     // 配置保底均值检测 σ 倍数（默认 2.0，可由命令行 -F 指定）
     setFallbackMeanNSigma(m.FallbackMeanNSigma);
+    setNoBlock(m.noBlock);
+    setNoVertical(m.noVertical);
     #pragma omp parallel for schedule(static) reduction(+:loop_total_time) reduction(min:loop_min_time) reduction(max:loop_max_time)
     for (ii = 0; ii < numReads; ii++)
     {
@@ -1206,6 +1211,64 @@ int main(int argc, char *argv[])
         if (m.generateMasks)
         {
             clearIdentNSigmaMasks(maskSetPtr, nsampBinned, nchanBinned);
+
+            /* ---------------- Pulse mask (experimental) ----------------
+             * We generate it in window-local coordinates (t=0 at this block start),
+             * consistent with src/experiment_pulse_mask.py.
+             * NOTE: Currently OR into globalMask only (so pulse isn't treated as RFI).
+             */
+            if (m.hasPulse) {
+                /* Calculate block start time to adjust global T0 to block-local time */
+                double block_duration = (double)nsampBinned * (double)m.tbinBinned;
+                double current_block_start_time = (double)ii * block_duration;
+                
+                /* T0_local passed to identPulse needs to be: time of a pulse arrival relative to this block's t=0.
+                   Since m.pulseT0Local is effectively global T0, we subtract current block's start time. */
+                float relativeT0 = m.pulseT0Local - (float)current_block_start_time;
+
+                bool *pulseMask = SLICE_PTR(mask_pulse_all, (size_t)nchanBinned * (size_t)nsampBinned, tid);
+                /* Ensure it's clear for this iteration (since it's a pre-allocated scratch buffer) */
+                memset(pulseMask, 0, (size_t)nchanBinned * (size_t)nsampBinned * sizeof(bool));
+
+                identPulse(
+                    1,
+                    m.pulseDM,
+                    m.pulseP0,
+                    m.pulseWidth,
+                    relativeT0, 
+                    m.pulselofreq,
+                    m.pulsehifreq,
+                    dsFreqArray,
+                    nchanBinned,
+                    m.tbinBinned,
+                    nsampBinned,
+                    pulseMask
+                );
+
+                if (m.interpulse) {
+                    float rel_it0;
+                    if (m.interpulseT0 >= 0.0f) {
+                        rel_it0 = m.interpulseT0 - (float)current_block_start_time;
+                    } else {
+                        rel_it0 = relativeT0 + 0.5f * m.pulseP0;
+                    }
+                    identPulse(
+                        1,
+                        m.pulseDM,
+                        m.pulseP0,
+                        m.interpulseWidth,
+                        rel_it0, 
+                        m.pulselofreq,
+                        m.pulsehifreq,
+                        dsFreqArray,
+                        nchanBinned,
+                        m.tbinBinned,
+                        nsampBinned,
+                        pulseMask
+                    );
+                }
+                // logicalOR(maskSetPtr->globalMask, pulseMask, nsampBinned, nchanBinned); // Moved downstream
+            }
 
             // Plot the unprocessed raw data
             if (doPlotThisIter)
@@ -1318,6 +1381,34 @@ int main(int argc, char *argv[])
                                 vs_time_means, vs_flag_time);
                 double rfi_time = mono_time_sec() - rfi_start; if (rfi_time < 0) rfi_time = 0;
                 printf("RFI detection time: %.4f seconds\n", rfi_time);
+
+                /* Merge pulse mask (if enabled) so it appears in final output. 
+                   Done here because identSubstNSigma clears maskSetPtr masks. */
+                if (m.hasPulse) {
+                   bool *pulseBuf = SLICE_PTR(mask_pulse_all, nchanBinned * nsampBinned, tid);
+                   memcpy(maskSetPtr->pulseMask, pulseBuf, sizeof(bool) * nchanBinned * nsampBinned);
+                   
+                   /* Also OR to globalMask so it blocks "RFI" visually in plots (optional) */
+                   logicalOR(maskSetPtr->globalMask, pulseBuf, nsampBinned, nchanBinned);
+
+                   /* NEW: prioritize Pulse category.
+                    * Any pixel that is marked as a Pulse should NOT be marked as RFI.
+                    * This ensures that on the final merged PNG, the pulse (red) is cleanly visible.
+                    */
+                   size_t total_pix = (size_t)nchanBinned * (size_t)nsampBinned;
+                   for (size_t idx = 0; idx < total_pix; idx++) {
+                       if (pulseBuf[idx]) {
+                           maskSetPtr->horizontalMask[idx] = false;
+                           maskSetPtr->verticalMask[idx] = false;
+                           maskSetPtr->pointMask[idx] = false;
+                           maskSetPtr->chanBrightMask[idx] = false;
+                           maskSetPtr->chanDarkMask[idx] = false;
+                           maskSetPtr->chanComplexMask[idx] = false;
+                           maskSetPtr->blockMask[idx] = false;
+                           maskSetPtr->periodicMask[idx] = false;
+                       }
+                   }
+                }
             }
             if (m.writeMasks)
             {

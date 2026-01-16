@@ -1,5 +1,15 @@
 import cv2
+# 优化点: 禁用 OpenCV 的内部多线程，防止在多进程环境下线程数溢出 (同步自 TrainingOnServer)
+cv2.setNumThreads(0)
 import os, re
+
+# 限制底层库线程数，防止线程爆炸 (同步自 TrainingOnServer)
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
 import fitsio
 import numpy as np
 from typing import Any, cast, Optional, List
@@ -72,7 +82,7 @@ class FocalTverskyLoss(nn.Module):
         gamma: float = 1.333,
         smooth: float = 1e-6,
         reduction: str = 'mean',
-    ignore_index: Optional[int] = None,
+        ignore_index: Optional[int] = None,
         label_smoothing: float = 0.0,
     ) -> None:
         super().__init__()
@@ -90,7 +100,7 @@ class FocalTverskyLoss(nn.Module):
         self,
         y_pred: torch.Tensor,  # (N, C, H, W) 
         y_true: torch.Tensor,  # (N, H, W)
-    class_weights: Optional[torch.Tensor] = None,  # (C,)
+        class_weights: Optional[torch.Tensor] = None,  # (C,)
     ) -> torch.Tensor:
         if y_true.dtype != torch.long:
             y_true = y_true.long()
@@ -318,10 +328,10 @@ class UNetLightningModule(pl.LightningModule):
 
         # 记录每个类别的 FocalTversky loss（按 epoch 汇总）
         try:
-                per_class_ft = self.focal_tversky_perclass(probs, masks, class_weights=self.class_weights)
-                for c, v in enumerate(per_class_ft):
-                    name = self.class_names[c] if c < len(self.class_names) else f"class_{c}"
-                    self.log(f"train_ft_{name}", v, on_step=False, on_epoch=True, prog_bar=False)
+            per_class_ft = self.focal_tversky_perclass(probs, masks, class_weights=self.class_weights)
+            for c, v in enumerate(per_class_ft):
+                name = self.class_names[c] if c < len(self.class_names) else f"class_{c}"
+                self.log(f"train_ft_{name}", v, on_step=False, on_epoch=True, prog_bar=False)
         except Exception:
             pass
 
@@ -472,8 +482,8 @@ class FITSDataset(Dataset):
     """
 
     # 默认类别列表（可被 __main__ 中的 CLASSES 覆盖）
-    # 当前训练投入 5 类（含背景）：bkg, horizontal, vertical, point, block
-    CLASSES = ["bkg", "horizontal", "vertical", "point", "block"]
+    # 当前训练投入 6 类（含背景）：bkg, horizontal, vertical, point, block, pulsar
+    CLASSES = ["bkg", "horizontal", "vertical", "point", "block", "pulsar"]
 
     @staticmethod
     def extract_id(filename):
@@ -513,6 +523,7 @@ class FITSDataset(Dataset):
             2: 2,  # vertical
             6: 3,  # point
             7: 4,  # block
+            8: 5,  # pulsar
         }
         print(f"Using class mapping: {self.class_mapping}")
         
@@ -825,7 +836,7 @@ if __name__ == "__main__":
     # 将与硬件无关的模型/数据超参数放在顶层共享配置（便于与硬件相关参数分离）
     # 这些参数与训练机器（local/server）无关，便于统一修改和版本控制
     ENCODER = "segformer-b2"
-    CLASSES = ["bkg", "horizontal", "vertical", "point", "block"]
+    CLASSES = ["bkg", "horizontal", "vertical", "point", "block", "pulsar"]
     SCHEDULER_TYPE = "cosine_warmup"
     FOCAL_GAMMA = 2.0
     LOSS_ALPHA = 0.7
@@ -834,31 +845,31 @@ if __name__ == "__main__":
 
     # 使用两套硬编码的配置集（`local` / `server`），通过 CONFIG_MODE 切换
     # local: 轻量级开发机配置；server: 高并发、多核、多GPU 训练服务器配置
-    CONFIG_MODE = "server"  # 修改为 'local' 切换到本地开发配置
+    CONFIG_MODE = "local"  # 修改为 'local' 以适配 4060 显卡配置
 
     # 每套配置只包含与硬件/运行相关的参数（不再包含模型结构或损失超参）
     configs = {
         "local": {
-            "LEARNING_RATE": 2e-4,
-            "BATCH_SIZE": 1,
-            "NUM_WORKERS": max(0, min(4, (os.cpu_count() or 4) - 1)),
+            "LEARNING_RATE": 1e-4,
+            "BATCH_SIZE": 4,
+            "NUM_WORKERS": max(0, min(8, (os.cpu_count() or 4) - 1)),
             "MAX_EPOCHS": 50,
             "ACCUMULATE_GRAD_BATCHES": 4,
             "USE_COMPILE": False,
-            "PRECISION": 32,
+            "PRECISION": "16-mixed",
             "DEVICES": 1,
         },
         "server": {
             "LEARNING_RATE": 2e-4,
-            "BATCH_SIZE": 4,
+            "BATCH_SIZE": 16,
             # 为避免把所有 CPU 核心占满，保留 1 个核给系统
-            "NUM_WORKERS": max(1, min(64, (os.cpu_count() or 128) - 2)),
+            "NUM_WORKERS": 2,
             "MAX_EPOCHS": 100,
-            "ACCUMULATE_GRAD_BATCHES": 4,
+            "ACCUMULATE_GRAD_BATCHES": 8,
             # 在老 PyTorch/CUDA 环境上禁用 torch.compile，以免不兼容
             "USE_COMPILE": False,
-            # V100 在 PyTorch 1.12 上通常更稳定使用 fp32 或 fp16（非 bf16）
-            "PRECISION": 32,
+            # V100 在比较稳定的环境下推荐使用 16-mixed
+            "PRECISION": "16-mixed",
             "DEVICES": 1,  # 如果你想使用所有可见 GPU，设置为 torch.cuda.device_count() 或具体数字
         }
     }

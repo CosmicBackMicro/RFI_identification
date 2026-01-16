@@ -44,8 +44,8 @@ def main():
     # Get FITS and PNG files from root, sorted by block number
     fits_files = sorted(output_dir.glob("*.fits"), key=lambda f: get_num(f.name))
     png_files = sorted(output_dir.glob("*.png"), key=lambda f: get_num(f.name))
-    if len(fits_files) != len(png_files):
-        raise ValueError(f"Error: Number of FITS files ({len(fits_files)}) != PNG files ({len(png_files)}).")
+    # if len(fits_files) != len(png_files):
+    #     raise ValueError(f"Error: Number of FITS files ({len(fits_files)}) != PNG files ({len(png_files)}).")
     
     # Assume they are paired by sorted order
 

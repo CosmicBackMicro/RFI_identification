@@ -1388,13 +1388,11 @@ int main(int argc, char *argv[])
                    bool *pulseBuf = SLICE_PTR(mask_pulse_all, nchanBinned * nsampBinned, tid);
                    memcpy(maskSetPtr->pulseMask, pulseBuf, sizeof(bool) * nchanBinned * nsampBinned);
                    
-                   /* Also OR to globalMask so it blocks "RFI" visually in plots (optional) */
+                   /* 也将脉冲或到 globalMask 中，以便在绘图中视觉上阻断 RFI (可选) */
                    logicalOR(maskSetPtr->globalMask, pulseBuf, nsampBinned, nchanBinned);
 
-                   /* NEW: prioritize Pulse category.
-                    * Any pixel that is marked as a Pulse should NOT be marked as RFI.
-                    * This ensures that on the final merged PNG, the pulse (red) is cleanly visible.
-                    */
+                   /* 移除这里的强制优先级逻辑，让 mask.c 中的写入顺序决定最终颜色 */
+                   /* 
                    size_t total_pix = (size_t)nchanBinned * (size_t)nsampBinned;
                    for (size_t idx = 0; idx < total_pix; idx++) {
                        if (pulseBuf[idx]) {
@@ -1408,6 +1406,7 @@ int main(int argc, char *argv[])
                            maskSetPtr->periodicMask[idx] = false;
                        }
                    }
+                   */
                 }
             }
             if (m.writeMasks)

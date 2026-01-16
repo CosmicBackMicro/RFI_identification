@@ -21,8 +21,8 @@ float ksigma_2d(const float *dataT, const int *mask, int nsamp, int nchan,
 void outChanSubstitution(float *data, const int *channelMask, const int *pointMask, int nsamp, int nchan);
 
 // Substitute in-channel outliers using local statistics
-void inChanSubstitution(float *data, int *globalMask, int nsamp, int nchan, int *pixelsSubstituted);
-void substPixels(float *data, int size, int *mask, int *goodSamps, int *randIdx);
+void inChanSubstitution(float *data, bool *globalMask, int nsamp, int nchan, int *pixelsSubstituted);
+void substPixels(float *data, int size, bool *mask, int *goodSamps, int *randIdx);
 // 2D variant: substitute masked pixels per-channel using unmasked samples from same channel
 void substPixels2D(float *data, int nsamp, int nchan, int *mask);
 void binarySIR(int *mask, int nsamp, int nchan, int win_samp, int win_chan, float thrup, float thrdown);
@@ -53,6 +53,7 @@ typedef struct IdentNSigmaMasks {
     bool *chanBrightMask;
     bool *chanDarkMask;
     bool *chanComplexMask;
+    bool *pulseMask;     // New: dedicated pulse mask layer
 } IdentNSigmaMasks;
 
 void identSubstNSigma(
@@ -148,3 +149,24 @@ int cancelHorizontalMaskForPointDominantChannels(
 /* Global toggles for alternative channel-detection algorithms (set from caller) */
 void setUseIQRM(int v);
 void setUseCLFD(int v);
+void setNoBlock(int v);
+void setNoVertical(int v);
+
+/* Pulse mask generation (window-local time coordinates).
+ * Writes a per-pixel boolean mask (channel-major: mask[ch*nsamp + t]).
+ * Safe to call inside OpenMP loops when each thread uses its own pulseMask slice.
+ */
+void identPulse(
+    int hasPulse,
+    float DM,
+    float P0,
+    float width,
+    float T0_local,
+    float lo_freq,
+    float hi_freq,
+    const float *freqs_mhz,
+    int nchan,
+    float tbin_s,
+    int nsamp,
+    bool *pulseMask
+);

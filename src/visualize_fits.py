@@ -10,24 +10,27 @@ import matplotlib
 
 
 def _setup_mpl_backend():
-    """Prefer a Tk backend to avoid mixing Qt (matplotlib) with Tk (file dialog),
-    which can cause freezes on some Linux/remote/X11 setups. Fallback to Agg if Tk is unavailable.
-    You can override by setting environment variable DERFI_MPL_BACKEND.
-    """
+    """彻底解决显示连接问题：优先尝试交互式后端，若环境不支持则自动降级为非交互式后端。"""
     env_backend = os.environ.get("DERFI_MPL_BACKEND")
     if env_backend:
         try:
             matplotlib.use(env_backend, force=True)
             return
         except Exception:
-            pass  # fall through to auto selection
-    # Try TkAgg first
+            pass
+
+    # 尝试 TkAgg 并验证是否真能连接到 Display
     try:
-        import tkinter  # noqa: F401
+        import tkinter
+        # 尝试创建一个极小的 Tk 根窗口来测试 Display 连接
+        test_root = tkinter.Tk()
+        test_root.withdraw() # 隐藏测试窗口
+        test_root.destroy()  # 销毁测试窗口
         matplotlib.use("TkAgg", force=True)
         return
     except Exception:
-        # Headless or Tk unavailable -> safe non-interactive backend
+        # 如果报错（如 couldn't connect to display），则静默降级到 Agg
+        print("⚠️  Warning: No graphical display detected. Falling back to 'Agg' backend (saving to file only).")
         matplotlib.use("Agg", force=True)
 
 
@@ -979,8 +982,19 @@ def test_load_fits_image(input_source, mode='dir', verbose: bool=False, mask_dir
 
     fig.canvas.mpl_connect('key_press_event', on_key)
     show(0)
-    fig.canvas.draw(); plt.pause(0.001)
-    plt.show()
+
+    # 彻底解决：根据后端类型决定是弹窗还是保存预览图
+    if matplotlib.get_backend().lower() == 'agg':
+        preview_path = "output/visualize_preview.png"
+        os.makedirs("output", exist_ok=True)
+        fig.savefig(preview_path)
+        print(f"\n📸 [Headless Mode] Initial frame saved to: {os.path.abspath(preview_path)}")
+        print("   (Tip: In VS Code, Ctrl+Click the path above to view the image)")
+        plt.close(fig)
+    else:
+        fig.canvas.draw()
+        plt.pause(0.001)
+        plt.show()
 
 def _choose_file_via_gui(initial_dir=None, title="Select PSRFITS file"):
     """Try to open a file picker dialog using Tkinter. Returns path or None."""

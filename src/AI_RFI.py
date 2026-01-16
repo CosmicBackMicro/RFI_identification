@@ -138,22 +138,40 @@ def replace_masked_pixels(data: np.ndarray, mask: np.ndarray) -> np.ndarray:
     C, T = data.shape
     cleaned = data.copy()
     
+    # Class definitions: 0:bkg, 1:horizontal(chan), 2:vertical, 3:point, 4:block, 5:pulsar
+    # Priority: Horizontal RFI > Vertical/Point/Block RFI > Pulsar. 
+    # Overlapping regions should be treated as RFI to avoid false positives in pulse search.
+    PULSAR_LABEL, CHAN_LABEL = 5, 1
+    
     clean_mask = (mask == 0)
+    
     clean_counts = np.sum(clean_mask, axis=1)
     rows_to_fix = np.where((clean_counts > 0) & (clean_counts > 0.05 * T))[0]
     
     for c in rows_to_fix:
-        m_idx = mask[c] > 0
+        row_m = mask[c]
+        # 如果该通道包含了横向(chan)干扰，则该行内所有非背景像素（包括识别为 pulsar 的）均进行替换。
+        # 这是为了从根本上消除可能残留在脉冲特征中的 RFI。
+        if np.any(row_m == CHAN_LABEL):
+            m_idx = (row_m > 0)
+        else:
+            # 否则（如只有点状或块状干扰），默认依然保护 pulsar 区域以保留信号。
+            # 但如果这些干扰与脉冲重叠，在训练阶段通过调换优先级已经将其打上了 RFI 标签，
+            # 因此这里 row_m 会直接被识别为 RFI 类别而不受保护。
+            m_idx = (row_m > 0) & (row_m != PULSAR_LABEL)
+
         if not np.any(m_idx): continue
         bg_data = data[c, clean_mask[c]]
         cleaned[c, m_idx] = bg_data[np.random.randint(0, bg_data.size, np.count_nonzero(m_idx))]
 
-    still_masked = (mask > 0) & (np.abs(cleaned - data) < 1e-7)
+    # 第二遍（时间维度/列）：补漏，逻辑保持一致（排除 pulsar 以免二次误伤）
+    to_fix_mask = (mask > 0) & (mask != PULSAR_LABEL)
+    still_to_fix = to_fix_mask & (np.abs(cleaned - data) < 1e-7)
     clean_counts_col = np.sum(clean_mask, axis=0)
     cols_to_fix = np.where(clean_counts_col > 0)[0]
     
     for t in cols_to_fix:
-        col_m_mask = still_masked[:, t]
+        col_m_mask = still_to_fix[:, t]
         if not np.any(col_m_mask): continue
         bg_data = data[clean_mask[:, t], t]
         cleaned[col_m_mask, t] = bg_data[np.random.randint(0, bg_data.size, np.count_nonzero(col_m_mask))]

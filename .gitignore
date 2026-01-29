@@ -60,3 +60,6 @@ core
 # Environment variables
 .env
 .env.local
+
+# Sim data
+simulation/

@@ -4,6 +4,7 @@ Simple FITS file visualization script - directly displays the output of the load
 """
 
 import os
+import sys
 import numpy as np
 import fitsio
 import matplotlib
@@ -248,6 +249,9 @@ def test_load_fits_image(input_source, mode='dir', verbose: bool=False, mask_dir
             
         print(f"Opened Large FITS: {input_source}")
         print(f"Total Subints (Rows): {n_rows}, Blocks per read: {blocksperread}")
+
+        # Store for later use (e.g., mask stitching)
+        data_provider['psrfits_n_rows'] = int(n_rows)
         
         data_provider['count'] = (n_rows + blocksperread - 1) // blocksperread
         data_provider['get_name'] = lambda i: f"Rows {i*blocksperread} to {min((i+1)*blocksperread-1, n_rows-1)}"
@@ -289,21 +293,32 @@ def test_load_fits_image(input_source, mode='dir', verbose: bool=False, mask_dir
                 mask_map[bn] = p
             print(f"[Info] Found {len(mask_map)} mask PNG(s) in: {mask_dir}")
 
+    # In PSRFITS mode, AI_RFI writes masks as: <fits_basename>_sub{row_idx}.png
+    # Capture basename/row count once so we can match correctly.
+    psrfits_bn = None
+    psrfits_n_rows = 0
+    if mode == 'file':
+        psrfits_bn = os.path.splitext(os.path.basename(input_source))[0]
+        try:
+            psrfits_n_rows = int(data_provider.get('psrfits_n_rows', 0))
+        except Exception:
+            psrfits_n_rows = 0
+
     # Class names and color mapping (for legend and rendering), can be adjusted as needed
     # Convention: 0=background, 1=horizontal, 2=vertical, 6=point, 7=block, 8=pulse
     class_names = {
-        1: 'horizontal',
-        2: 'vertical',
-        6: 'point',
-        7: 'block',
-        8: 'pulse',
+        1: 'Horizontal',
+        2: 'Vertical',
+        6: 'Point',
+        7: 'Block',
+        8: 'Pulsar',
     }
     class_color_map = {
         1: (0.0, 1.0, 1.0),   # horizontal -> cyan
         2: (1.0, 0.0, 1.0),   # vertical -> magenta
         6: (0.0, 0.0, 1.0),   # point -> blue
         7: (1.0, 1.0, 0.0),   # block -> yellow
-        8: (1.0, 0.0, 0.0),   # pulse -> red
+        8: (1.0, 0.0, 0.0),   # pulsar -> red
     }
 
     # Create figure and axes with expanded layout adding two sigma panels:
@@ -313,7 +328,8 @@ def test_load_fits_image(input_source, mode='dir', verbose: bool=False, mask_dir
     #  - colorbar panel: narrow colorbar
     #  - right panel: frequency sigma profile (std over time)
     #  - bottom panel: time sigma profile (std over frequency)
-    fig = plt.figure(figsize=(13, 9))
+    # fig = plt.figure(figsize=(13, 9))
+    fig = plt.figure(figsize=(10, 7))
     from matplotlib.gridspec import GridSpec
     gs = GridSpec(
         3, 5,
@@ -493,19 +509,48 @@ def test_load_fits_image(input_source, mode='dir', verbose: bool=False, mask_dir
         x_left = (block_idx * nsamp) * tbin
         x_right = x_left + nsamp * tbin
         y_bottom, y_top = 0, nchan
+        
+        # Apply extent to BOTH data and mask layers to ensure alignment
+        extent = (x_left, x_right, y_bottom, y_top)
         try:
-            image_display.set_extent((x_left, x_right, y_bottom, y_top))
+            image_display.set_extent(extent)
+            mask_display.set_extent(extent)
             ax_main.set_xlim(x_left, x_right)
             ax_main.set_ylim(y_bottom, y_top)
         except Exception:
             pass
 
-        # If mask overlay enabled, try to overlay corresponding PNG by block index
+        # If mask overlay enabled, try to overlay corresponding PNG
         if mask_dir:
-            # Derive basename from FITS filename and look for exact basename match in mask_map
-            fits_bn = os.path.splitext(os.path.basename(path))[0]
+            # In directory mode, path is a real FITS file; in PSRFITS mode, path is virtual (row_*)
+            fits_bn = os.path.splitext(os.path.basename(path))[0] if mode == 'dir' else (psrfits_bn or str(path))
             overlay = None
-            candidate_path = mask_map.get(fits_bn)
+            candidate_path = None
+
+            if mode == 'file':
+                # Match naming: <base>_sub{idx} or <base>_block{idx}
+                # - blocksperread==1: idx == current subint (== index)
+                # - blocksperread>1 : current frame covers rows [start..end]
+                start_row = index * blocksperread
+                candidate_path = mask_map.get(f"{fits_bn}_sub{start_row}")
+                if candidate_path is None:
+                    candidate_path = mask_map.get(f"{fits_bn}_block{start_row}")
+
+                # Fallback to RFISimulator naming: mask_{idx}
+                if candidate_path is None:
+                    for fmt in (f"mask_{start_row}", f"sub{start_row}", f"block{start_row}", str(start_row)):
+                        if fmt in mask_map:
+                            candidate_path = mask_map[fmt]
+                            break
+
+                if candidate_path is None and blocksperread > 1:
+                    # If user produced merged masks with a range suffix, try it as well
+                    end_row = min((index + 1) * blocksperread - 1, (start_row + blocksperread - 1))
+                    candidate_path = mask_map.get(f"{fits_bn}_sub{start_row}-{end_row}")
+            else:
+                # Directory mode: exact basename match
+                candidate_path = mask_map.get(fits_bn)
+
             # If no exact match, try a couple of common variants (suffixes/prefixes)
             if candidate_path is None:
                 # try with common suffixes
@@ -521,34 +566,83 @@ def test_load_fits_image(input_source, mode='dir', verbose: bool=False, mask_dir
                         break
             if candidate_path:
                 try:
-                    # Read class-index mask preserving integer labels
+                    def _read_mask_png(png_path: str):
+                        """Read a mask PNG and return a 2D uint8 array of class ids."""
+                        mask_idx_local = None
+                        try:
+                            from PIL import Image as _PIL_Image
+                            _im = _PIL_Image.open(png_path)
+                            if _im.mode == 'P':
+                                mask_idx_local = np.array(_im, dtype=np.uint16)
+                            elif _im.mode in ('L',):
+                                mask_idx_local = np.array(_im, dtype=np.uint8)
+                            elif _im.mode.startswith('I'):
+                                mask_idx_local = np.array(_im, dtype=np.int32)
+                            else:
+                                mask_idx_local = np.array(_im.convert('L'), dtype=np.uint8)
+                        except Exception:
+                            import matplotlib.image as mpimg
+                            mask_img = mpimg.imread(png_path)
+                            if mask_img.ndim == 2:
+                                mask_idx_local = (mask_img * 255.0 + 0.5).astype(np.uint8)
+                            elif mask_img.ndim == 3:
+                                mask_idx_local = (mask_img[..., 0] * 255.0 + 0.5).astype(np.uint8)
+
+                        if mask_idx_local is None:
+                            return None
+                        if mask_idx_local.ndim != 2:
+                            return None
+
+                        # Backward compatibility (old AI_RFI saved id*255)
+                        try:
+                            # If all non-zero values are 255, it's likely a binary mask that should be class 1
+                            # If they are multiples of some value, or just very large, we check the range.
+                            mx = int(np.max(mask_idx_local))
+                            if mx == 255:
+                                # Special case: if it's 255, it might be a binary mask (class 1) or scaled class IDs.
+                                # Check if there are values other than 0 and 255.
+                                unique_vals = np.unique(mask_idx_local)
+                                if len(unique_vals) == 2 and 0 in unique_vals and 255 in unique_vals:
+                                    # Binary mask, map 255 to 1
+                                    mask_idx_local = (mask_idx_local // 255).astype(np.uint8, copy=False)
+                                elif mx > 20: 
+                                    # Scaled IDs? Try to recover.
+                                    mask_idx_local = (mask_idx_local // 255).astype(np.uint8, copy=False)
+                        except Exception:
+                            pass
+
+                        return mask_idx_local.astype(np.uint8, copy=False)
+
+                    # Read + (if needed) stitch masks for PSRFITS blocksperread>1
                     mask_idx = None
-                    try:
-                        from PIL import Image as _PIL_Image
-                        _im = _PIL_Image.open(candidate_path)
-                        # Preserve palette indices if present; else convert to 8-bit or 32-bit integer
-                        if _im.mode == 'P':
-                            mask_idx = np.array(_im, dtype=np.uint16)
-                        elif _im.mode in ('L',):
-                            mask_idx = np.array(_im, dtype=np.uint8)
-                        elif _im.mode.startswith('I'):
-                            mask_idx = np.array(_im, dtype=np.int32)
-                        else:
-                            # Fallback: convert to 'L' (8-bit) which holds label indices up to 255
-                            mask_idx = np.array(_im.convert('L'), dtype=np.uint8)
-                    except Exception:
-                        # Fallback to matplotlib if PIL unavailable; will likely return floats in [0,1]
-                        import matplotlib.image as mpimg
-                        mask_img = mpimg.imread(candidate_path)
-                        if mask_img.ndim == 2:
-                            mask_idx = (mask_img * 255.0 + 0.5).astype(np.uint8)
-                        elif mask_img.ndim == 3:
-                            mask_idx = (mask_img[..., 0] * 255.0 + 0.5).astype(np.uint8)
-                        else:
-                            mask_idx = None
+                    if mode == 'file' and blocksperread > 1:
+                        start_row = index * blocksperread
+                        # Cap by total row count if known
+                        nrows_cap = psrfits_n_rows if isinstance(psrfits_n_rows, int) and psrfits_n_rows > 0 else (start_row + blocksperread)
+                        end_row = min(start_row + blocksperread - 1, nrows_cap - 1)
+                        pieces = []
+                        for r in range(start_row, end_row + 1):
+                            p = mask_map.get(f"{fits_bn}_sub{r}")
+                            if not p:
+                                if verbose:
+                                    print(f"[Info] Missing mask for subint {r}: expected key {fits_bn}_sub{r}")
+                                pieces = []
+                                break
+                            mi = _read_mask_png(p)
+                            if mi is None:
+                                pieces = []
+                                break
+                            pieces.append(mi)
+                        if pieces:
+                            # Expect each piece is (nchan, nsamp_single); stitch along time axis
+                            mask_idx = np.concatenate(pieces, axis=1)
+                    else:
+                        mask_idx = _read_mask_png(candidate_path)
 
                     if mask_idx is not None and mask_idx.ndim == 2:
                         # Try to match orientation to displayed image (nchan x nsamp)
+                        # Note: image is already np.flipud(data.T) which puts chan 0 at the bottom.
+                        # Now our mask PNGs (from both C-core and Simulator) also put chan 0 at the bottom.
                         mh, mw = mask_idx.shape
                         ih, iw = image.shape
                         if (mh, mw) == (ih, iw):
@@ -556,19 +650,11 @@ def test_load_fits_image(input_source, mode='dir', verbose: bool=False, mask_dir
                         elif (mh, mw) == (iw, ih):
                             mask_aligned = mask_idx.T
                         else:
-                            # Shapes differ; cannot safely rescale without extra deps; disable overlay for this frame
                             print(f"[Warn] Mask shape {mh}x{mw} mismatches image {ih}x{iw}; skip overlay for {block_idx}")
                             mask_aligned = None
 
                         if mask_aligned is not None:
-                            # Build categorical color overlay: 0=background (transparent), >0 are classes
                             rgba = np.zeros((ih, iw, 4), dtype=float)
-                            # A small color palette for classes 1..N (cycled)
-                            # Prefer GB-dominant, low-R colors to contrast gi st_heat (red-toned)
-                            # Explicit color mapping for known classes to improve visibility:
-                            # class index mapping expected: 0=background, 1=horizontal, 2=vertical, 3=point, 4=block
-                            # Desired colors: point=blue, vertical=magenta, horizontal=orange, block=green
-                            # Prefer the shared class_color_map defined above; fallback to local map
                             try:
                                 color_map = class_color_map
                             except Exception:
@@ -578,7 +664,6 @@ def test_load_fits_image(input_source, mode='dir', verbose: bool=False, mask_dir
                                     3: np.array([0.0, 0.0, 1.0]),
                                     4: np.array([0.0, 1.0, 0.0]),
                                 }
-                            # Fallback palette for any other unexpected class ids
                             palette = np.array([
                                 [0.5, 0.5, 0.5],
                                 [0.0, 1.0, 1.0],
@@ -1115,17 +1200,29 @@ if __name__ == "__main__":
 
     # Handle Mask
     mask_dir = None
-    if mode == 'dir' and not args.no_mask:
+    # argparse default can't distinguish: "user didn't pass --mask" vs "user passed --mask".
+    # We use argv presence to control behavior:
+    # - PSRFITS mode: default OFF unless user explicitly passes --mask
+    # - Directory mode: keep previous default ON (ask user if needed)
+    argv_has_mask = ('--mask' in sys.argv)
+
+    if not args.no_mask:
         if isinstance(args.mask, str):
+            # User explicitly provided a mask directory via: --mask PATH
             mask_dir = args.mask
         elif args.mask is True:
-            # If user didn't specify mask path, ask for it
-            print("Select Mask Directory (Cancel to disable overlay)...")
-            init_mask_dir = target_path
-            mask_dir = _choose_directory_via_gui(initial_dir=init_mask_dir, title="Select Mask Directory (Cancel to disable overlay)")
-        
+            if mode == 'file':
+                # PSRFITS mode: only enable overlay when user explicitly asked for it.
+                if argv_has_mask:
+                    mask_dir = os.path.join(os.getcwd(), "results", "AI_RFI")
+            else:
+                # Directory mode: keep default ON (ask user when --mask has no path)
+                print("Select Mask Directory (Cancel to disable overlay)...")
+                init_mask_dir = target_path
+                mask_dir = _choose_directory_via_gui(initial_dir=init_mask_dir, title="Select Mask Directory (Cancel to disable overlay)")
+
         if mask_dir and not os.path.isdir(mask_dir):
-            print(f"[Warn] Invalid mask path provided: {mask_dir}, mask overlay will be disabled.")
+            print(f"[Warn] Mask dir not found: {mask_dir}, overlay disabled.")
             mask_dir = None
 
     test_load_fits_image(target_path, mode=mode, verbose=args.verbose, mask_dir=mask_dir, mask_alpha=args.mask_alpha, blocksperread=args.blocksperread)

@@ -173,31 +173,37 @@ void writeAllMasksPNG(const IdentNSigmaMasks *masks, int nsamp, int nchan,
         if (!indexMask) return;
 
         /*
-         * 优先级逻辑调整：横向干扰 (Horizontal) 具有最高优先级，脉冲 (Pulsar) 具有最低优先级。
-         * 即使某处有脉冲，只要它被识别为 Horizontal RFI，标签就应标记为 1 (Horizontal)。
-         * 这样可以防止在脉冲掩码保护下留下残留的强横向干扰，减少搜索中的假阳性。
+         * 优先级逻辑调整：
+         * 1. Point/Vertical/Block (较低优先级): 被脉冲覆盖以保留脉冲形态。
+         * 2. Pulsar (中等优先级): 覆盖点状和块状干扰，但会被横向干扰覆盖。
+         * 3. Horizontal (最高优先级): 覆盖脉冲，确保彻底消除通道干扰。
          *
-         * 标签映射 (与 UNet.py 保持一致):
-         * 0:bkg, 1:horizontal, 2:vertical, 6:point, 7:block, 8:pulsar
+         * 写入顺序决定覆盖（后写的盖住先写的）:
          */
 
-        // 1. 最低优先级：脉冲
-        if (masks->pulseMask) {
-            for (int i = 0; i < total; i++) if (masks->pulseMask[i]) indexMask[i] = 8;
-        }
-
-        // 2. 中等优先级：垂直、点状、块状干扰
+        // 1. 第一优先级（最低）：写入各类点状、垂直、块状干扰
+        // 这些干扰将被脉冲覆盖，以保护脉冲形态不被切割为碎片
         if (masks->verticalMask) {
             for (int i = 0; i < total; i++) if (masks->verticalMask[i]) indexMask[i] = 2;
         }
         if (masks->pointMask) {
             for (int i = 0; i < total; i++) if (masks->pointMask[i]) indexMask[i] = 6;
         }
-        if (masks->blockMask) { // block
+        if (masks->periodicMask) {
+            for (int i = 0; i < total; i++) if (masks->periodicMask[i]) indexMask[i] = 6; // 映射到 point
+        }
+        if (masks->blockMask) {
             for (int i = 0; i < total; i++) if (masks->blockMask[i]) indexMask[i] = 7;
         }
 
-        // 3. 最高优先级：横向干扰 (最后写入，覆盖重叠区域)
+        // 2. 第二优先级：写入脉冲
+        // 脉冲会覆盖 point/vertical/block，确保脉冲区域的标签是连续的 8
+        if (masks->pulseMask) {
+            for (int i = 0; i < total; i++) if (masks->pulseMask[i]) indexMask[i] = 8;
+        }
+
+        // 3. 第三优先级（最高）：写入横向干扰 (Horizontal)
+        // 横向干扰会覆盖脉冲，确保强通道干扰被彻底标记并行清空，防止假阳性
         if (masks->horizontalMask) {
             for (int i = 0; i < total; i++) if (masks->horizontalMask[i]) indexMask[i] = 1;
         }

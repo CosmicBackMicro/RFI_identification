@@ -1080,17 +1080,28 @@ void binarySIR(
 /// @param nsamp 每个通道的样本数
 /// @param nchan 通道数
 /// @param channelFlagged 通道标记数组（输入/输出）
+/// @param pointMask 点干扰标记位图，计算统计量时将跳过标记为真的像素（可选，可为 NULL）
 /// @return 额外标记的通道数
-int meanOutlierDetection(float *data, int nsamp, int nchan, int *channelFlagged) {
+int meanOutlierDetection(float *data, int nsamp, int nchan, int *channelFlagged, const bool *pointMask) {
     float *chan_means = (float *)malloc(nchan * sizeof(float));
     int mean_check_count = 0;
     
     // 计算未标记通道的均值
     for (int i = 0; i < nchan; i++) {
         if (!channelFlagged[i]) {  // 只对未标记通道
-            float mean, std;
-            findMeanStd(data + i * nsamp, nsamp, &mean, &std);
-            chan_means[mean_check_count++] = mean;
+            double sum = 0;
+            int count = 0;
+            float *row = data + (size_t)i * nsamp;
+            const bool *m = pointMask ? (pointMask + (size_t)i * nsamp) : NULL;
+            for (int j = 0; j < nsamp; j++) {
+                if (!m || !m[j]) {
+                    sum += row[j];
+                    count++;
+                }
+            }
+            if (count > 0) {
+                chan_means[mean_check_count++] = (float)(sum / count);
+            }
         }
     }
     
@@ -1107,11 +1118,22 @@ int meanOutlierDetection(float *data, int nsamp, int nchan, int *channelFlagged)
         
         for (int i = 0; i < nchan; i++) {
             if (!channelFlagged[i]) {  // 只检查未标记的
-                float mean, std;
-                findMeanStd(data + i * nsamp, nsamp, &mean, &std);
-                if (mean > upper_bound || mean < lower_bound) {
-                    channelFlagged[i] = 1;  // 标记为异常
-                    additional_flagged++;
+                double sum = 0;
+                int count = 0;
+                float *row = data + (size_t)i * nsamp;
+                const bool *m = pointMask ? (pointMask + (size_t)i * nsamp) : NULL;
+                for (int j = 0; j < nsamp; j++) {
+                    if (!m || !m[j]) {
+                        sum += row[j];
+                        count++;
+                    }
+                }
+                if (count > 0) {
+                    float mean = (float)(sum / count);
+                    if (mean > upper_bound || mean < lower_bound) {
+                        channelFlagged[i] = 1;  // 标记为异常
+                        additional_flagged++;
+                    }
                 }
             }
         }
@@ -1159,7 +1181,7 @@ void setNoVertical(int v) { g_noVertical = (v != 0); }
 /// @param channel_std_threshold Sigma threshold for outlier detection (T_chan)
 /// @param nsigma_in Sigma threshold for inChannel detection (T_point)
 void outChanDetection(float *data, int nsamp, int nchan, int *channelFlagged,
-                              float *channel_stds, float *channel_stds_temp, float channel_std_threshold, float nsigma_in, int plot)
+                              float *channel_stds, float *channel_stds_temp, float channel_std_threshold, float nsigma_in, int plot, const bool *pointMask)
 {
     const int MAX_ITERATIONS = 30;   // Reduced maximum iterations for faster convergence
     const float STD_CHANGE_THRESHOLD = 0.01f;  // Relaxed standard deviation change rate threshold (1%)
@@ -1181,13 +1203,33 @@ void outChanDetection(float *data, int nsamp, int nchan, int *channelFlagged,
         channelFlagged[i] = 0;  // Initialize to 0
     }
     
-    // Calculate standard deviation for each channel
+    // Calculate standard deviation for each channel, ignoring pixels in pointMask
     for (i = 0; i < nchan; i++)
     {
-        float channel_mean, channel_std;
-        findMeanStd(data + i * nsamp, nsamp, &channel_mean, &channel_std);
-        channel_stds[i] = channel_std;
-        initial_channel_stds[i] = channel_std; // Save initial value for comparison
+        double sum = 0, sum_sq = 0;
+        int count = 0;
+        float *row = data + (size_t)i * nsamp;
+        const bool *m = pointMask ? (pointMask + (size_t)i * nsamp) : NULL;
+        
+        for (int j = 0; j < nsamp; j++) {
+            if (!m || !m[j]) {
+                float val = row[j];
+                sum += val;
+                sum_sq += (double)val * val;
+                count++;
+            }
+        }
+        
+        if (count > 1) {
+            double mean = sum / count;
+            channel_stds[i] = (float)sqrt(fmax(0.0, (sum_sq / count) - (mean * mean)));
+        } else {
+            // Fallback: if entire channel is point-masked or too few samples, use dummy findMeanStd
+            float dummy_m, dummy_s;
+            findMeanStd(row, nsamp, &dummy_m, &dummy_s);
+            channel_stds[i] = dummy_s;
+        }
+        initial_channel_stds[i] = channel_stds[i]; // Save initial value for comparison
     }
     
     // Fit Gaussian to initial channel stds to get mu and sigma
@@ -1294,7 +1336,7 @@ void outChanDetection(float *data, int nsamp, int nchan, int *channelFlagged,
     printf("After smoothing: %d channels flagged\n", final_flagged_count);
     
     // === 兜底均值检测 ===
-    int additional_flagged = meanOutlierDetection(data, nsamp, nchan, channelFlagged);
+    int additional_flagged = meanOutlierDetection(data, nsamp, nchan, channelFlagged, pointMask);
     final_flagged_count += additional_flagged;
     printf("Mean-based outlier check: flagged %d additional channels (total now: %d)\n", 
            additional_flagged, final_flagged_count);
@@ -1303,9 +1345,23 @@ void outChanDetection(float *data, int nsamp, int nchan, int *channelFlagged,
     if (tls_fallback_channel_means && tls_fallback_channel_means_size >= (size_t)nchan && nchan >= 3) {
         float *buf = tls_fallback_channel_means;
         for (int ci = 0; ci < nchan; ++ci) {
-            float ch_mean, ch_std_dummy;
-            findMeanStd(data + (size_t)ci * (size_t)nsamp, nsamp, &ch_mean, &ch_std_dummy);
-            buf[ci] = ch_mean;
+            double sum = 0;
+            int count = 0;
+            float *row = data + (size_t)ci * (size_t)nsamp;
+            const bool *m = pointMask ? (pointMask + (size_t)ci * (size_t)nsamp) : NULL;
+            for (int k = 0; k < nsamp; k++) {
+                if (!m || !m[k]) {
+                    sum += row[k];
+                    count++;
+                }
+            }
+            if (count > 0) {
+                buf[ci] = (float)(sum / count);
+            } else {
+                float ch_mean, ch_std_dummy;
+                findMeanStd(row, nsamp, &ch_mean, &ch_std_dummy);
+                buf[ci] = ch_mean;
+            }
         }
         float global_mean, global_std;
         findMeanStd(buf, nchan, &global_mean, &global_std);
@@ -2244,7 +2300,7 @@ void identSubstNSigma(
             fprintf(stderr, "Warning: CLFD buffer not provided to identSubstNSigma; falling back to outChanDetection\n");
             float *channel_stds = (float *)malloc(nchan * sizeof(float));
             float *channel_stds_temp = (float *)malloc(nchan * sizeof(float));
-            outChanDetection(data, nsamp, nchan, flaggedChans, channel_stds, channel_stds_temp, NSigmaOutChan, NSigmaInChan, plot);
+            outChanDetection(data, nsamp, nchan, flaggedChans, channel_stds, channel_stds_temp, NSigmaOutChan, NSigmaInChan, plot, pointMask);
             free(channel_stds);
             free(channel_stds_temp);
             expandChannelMask(flaggedChans, horizontalMask, nsamp, nchan);
@@ -2267,7 +2323,7 @@ void identSubstNSigma(
     else {
         float *channel_stds = (float *)malloc(nchan * sizeof(float));
         float *channel_stds_temp = (float *)malloc(nchan * sizeof(float));
-        outChanDetection(data, nsamp, nchan, flaggedChans, channel_stds, channel_stds_temp, NSigmaOutChan, NSigmaInChan, plot);
+        outChanDetection(data, nsamp, nchan, flaggedChans, channel_stds, channel_stds_temp, NSigmaOutChan, NSigmaInChan, plot, pointMask);
         double outchan_time = omp_get_wtime() - outchan_start;
         printf("outChannel detection completed (%.4f seconds)\n", outchan_time);
         // Expand 1D flaggedChans to 2D horizontalMask
@@ -2348,7 +2404,7 @@ void identSubstNSigma(
     // Apply internal dilation (radius=3 iterations=1) to bridge sparse gaps before CCA
     if (!g_noBlock) {
         detectBlockRFI(pointMask, nsamp, nchan, blockMask,
-                       5000, 0.7f,   // min_area, min_density tuned for large radar-like blocks
+                       5000, 0.5f,   // min_area, min_density tuned for large radar-like blocks
                        7, 1);        // dilate radius, iterations (adjust if over-merging)
         // High priority: directly overwrite globalMask
         for (int idx = 0; idx < nsamp * nchan; ++idx) {

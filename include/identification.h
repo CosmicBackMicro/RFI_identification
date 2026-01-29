@@ -28,14 +28,14 @@ void substPixels2D(float *data, int nsamp, int nchan, int *mask);
 void binarySIR(int *mask, int nsamp, int nchan, int win_samp, int win_chan, float thrup, float thrdown);
 
 void outChanDetection(float *data, int nsamp, int nchan, int *channelFlagged,
-                              float *channel_stds, float *channel_stds_temp, float channel_std_threshold, float nsigma_in, int plot);
+                              float *channel_stds, float *channel_stds_temp, float channel_std_threshold, float nsigma_in, int plot, const bool *pointMask);
 
 /* 设置线程局部的保底均值缓冲区（用于 outChanDetection 的 ±kσ 均值兜底检测，避免并行循环内重复 malloc）*/
 void setFallbackChannelMeansBuffer(float *buf, size_t size);
 /* 设置保底均值检测的 σ 倍数（默认 2.0，可通过命令行参数配置）*/
 void setFallbackMeanNSigma(float v);
 
-int meanOutlierDetection(float *data, int nsamp, int nchan, int *channelFlagged);
+int meanOutlierDetection(float *data, int nsamp, int nchan, int *channelFlagged, const bool *pointMask);
 
 int inChanDetection(float *data, int nsamp, int nchan, float Nsigma,
     bool *horizontalMask, int *channel_fully_flagged,

@@ -1,4 +1,4 @@
- #pragma once
+#pragma once
  #include "identification.h" // for IdentNSigmaMasks
 
 // 清空所有掩码数组
@@ -12,6 +12,7 @@ void clearIdentNSigmaMasks(IdentNSigmaMasks *m, int nsamp, int nchan);
 // - logicalOR: element-wise OR from mask into globalMask
 
 void writeIndexMaskPNG(const bool *mask, int nsamp, int nchan, char *filename);
+void writeBinaryMask(const bool *mask, int nsamp, int nchan, const char *filename);
 void writeClassIndexMaskPNG(const int *indexMask, int nsamp, int nchan, char *filename);
 
 void mergeMask2D(int *masks[], int nmasks, int nsamp, int nchan, int *result);

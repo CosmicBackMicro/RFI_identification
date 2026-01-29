@@ -26,6 +26,7 @@ import argparse
 import sys
 import threading
 import gc
+import shutil
 from queue import Queue, Empty
 from threading import Thread
 
@@ -185,8 +186,29 @@ def process_psrfits_example(fits_path, engine_path, start_subint=0, ntodo=0, gpu
     file_lock = threading.Lock()
     inference_times, read_times, write_times = [], [], []
     base_name = os.path.basename(fits_path).replace(".fits", "")
-    mask_dir = "output/masks" if not nomask else None
-    if mask_dir: os.makedirs(mask_dir, exist_ok=True)
+    # Save inference masks under results/AI_RFI (repo-conventional results folder)
+    mask_dir = "results/AI_RFI" if not nomask else None
+    if mask_dir:
+        # Safety: only ever delete contents inside the intended directory.
+        safe_root = os.path.normpath("results/AI_RFI")
+        target = os.path.normpath(mask_dir)
+        if target != safe_root:
+            raise RuntimeError(f"Refusing to clear unexpected mask_dir: {mask_dir}")
+
+        # If directory exists and is non-empty, clear it before writing new results.
+        if os.path.isdir(target):
+            try:
+                if os.listdir(target):
+                    for name in os.listdir(target):
+                        p = os.path.join(target, name)
+                        if os.path.isdir(p) and not os.path.islink(p):
+                            shutil.rmtree(p)
+                        else:
+                            os.remove(p)
+            except Exception as e:
+                raise RuntimeError(f"Failed to clear existing contents under {target}: {e}")
+        else:
+            os.makedirs(target, exist_ok=True)
 
     ready_queue = Queue(maxsize=pipeline_depth)
     done_queue = Queue(maxsize=pipeline_depth)
@@ -288,7 +310,11 @@ def process_psrfits_example(fits_path, engine_path, start_subint=0, ntodo=0, gpu
                 mask = np.zeros_like(subint_2d, dtype=np.uint8)
 
             t0 = time.perf_counter()
-            if mask_dir: cv2.imwrite(os.path.join(mask_dir, f"{base_name}_sub{idx}.png"), (mask * 255).astype(np.uint8))
+            if mask_dir:
+                # Save categorical mask (class ids) for visualization/overlay.
+                # Note: AI_RFI内部 mask 已用于清洗，此处仅修正保存方向，避免可视化上下颠倒。
+                mask_to_save = np.flipud(mask).astype(np.uint8, copy=False)
+                cv2.imwrite(os.path.join(mask_dir, f"{base_name}_sub{idx}.png"), mask_to_save)
             
             cleaned_2d = replace_masked_pixels(subint_2d, mask)
             try:

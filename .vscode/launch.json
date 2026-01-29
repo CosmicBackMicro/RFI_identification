@@ -11,10 +11,10 @@
             "args": [
                 // "--filename=/mnt/d/FASTData/FITSFiles/B0355+54_20191110_tracking_1-M01-P1-c2048b1.fits",
                 // "--filename=/mnt/d/FASTData/FITSFiles/B1929+10_20210106_tracking-M01-P1-c1024b1.fits",
-                "--filename=/mnt/d/FASTData/FITSFiles/J195401+292434_20210402_tracking-M02-P1-c2048b1.fits",
-                "--blocksPerRead=32",
-                "--binFactorTime=32", 
-                // 生成训练数据时，一般blocksPerRead应与binFactorTime相等，这样可以保持生成图片的尺寸一致
+                // "--filename=/mnt/d/FASTData/FITSFiles/J195401+292434_20210402_tracking-M02-P1-c2048b1.fits",
+                "--filename=/home/cbm/deRFI/simulation/simulation_psrfits.fits",
+                "--blocksPerRead=1",
+                "--binFactorTime=1", // 生成训练数据时，一般blocksPerRead应与binFactorTime相等，这样可以保持生成图片的尺寸一致
                 "--binFactorFreq=1",
                 "--plot=0",
                 "--savePlot=1",
@@ -29,7 +29,7 @@
                 "--enableCuda=0",
                 // "--hasPulse", "--pulseDM=57", "--pulseP0=0.15638", "--pulseT0=0.1057", "--pulseWidth=0.02",
                 // "--hasPulse", "--pulseDM=3.183", "--pulseP0=0.226525", "--pulseT0=0.1514", "--pulseWidth=0.017", "--interpulse", "--interpulset0=0.0434", "--interpulseWidth=0.004", "--noBlock",
-                "--hasPulse", "--pulseDM=5", "--pulseP0=0.426665", "--pulseT0=0.065", "--pulseWidth=0.07", "--pulsehifreq=1250", "--noVertical",
+                // "--hasPulse", "--pulseDM=5", "--pulseP0=0.426665", "--pulseT0=0.065", "--pulseWidth=0.07", "--pulsehifreq=1250", "--noVertical",
             ],
             "stopAtEntry": false,
             "cwd": "${fileDirname}",

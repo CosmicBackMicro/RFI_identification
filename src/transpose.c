@@ -1,7 +1,10 @@
 #include <omp.h>
 #include <fftw3.h>
+#include <pthread.h>
 
 #include "transpose.h"
+
+static pthread_mutex_t fftw_planner_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /// @brief Transpose a block of data from frequency contiguous to time contiguous.
 /// Theoretically it can be used vice versa.
@@ -63,7 +66,8 @@ void transpose(float *array, int nsamp, int nchan, float *arrayT)
     } else if (tplan2 && p2_ns == nsamp && p2_nc == nchan) {
         plan = tplan2;
     } else {
-        // Create a new plan in an empty slot (do not destroy existing plans to avoid races)
+        // Create a new plan in an empty slot (protected by mutex as FFTW planner is not thread-safe)
+        pthread_mutex_lock(&fftw_planner_mutex);
         if (!tplan1) {
             tplan1 = plan_transpose_f(nsamp, nchan, array, arrayT);
             p1_ns = nsamp; p1_nc = nchan;
@@ -74,9 +78,11 @@ void transpose(float *array, int nsamp, int nchan, float *arrayT)
             plan = tplan2;
         } else {
             // Fallback safely without modifying existing plans
+            pthread_mutex_unlock(&fftw_planner_mutex);
             cpu_transpose_fallback(array, nsamp, nchan, arrayT);
             return;
         }
+        pthread_mutex_unlock(&fftw_planner_mutex);
     }
 
     fftwf_execute_r2r(plan, array, arrayT);

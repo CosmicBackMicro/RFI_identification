@@ -37,11 +37,11 @@ extern int fits_is_reentrant(void) __attribute__((weak));
 #define SLICE_PTR(base, elems_per_thread, tid) ((base) + ((size_t)(tid) * (size_t)(elems_per_thread)))
 
 static inline int slice_index_from_iter(int iter, int maxThreads) {
+    if (maxThreads < 1) maxThreads = 1;
     if (omp_in_parallel()) {
         int tid = omp_get_thread_num();
-        return (tid >= 0) ? tid : 0;
+        return (tid >= 0) ? (tid % maxThreads) : 0;
     }
-    if (maxThreads < 1) maxThreads = 1;
     return iter % maxThreads;
 }
 
@@ -293,6 +293,13 @@ char *extractSourceName(const char *absolutePath)
     const char *last_slash = strrchr(absolutePath, '/');                         // Find last '/' of the absolute path
     const char *filename = (last_slash != NULL) ? last_slash + 1 : absolutePath; // Get filename after last '/'
     char *filename_copy = strdup(filename);                                      // Copy filename to a temporary string
+
+    // Strip extension (.fits, .fit, etc.)
+    char *last_dot = strrchr(filename_copy, '.');
+    if (last_dot != NULL) {
+        *last_dot = '\0';
+    }
+
     char *first_part = strtok(filename_copy, "_");                               // G120.82-21.31
     char *second_part = strtok(NULL, "_");                                       // 20240812
     char *result = NULL;
@@ -302,6 +309,8 @@ char *extractSourceName(const char *absolutePath)
         sprintf(result, "%s_%s", first_part, second_part);
     } else if (first_part) {
         result = strdup(first_part);
+    } else {
+        result = strdup("unknown");
     }
     free(filename_copy);                                                         // Free the temporary string
     return result;

@@ -63,3 +63,12 @@ core
 
 # Sim data
 simulation/
+simulation_v2/
+simulation_and_compare/
+simulation_v3/
+simulation_v3_malfunc/
+simulation_v4/
+temp/
+infer_and_compare/
+infer_and_compare_v2/
+int8/

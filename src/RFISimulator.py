@@ -7,6 +7,7 @@ import os
 import time
 from typing import Tuple
 
+import cv2
 import fitsio
 import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
@@ -25,6 +26,7 @@ PULSAR = 8          # pulsar signal (Pulse)
 
 def add_pulsar_signal(
         data: np.ndarray, 
+        mask: np.ndarray,
         t_start_abs: float,
         tbin: float,
         nchan: int,
@@ -35,7 +37,7 @@ def add_pulsar_signal(
         width_s: float = 0.02,
         amplitude: float = 20.0
     ) -> np.ndarray:
-    """Inject dispersed pulsar signal into data block."""
+    """Inject dispersed pulsar signal into data block and mark mask."""
     nsamp, _ = data.shape
     
     # Calculate frequency array (Low->High)
@@ -72,6 +74,10 @@ def add_pulsar_signal(
     intensity = amplitude * np.exp(-0.5 * (dist / sigma)**2)
     
     data += intensity.astype(data.dtype)
+
+    # Mark mask (where pulse intensity is above a threshold, e.g., phase dist < 2*sigma)
+    mask[dist < 2.5 * sigma] = PULSAR
+
     return data
 
 
@@ -168,25 +174,48 @@ def generate_background(nsamp: int, nchan: int, bg_mu: float, bg_sigma: float, s
 
 
 def add_many_periodic_points(data: np.ndarray, mask: np.ndarray, count: int, bg_sigma: float, seed: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Add several periodic point RFIs with random amplitude/width/duty."""
+    """Add several periodic point RFIs with random amplitude/width/duty and collision avoidance."""
     rng = np.random.default_rng(seed if seed != 0 else None)
     nsamp, nchan = data.shape
+    time_buffer = 40
     
     for i in range(count):
-        rand_amp_sigma = rng.random() * 4.0 + 1.0  # amplitude in [1, 5) sigma
-        rand_width = rng.integers(1, 20)           # width in [1, 20)
-        rand_duty = rng.random() * 0.1 + 0.05      # duty cycle in [0.05, 0.15)
-
+        # 1. Parameter Selection
+        rand_amp_sigma = rng.random() * 8.0 + 5.0  # amplitude in [5, 13) sigma (slightly reduced)
+        rand_width = rng.integers(10, 41)          # width in [10, 41)
+        rand_duty = rng.random() * 0.05 + 0.02     # duty cycle in [0.02, 0.07) (sparser)
+        
         amp_val = rand_amp_sigma * bg_sigma
-        flag = POINT_POINT if rand_duty < 0.95 else CHAN_RFI
-
-        start_ch = int(rng.integers(0, max(1, nchan - rand_width + 1)))
+        
+        # 2. Collision Avoidance (Avoid POINT_BLOCK)
+        start_ch = 0
+        retry = 0
+        while retry < 10:
+            start_ch = int(rng.integers(0, max(1, nchan - rand_width + 1)))
+            end_ch = min(nchan, start_ch + rand_width)
+            # Check if this channel range overlaps with any block RFI
+            if not np.any(mask[:, start_ch:end_ch] == POINT_BLOCK):
+                break
+            retry += 1
+        
         end_ch = min(nchan, start_ch + rand_width)
         on = rng.random(nsamp) < rand_duty
         
-        data[on, start_ch:end_ch] += amp_val
-        # Only mark mask where RFI is actually present
-        mask[on, start_ch:end_ch] = flag
+        # 3. Apply with Gaussian Profile in Frequency and slight Time extension
+        ch_indices = np.arange(start_ch, end_ch)
+        center_f = (start_ch + end_ch - 1) / 2.0
+        f_sigma = rand_width / 4.0
+        # Gaussian frequency profile
+        f_profile = np.exp(-0.5 * ((ch_indices - center_f) / f_sigma) ** 2)
+        
+        for t in np.where(on)[0]:
+            # Time extension: 1-3 samples
+            t_ext = rng.integers(1, 4)
+            t_end = min(nsamp, t + t_ext)
+            
+            data[t:t_end, start_ch:end_ch] += amp_val * f_profile[np.newaxis, :]
+            mask[t:t_end, start_ch:end_ch] = POINT_POINT
+            
     return data, mask
 
 def add_chan(
@@ -210,37 +239,50 @@ def add_chan(
         gauss_profile = np.exp(-0.5 * ((ch_indices - center_chan) / std_dev) ** 2)
         data[:, start_ch:end_ch] += gauss_profile * amplitude
         
+        # 只判定强度大于最大值 5% 的像素为掩码
+        # amplitude 可能是负数（代表 dark band）
+        threshold = 0.05
+        mask_channels = np.abs(gauss_profile) > threshold
+        mask[:, start_ch:end_ch][:, mask_channels] = CHAN_SUBTYPE
+        
     elif mode == 'uniform':
         data[:, start_ch:end_ch] += amplitude
+        mask[:, start_ch:end_ch] = CHAN_SUBTYPE
     else:
         raise ValueError(f"Unknown mode: {mode}, must be 'gaussian' or 'uniform'")
 
-    mask[:, start_ch:end_ch] = CHAN_SUBTYPE
-    
     return data, mask
         
 def add_many_random_points(
-        data: np.ndarray, mask: np.ndarray, point_count: int, point_amp_sigma: float, bg_sigma: float, seed: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Add random point RFIs and label them as POINT_RANDOM."""
+        data: np.ndarray, mask: np.ndarray, cluster_count: int, point_amp_sigma: float, bg_sigma: float, seed: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Add small clusters of point RFIs (avoiding single isolated pixels) and label them as POINT_POINT."""
     rng = np.random.default_rng(seed if seed != 0 else None)
     nsamp, nchan = data.shape
     if mask is None:
         mask = np.zeros_like(data, dtype=np.uint8)
     elif mask.dtype != np.uint8:
         mask = mask.astype(np.uint8)
-    if point_count > 0:
-        available = np.where(mask == 0)
-        total_avail = available[0].size
-        if total_avail < point_count:
-            print(f"Warning: only {total_avail} unmarked pixels, but point_count={point_count}. Will use all available.")
-            select_count = total_avail
-        else:
-            select_count = point_count
-        idx = rng.choice(total_avail, size=select_count, replace=False)
-        ts = available[0][idx]
-        cs = available[1][idx]
-        data[ts, cs] += (point_amp_sigma * bg_sigma)
-        mask[ts, cs] = POINT_POINT
+    
+    if cluster_count > 0:
+        for _ in range(cluster_count):
+            # Pick a starting point that is not already masked
+            retry = 0
+            while retry < 5:
+                t = rng.integers(0, nsamp - 2)
+                c = rng.integers(0, nchan - 2)
+                if np.all(mask[t:t+2, c:c+2] == 0):
+                    # Define cluster size (e.g., 2x2, 2x3, 3x2)
+                    h = rng.integers(2, 4)
+                    w = rng.integers(2, 4)
+                    t_end = min(nsamp, t + h)
+                    c_end = min(nchan, c + w)
+                    
+                    amp_val = point_amp_sigma * bg_sigma
+                    data[t:t_end, c:c_end] += amp_val
+                    mask[t:t_end, c:c_end] = POINT_POINT
+                    break
+                retry += 1
+                
     return data, mask
 
 
@@ -365,18 +407,14 @@ def plot_synth_result(data: np.ndarray, mask: np.ndarray, plot_path: str) -> Non
     import matplotlib.colors as mcolors
     mask_labels = {
         0: 'Background',
-        1: 'Chan RFI (coarse)',
-        2: 'Point RFI (coarse)',
-        3: 'Chan RFI - Bright',
-        4: 'Chan RFI - Dark',
-        5: 'Chan RFI - Complex',
-        6: 'Point RFI - Random',
-        7: 'Point RFI - Periodic',
-        8: 'Point RFI - Block',
-        9: 'Point RFI - Vertical',
+        1: 'Chan RFI',
+        2: 'Vertical RFI',
+        6: 'Point RFI',
+        7: 'Block RFI',
+        8: 'Pulsar Signal',
     }
     cmap = plt.get_cmap(mask_cmap)
-    norm = mcolors.Normalize(vmin=0, vmax=9)
+    norm = mcolors.Normalize(vmin=0, vmax=8)
     
     handles = []
     for k, v in mask_labels.items():
@@ -390,7 +428,7 @@ def plot_synth_result(data: np.ndarray, mask: np.ndarray, plot_path: str) -> Non
     ax_mask.set_xlim(ax_data.get_xlim())  # mask x-range matches main image
     ax_mask.set_ylim(ax_data.get_ylim())  # mask y-range matches main image
 
-    im_mask.set_clim(0, 9)
+    im_mask.set_clim(0, 8)
     plt.savefig(plot_path, dpi=600, bbox_inches='tight')
     plt.close()
     
@@ -628,6 +666,7 @@ def generate_sample(
     if pulsar_config:
         add_pulsar_signal(
             data=data,
+            mask=mask,
             t_start_abs=t_start,
             tbin=pulsar_config['tbin'],
             nchan=nchan,
@@ -641,14 +680,17 @@ def generate_sample(
 
     if rfi_config:
         # Use consistent RFI parameters
+        # Reducing periodic points density as requested (from 2 to 1 in config apply or by override)
         data, mask = rfi_config.apply_consistent_rfi(data, mask, seed + 1)
     else:
         # Random every time (Moderate settings)
-        data, mask = add_many_periodic_points(data, mask, count=2, bg_sigma=bg_sigma, seed=seed + 1)
+        # Reduced periodic points count from 2 to 1
+        data, mask = add_many_periodic_points(data, mask, count=1, bg_sigma=bg_sigma, seed=seed + 1)
         data, mask = add_many_chans(data, mask, n_gaussian=2, n_uniform=1, bg_sigma=bg_sigma, seed=seed + 2)
 
-    # Random points and blobs are considered transient/random, so they vary per subint
-    data, mask = add_many_random_points(data, mask, point_count=400, point_amp_sigma=5.0, bg_sigma=bg_sigma, seed=seed + 3)
+    # Random points (isolated): Increased count from 50 to 150 (at least doubled)
+    # Using clusters of size at least 2x2. cluster_count represents the number of small patches.
+    data, mask = add_many_random_points(data, mask, cluster_count=40, point_amp_sigma=12.0, bg_sigma=bg_sigma, seed=seed + 3)
 
     data, mask = add_many_blob_points(data, mask, count=2, bg_sigma=bg_sigma, seed=seed + 4)
     
@@ -673,25 +715,33 @@ def generate_single_sample(args):
 def main():
     parser = argparse.ArgumentParser(description='Generate synthetic RFI data.')
     parser.add_argument('--dataset', action='store_true', help='Write per-sample FITS files (legacy mode).')
+    parser.add_argument('--psrfits', action='store_true', help='Write a single merged PSRFITS file (default if --dataset is not set).')
     parser.add_argument('--nomask', action='store_true', help='Do not save mask PNGs.')
+    parser.add_argument('--num_samples', type=int, default=5000, help='Number of subints to generate (default: 5000).')
+    parser.add_argument('--output_dir', type=str, default='/home/cbm/deRFI/simulation_v3', help='Output directory for FITS.')
+    parser.add_argument('--mask_dir', type=str, default='/home/cbm/deRFI/simulation_v3/mask_GroundTruth', help='Output directory for mask PNGs.')
+    parser.add_argument('--nsamp', type=int, default=1024, help='Samples per subint (default: 1024).')
+    parser.add_argument('--nchan', type=int, default=1792, help='Frequency channels (default: 1792).')
     args = parser.parse_args()
 
     config = {
-        'num_samples': 500,   # Modified: 500 subints
+        'num_samples': args.num_samples,
         'base_seed': 98765,
-        'plot_interval': 50,
-        'nsamp': 1024,
-        'nsblk': 1024,
-        'nchan': 1792,
+        'plot_interval': 10001,
+        'nsamp': args.nsamp,
+        'nsblk': args.nsamp,
+        'nchan': args.nchan,
         'bg_mu': 0.0,
         'bg_sigma': 5.0,
-        'output_dir': '/home/cbm/deRFI/simulation',
+        'output_dir': args.output_dir,
+        'mask_dir': args.mask_dir,
         'tbin': 4.9152e-05,
         'obsfreq': 1249.8779296875,
         'obsbw': 500.0,
         'src_name': 'SIMRFI'
     }
     os.makedirs(config['output_dir'], exist_ok=True)
+    os.makedirs(config['mask_dir'], exist_ok=True)
 
     # Initialize RFI configuration once for the entire file/batch
     rfi_config = None 
@@ -699,42 +749,52 @@ def main():
     # rfi_config.print_config()
 
     # Initialize Pulsar Injector Configuration
-    pulsar_period = 1.0     # 1 second period
-    pulsar_width  = 0.002   # 2 ms width (Sigma)
-    pulsar_dm     = 50.0    # DM 50
-    pulsar_flux   = 10.0    # Realistic flux (dimmer)
-    
-    # pulsar_config = {
-    #     'period': pulsar_period,
-    #     'dm': pulsar_dm,
-    #     'width': pulsar_width,
-    #     'flux': pulsar_flux,
-    #     'tbin': config['tbin'],
-    #     'obsfreq': config['obsfreq'],
-    #     'obsbw': config['obsbw']
-    # }
-    pulsar_config = None 
+    # We will randomize DM for each sample, so we define a template here
+    pulsar_template = {
+        'period': 1.0,     # 1 second period
+        'dm_range': (10.0, 100.0), # DM Range requested by user
+        'width': 0.002,    # 2 ms width (Sigma)
+        'flux': 12.0,      # Flux
+        'tbin': config['tbin'],
+        'obsfreq': config['obsfreq'],
+        'obsbw': config['obsbw']
+    }
     
     print(f"\n[Pulsar Configuration]")
-    print(f"  Period: {pulsar_period} s")
-    print(f"  DM:     {pulsar_dm} pc/cm^3")
-    print(f"  Flux:   {pulsar_flux}")
+    print(f"  Period: {pulsar_template['period']} s")
+    print(f"  DM Range: {pulsar_template['dm_range']} pc/cm^3")
+    print(f"  Flux:   {pulsar_template['flux']}")
 
+    base_name = 'simulation_psrfits'
 
-    if args.dataset:
+    # Decide mode: if --psrfits is specified, use single merged PSRFITS mode.
+    # Otherwise (e.g., if --dataset is set OR logic fallback), use per-sample mode.
+    # Updated: If neither is specified, default to dataset mode as requested.
+    use_psrfits_mode = args.psrfits
+
+    if use_psrfits_mode:
+        print(f"🚀 Mode select: Single Merged PSRFITS (Output: {config['output_dir']}/{base_name}.fits)")
+    else:
+        print(f"🚀 Mode select: Per-Sample Dataset (Output: {config['output_dir']}/{base_name}_blockXXXX.fits)")
+
+    if not use_psrfits_mode:
         tasks = []
+        rng = np.random.default_rng(config['base_seed']) # For DM randomization
         for i in range(config['num_samples']):
             current_seed = config['base_seed'] + i
-            
-            # Calculate absolute start time for this block
-            t_start = i * config['nsblk'] * config['tbin']
-
-            plot_out = f"{config['output_dir']}/plot_{i+5000}.png"
-            fits_out = f"{config['output_dir']}/data_{i+5000}.fits"
-            mask_png_out = f"{config['output_dir']}/mask_{i+5000}.png" if not args.nomask else None
-
             do_plot = (i % config['plot_interval'] == 0)
 
+            t_start = i * config['nsblk'] * config['tbin']
+
+            # Randomize DM for this subint
+            pulsar_config = pulsar_template.copy()
+            pulsar_config['dm'] = rng.uniform(*pulsar_template['dm_range'])
+
+            plot_out = f"{config['output_dir']}/{base_name}_block{i:04d}_plot.png"
+            fits_out = f"{config['output_dir']}/{base_name}_block{i:04d}.fits"
+            mask_png_out = f"{config['mask_dir']}/{base_name}_block{i:04d}.png" if not args.nomask else None
+
+            # Task arguments: (nsamp, nchan, bg_mu, bg_sigma, seed, plot_out, fits_out, mask_png_out, do_plot, rfi_config, pulsar_config, t_start)
             task_args = (
                 config['nsamp'], config['nchan'], config['bg_mu'], config['bg_sigma'], current_seed,
                 plot_out, fits_out, mask_png_out, do_plot, rfi_config, pulsar_config, t_start
@@ -743,7 +803,7 @@ def main():
         
         # Note: RFIConfig must be picklable for multiprocessing. The simple class structure should be fine.
         num_processes = multiprocessing.cpu_count()
-        print(f"Starting parallel generation with {num_processes} processes...")
+        print(f"Starting parallel generation with {num_processes} processes (Per-sample mode)...")
 
         total_start_time = time.time()
 
@@ -751,10 +811,11 @@ def main():
             pool.map(generate_single_sample, tasks)
 
         total_end_time = time.time()
-        print(f"Finished generating {config['num_samples']} samples in {total_end_time - total_start_time:.2f} seconds.")
+        print(f"Finished generating {config['num_samples']} independent samples in {total_end_time - total_start_time:.2f} seconds.")
         return
 
-    psrfits_path = os.path.join(config['output_dir'], 'simulation_psrfits.fits')
+    # --- Merged PSRFITS Mode ---
+    psrfits_path = os.path.join(config['output_dir'], f'{base_name}.fits')
     fits, dtype, dat_freq, dat_wts = init_psrfits(
         psrfits_path,
         config['nchan'],
@@ -766,6 +827,7 @@ def main():
     )
 
     total_start_time = time.time()
+    rng = np.random.default_rng(config['base_seed']) # For DM randomization in sequential loop
     for i in range(config['num_samples']):
         current_seed = config['base_seed'] + i
         do_plot = (i % config['plot_interval'] == 0)
@@ -781,6 +843,10 @@ def main():
 
         t_start = i * config['nsblk'] * config['tbin']
 
+        # Randomize DM for this subint
+        pulsar_config = pulsar_template.copy()
+        pulsar_config['dm'] = rng.uniform(*pulsar_template['dm_range'])
+
         data, mask = generate_sample(
             config['nsamp'],
             config['nchan'],
@@ -793,13 +859,13 @@ def main():
         )
 
         if do_plot:
-            plot_out = f"{config['output_dir']}/plot_{i}.png"
+            plot_out = f"{config['output_dir']}/{base_name}_block{i:04d}_plot.png"
             plot_synth_result(data, mask, plot_out)
 
         append_psrfits_subint(fits, dtype, data, i, config['tbin'], dat_freq, dat_wts)
 
         if not args.nomask:
-            mask_png_out = f"{config['output_dir']}/mask_{i}.png"
+            mask_png_out = f"{config['mask_dir']}/{base_name}_block{i:04d}.png"
             save_mask_png(mask, mask_png_out)
     
     print() # Newline after progress bar
@@ -811,6 +877,15 @@ def main():
     total_end_time = time.time()
     print(f"PSRFITS saved: {psrfits_path}")
     print(f"Finished generating {config['num_samples']} samples in {total_end_time - total_start_time:.2f} seconds.")
+
+def dilate_mask(mask_region, radius=3, iterations=1):
+    """Dilate boolean 2D array using OpenCV."""
+    if radius < 3:
+        return mask_region
+    # OpenCV dilate requires uint8
+    kernel = np.ones((radius, radius), np.uint8)
+    dilated = cv2.dilate(mask_region.astype(np.uint8), kernel, iterations=iterations)
+    return dilated.astype(bool)
 
 def add_block_rfi(
         data: np.ndarray, mask: np.ndarray,
@@ -837,22 +912,48 @@ def add_block_rfi(
                 break
             retry += 1
         
+        # 创建一个局部掩码用于形态学处理
+        local_mask = np.zeros((block_w, block_h), dtype=bool)
+        
         # 在该区域内密集生成具有频率延展的小点
         num_inner_bursts = rng.integers(100, 300) # 内部细节数量
+        
         for _ in range(num_inner_bursts):
-            bt = t0 + rng.integers(0, block_w)
-            bf = f0 + rng.integers(0, block_h)
+            bt_rel = rng.integers(0, block_w)
+            bf_rel = rng.integers(0, block_h)
             
             # 细节特征：时间窄 (1-2)，频率延展 (10-40)
             burst_dt = rng.integers(1, 3) 
             burst_df = rng.integers(10, 40)
             
-            t_end = min(nsamp, bt + burst_dt)
-            f_end = min(nchan, bf + burst_df)
+            # 绝对坐标（用于修改Data）
+            t_start_global = t0 + bt_rel
+            f_start_global = f0 + bf_rel
             
+            t_end_global = min(nsamp, t_start_global + burst_dt)
+            f_end_global = min(nchan, f_start_global + burst_df)
+            
+            # 添加数据
             amp = rng.uniform(5, 12) * bg_sigma
-            data[bt:t_end, bf:f_end] += amp
-            mask[bt:t_end, bf:f_end] = POINT_BLOCK
+            data[t_start_global:t_end_global, f_start_global:f_end_global] += amp
+            
+            # 相对坐标（用于局部Mask膨胀）
+            t_end_rel = min(block_w, bt_rel + burst_dt)
+            f_end_rel = min(block_h, bf_rel + burst_df)
+            local_mask[bt_rel:t_end_rel, bf_rel:f_end_rel] = True
+            
+        # --- 将实际修改的像素贴回主 mask ---
+        t_end_block = min(nsamp, t0 + block_w)
+        f_end_block = min(nchan, f0 + block_h)
+        actual_w = t_end_block - t0
+        actual_h = f_end_block - f0
+        
+        if actual_w > 0 and actual_h > 0:
+            mask_slice = mask[t0:t_end_block, f0:f_end_block]
+            local_slice = local_mask[:actual_w, :actual_h]
+            # 仅在实际注入了信号的地方更新为 POINT_BLOCK
+            mask_slice[local_slice] = POINT_BLOCK
+
     return data, mask
 
 
@@ -872,7 +973,7 @@ def add_vertical_rfi(
             t_base = rng.integers(0, nsamp)
             
             # 决定是簇效应（闪电）还是孤立脉冲
-            is_cluster = rng.random() > 0.4  # 60% 概率为簇，40% 为孤立脉冲
+            is_cluster = rng.random() > 0.7  # 30% 概率为簇，70% 为孤立脉冲
             
             if is_cluster:
                 cluster_count = rng.integers(3, 8) 

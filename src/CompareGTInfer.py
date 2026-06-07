@@ -18,7 +18,7 @@ import cv2
 
 # Add current directory to path for imports
 sys.path.append(os.path.dirname(__file__))
-from UNet import FITSDataset
+from SegFormer_StrategyAltered import FITSDataset
 
 try:
     import tensorrt as trt
@@ -67,7 +67,7 @@ def calculate_metrics(pred, target, num_classes):
     
     return acc, miou, fg_miou
 
-def save_visual_plot(i, image_np, mask_np, pred_np, class_names, save_dir, prefix="trt_"):
+def save_visual_plot(i, image_np, mask_np, pred_np, class_names, save_dir, prefix="trt_", custom_name=None):
     """
     Generate and save a 1x4 comparison subplot.
     Layout: [Input Data] [Ground Truth] [AI Prediction] [Detection Overlay]
@@ -113,12 +113,18 @@ def save_visual_plot(i, image_np, mask_np, pred_np, class_names, save_dir, prefi
     axes[3].set_axis_off()
     
     plt.tight_layout(rect=(0, 0.03, 1, 0.95))
-    output_path = os.path.join(save_dir, f"{prefix}comp_{i:03d}_miou{miou:.3f}.png")
+    
+    if custom_name:
+        filename = f"{custom_name}_miou{miou:.3f}.pdf"
+    else:
+        filename = f"{prefix}comp_{i:03d}_miou{miou:.3f}.pdf"
+        
+    output_path = os.path.join(save_dir, filename)
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
     return output_path
 
-def run_trt_inference(engine_path, dataset, num_samples=32, save_dir="results/inference_plots", batch_size=1):
+def run_trt_inference(engine_path, dataset=None, num_samples=32, save_dir="results/inference_plots", batch_size=1, single_image=None, single_mask=None):
     """Load TensorRT engine and process dataset samples."""
     print(f"🚀 Loading TensorRT engine: {engine_path}")
     logger = trt.Logger(trt.Logger.WARNING)
@@ -141,17 +147,28 @@ def run_trt_inference(engine_path, dataset, num_samples=32, save_dir="results/in
         raise RuntimeError("Engine must have at least one input and one output.")
     
     primary_input = input_names[0]
-    # We'll use the first output for predictions, but bind all
     primary_output = output_names[0]
 
-    # Pre-allocate buffers for ALL tensors to satisfy API requirements
-    # and improve performance by avoiding per-iteration allocation
+    # Auto-detect engine dimensions
+    try:
+        profile = engine.get_tensor_profile_shape(primary_input, 0)
+        # profile shape is (min, opt, max). Use opt or max.
+        target_shape = profile[1] # OPT shape
+        target_h, target_w = target_shape[2], target_shape[3]
+    except Exception:
+        # Fallback if not dynamic or profile failed
+        target_shape = engine.get_tensor_shape(primary_input)
+        target_h, target_w = target_shape[2], target_shape[3]
+    
+    print(f"📐 Engine detected input resolution: {target_w}x{target_h}")
+
+    # Pre-allocate buffers for ALL tensors
     buffers = {}
     for name in tensor_names:
-        # Get max shape from profile if dynamic, or fixed shape
-        # For simplicity in this script, we assume the provided batch_size and 512x512
-        # fits within the engine's profile.
-        context.set_input_shape(primary_input, (batch_size, 1, 512, 512))
+        # Bind the shape
+        if engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+            context.set_input_shape(name, (batch_size, 1, target_h, target_w))
+            
         shape = context.get_tensor_shape(name)
         dtype = trt.nptype(engine.get_tensor_dtype(name))
         
@@ -163,7 +180,6 @@ def run_trt_inference(engine_path, dataset, num_samples=32, save_dir="results/in
             "device": device_mem,
             "nbytes": host_mem.nbytes
         }
-        # Bind address
         context.set_tensor_address(name, int(device_mem))
 
     print("🔥 Warming up engine...")
@@ -171,18 +187,43 @@ def run_trt_inference(engine_path, dataset, num_samples=32, save_dir="results/in
     stream.synchronize()
     print("✅ Warmup complete.")
 
-    class_names = get_class_names(dataset)
-    num_to_process = min(num_samples, len(dataset))
-    
+    # --- Prepare Data ---
+    item_names = []
+    if single_image:
+        raw_img = FITSDataset.load_fits_image(single_image)
+        img_norm = FITSDataset.normalize_image_mean_std(raw_img, k=5.0)
+        
+        if single_mask and os.path.exists(single_mask):
+            raw_mask = cv2.imread(single_mask, cv2.IMREAD_UNCHANGED)
+            mask_lbl = np.zeros_like(raw_mask, dtype=np.uint8)
+            # Use same mapping as UNet.py
+            mapping = {0: 0, 1: 1, 2: 2, 6: 3, 7: 4, 8: 5}
+            for mask_val, class_idx in mapping.items():
+                mask_lbl[raw_mask == mask_val] = class_idx
+        else:
+            mask_lbl = np.zeros(img_norm.shape, dtype=np.uint8)
+        
+        test_items = [(img_norm, mask_lbl)]
+        num_to_process = 1
+        class_names = FITSDataset.CLASSES
+        item_names = [os.path.splitext(os.path.basename(single_image))[0]]
+    else:
+        if dataset is None:
+            raise ValueError("Dataset must be provided if single_image is not specified.")
+        class_names = get_class_names(dataset)
+        num_to_process = min(num_samples, len(dataset))
+        test_items = dataset
+        item_names = [dataset.ids[i] for i in range(num_to_process)]
+
     for start_idx in range(0, num_to_process, batch_size):
         end_idx = min(start_idx + batch_size, num_to_process)
         current_batch = end_idx - start_idx
         
         batch_imgs, batch_masks = [], []
         for i in range(start_idx, end_idx):
-            img, mask = dataset[i]
+            img, mask = test_items[i]
             # Standardize resolution for TensorRT engine
-            img_res = cv2.resize(np.array(img, dtype=np.float32), (512, 512), interpolation=cv2.INTER_LINEAR)
+            img_res = cv2.resize(np.array(img, dtype=np.float32), (target_w, target_h), interpolation=cv2.INTER_LINEAR)
             batch_imgs.append(np.expand_dims(img_res, axis=0))
             batch_masks.append(mask)
         
@@ -190,8 +231,8 @@ def run_trt_inference(engine_path, dataset, num_samples=32, save_dir="results/in
         
         # 1. Update input shape if batch is smaller than max
         if current_batch != batch_size:
-            context.set_input_shape(primary_input, (current_batch, 1, 512, 512))
-            # Rebind addresses because shape change might affect some internal state in some TRT versions
+            context.set_input_shape(primary_input, (current_batch, 1, target_h, target_w))
+            # Rebind addresses
             for name in tensor_names:
                 context.set_tensor_address(name, int(buffers[name]["device"]))
 
@@ -222,12 +263,15 @@ def run_trt_inference(engine_path, dataset, num_samples=32, save_dir="results/in
             target_mask = batch_masks[bi]
             pred_mask = preds[bi]
             
-            saved_path = save_visual_plot(global_idx + 1, img_np, target_mask, pred_mask, class_names, save_dir)
+            custom_name = item_names[global_idx] if global_idx < len(item_names) else None
+            saved_path = save_visual_plot(global_idx + 1, img_np, target_mask, pred_mask, class_names, save_dir, custom_name=custom_name)
             print(f"📸 Saved: {saved_path} (Infer: {infer_time/current_batch:.4f}s/sample)")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Simplified TensorRT Inference & Visualization")
-    parser.add_argument('--dataset', required=True, help='Top-level dataset directory')
+    parser.add_argument('--dataset', help='Top-level dataset directory')
+    parser.add_argument('--image', help='Path to a single FITS file')
+    parser.add_argument('--mask', help='Path to a single mask PNG file (optional)')
     parser.add_argument('--model', required=True, help='Path to .engine or .plan file')
     parser.add_argument('--num-samples', type=int, default=16, help='Number of samples to visualize')
     parser.add_argument('--batch-size', type=int, default=1, help='Batch size')
@@ -235,21 +279,43 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
 
-    val_img_dir = os.path.join(args.dataset, "image", "val")
-    val_mask_dir = os.path.join(args.dataset, "mask", "val")
+    dataset = None
+    if args.image:
+        print(f"🔍 Processing single image: {args.image}")
+        # Try to auto-detect mask if not provided
+        if not args.mask:
+            # 1. Try standard dataset structure: swap /image/ with /mask/ and extension
+            potential_mask = args.image.replace("/image/", "/mask/").replace(".fits", ".png").replace(".fit", ".png")
+            if os.path.exists(potential_mask):
+                args.mask = potential_mask
+                print(f"💡 Auto-detected mask (structure): {args.mask}")
+            else:
+                # 2. Try same directory with .png extension
+                same_dir_mask = os.path.splitext(args.image)[0] + ".png"
+                if os.path.exists(same_dir_mask):
+                    args.mask = same_dir_mask
+                    print(f"💡 Auto-detected mask (same dir): {args.mask}")
+    elif args.dataset:
+        val_img_dir = os.path.join(args.dataset, "image", "val")
+        val_mask_dir = os.path.join(args.dataset, "mask", "val")
 
-    if not os.path.exists(val_img_dir):
-        print(f"❌ Error: {val_img_dir} does not exist.")
+        if not os.path.exists(val_img_dir):
+            print(f"❌ Error: {val_img_dir} does not exist.")
+            sys.exit(1)
+
+        dataset = FITSDataset(val_img_dir, val_mask_dir)
+        print(f"🔍 Processing {args.num_samples} samples from dataset...")
+    else:
+        print("❌ Error: Either --dataset or --image must be specified.")
         sys.exit(1)
-
-    dataset = FITSDataset(val_img_dir, val_mask_dir)
-    print(f"🔍 Processing {args.num_samples} samples...")
     
     run_trt_inference(
         engine_path=args.model,
         dataset=dataset,
         num_samples=args.num_samples,
         save_dir=args.save_dir,
-        batch_size=args.batch_size
+        batch_size=args.batch_size,
+        single_image=args.image,
+        single_mask=args.mask
     )
     print(f"🎉 Results saved to: {args.save_dir}")

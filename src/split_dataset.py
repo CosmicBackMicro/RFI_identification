@@ -22,18 +22,19 @@ def get_num(name):
 
 def main():
     parser = argparse.ArgumentParser(description="Split deRFI dataset into train/val sets.")
+    parser.add_argument("--input_dir", default="output", help="Input folder containing samples (default: 'output').")
     parser.add_argument("--new_name", required=True, help="New name for the output folder.")
     parser.add_argument("--val_ratio", type=float, default=0.2, help="Ratio of samples for validation (default: 0.2).")
     args = parser.parse_args()
 
-    output_dir = Path("output")
+    output_dir = Path(args.input_dir)
     if not output_dir.exists():
-        raise FileNotFoundError("Error: 'output' folder does not exist.")
+        raise FileNotFoundError(f"Error: '{args.input_dir}' folder does not exist.")
 
     # Check FITS files count
     fits_files = sorted(output_dir.glob("*.fits"))
     if len(fits_files) < 10:
-        raise ValueError(f"Error: Found only {len(fits_files)} FITS files in 'output'. At least 4000 required.")
+        raise ValueError(f"Error: Found only {len(fits_files)} FITS files in '{args.input_dir}'.")
 
     # Create image and mask folders
     image_dir = output_dir / "image"

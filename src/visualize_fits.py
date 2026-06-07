@@ -196,7 +196,7 @@ def load_psrfits_row(fits_path, row_idx):
 import argparse
 from typing import Optional
 
-def test_load_fits_image(input_source, mode='dir', verbose: bool=False, mask_dir: Optional[str]=None, mask_alpha: float=0.7, blocksperread: int=1):
+def test_load_fits_image(input_source, mode='dir', verbose: bool=False, mask_dir: Optional[str]=None, mask_alpha: float=0.7, blocksperread: int=1, show_class: Optional[str]=None, nomargin: bool=False):
     """Use left/right arrow keys for bidirectional browsing (←/→), press J to jump to index, Esc to quit.
     When verbose=True, per-frame loading logs will be printed, default off to reduce I/O.
     input_source: directory path (mode='dir') or file path (mode='file')
@@ -304,46 +304,110 @@ def test_load_fits_image(input_source, mode='dir', verbose: bool=False, mask_dir
         except Exception:
             psrfits_n_rows = 0
 
+    def _mask_key_candidates(base_name: str, idx: int):
+        """Generate common basename candidates for a given mask index."""
+        idx4 = f"{idx:04d}"
+        idx_plain = str(idx)
+        return [
+            # 支持带有 _downsampX 这种新命名的后缀
+            f"{base_name}_downsamp", # 前缀匹配
+            f"{base_name}_sub{idx}",
+            f"{base_name}_sub{idx4}",
+            f"{base_name}_block{idx}",
+            f"{base_name}_block{idx4}",
+            f"mask_{idx}",
+            f"mask_{idx4}",
+            f"sub{idx}",
+            f"sub{idx4}",
+            f"block{idx}",
+            f"block{idx4}",
+            idx_plain,
+            idx4,
+        ]
+
+    def _find_mask_path(mask_map_local: dict, base_name: str, idx: int):
+        """Find mask path by trying multiple compatible naming schemes."""
+        # 先尝试完全匹配（针对带有 downsamp 后缀的情况）
+        # 现在的命名是 {base_name}_downsamp{X}_sub{idx:04d}.png
+        # 我们遍历所有的 key，看是否有包含 base_name 和 sub{idx:04d} 的
+        target_sub = f"sub{idx:04d}"
+        for key in mask_map_local.keys():
+            if base_name in key and target_sub in key:
+                return mask_map_local[key]
+
+        for key in _mask_key_candidates(base_name, idx):
+            p = mask_map_local.get(key)
+            if p:
+                return p
+        return None
+
     # Class names and color mapping (for legend and rendering), can be adjusted as needed
-    # Convention: 0=background, 1=horizontal, 2=vertical, 6=point, 7=block, 8=pulse
+    # Standard mapping (0=bkg, 1=horiz, 2=vert, 3=point, 4=block, 5=pulsar)
+    # Legacy/Simulator might use 6, 7, 8 for point, block, pulsar.
     class_names = {
         1: 'Horizontal',
         2: 'Vertical',
+        3: 'Point',
+        4: 'Block',
+        5: 'Pulsar',
         6: 'Point',
         7: 'Block',
         8: 'Pulsar',
     }
     class_color_map = {
-        1: (0.0, 1.0, 1.0),   # horizontal -> cyan
-        2: (1.0, 0.0, 1.0),   # vertical -> magenta
-        6: (0.0, 0.0, 1.0),   # point -> blue
-        7: (1.0, 1.0, 0.0),   # block -> yellow
-        8: (1.0, 0.0, 0.0),   # pulsar -> red
+        1: (0.0, 1.0, 1.0),   # cyan
+        2: (1.0, 0.0, 1.0),   # magenta
+        3: (0.0, 0.5, 1.0),   # sky blue (point)
+        4: (1.0, 1.0, 0.0),   # yellow (block)
+        5: (1.0, 0.0, 0.0),   # red (pulsar)
+        6: (0.0, 0.0, 1.0),   # blue (legacy point)
+        7: (1.0, 0.6, 0.0),   # orange (legacy block)
+        8: (0.8, 0.0, 0.0),   # dark red (legacy pulsar)
     }
 
+    # Filter classes if show_class is provided
+    allowed_classes = None
+    if show_class:
+        try:
+            allowed_classes = {int(c) for c in show_class if c.isdigit()}
+            # Filter maps for legend and consistency
+            class_names = {k: v for k, v in class_names.items() if k in allowed_classes}
+            class_color_map = {k: v for k, v in class_color_map.items() if k in allowed_classes}
+        except Exception as e:
+            print(f"[Warn] Failed to parse --showclass '{show_class}': {e}")
+
     # Create figure and axes with expanded layout adding two sigma panels:
-    #  - left panel: frequency mean profile (mean over time), shares y with main
-    #  - top panel: time mean profile (mean over frequency), shares x with main
-    #  - main panel: time-frequency image
-    #  - colorbar panel: narrow colorbar
-    #  - right panel: frequency sigma profile (std over time)
-    #  - bottom panel: time sigma profile (std over frequency)
-    # fig = plt.figure(figsize=(13, 9))
     fig = plt.figure(figsize=(10, 7))
     from matplotlib.gridspec import GridSpec
+    # Appropriately enlarge the main plot when margins are hidden
+    if nomargin:
+        wr = [1.0, 8.8, 0.35, 0.6, 0.01]
+        hr = [0.6, 9.2, 0.6]
+    else:
+        wr = [1.4, 8.0, 0.35, 1.4, 0.01]
+        hr = [1.2, 8.0, 1.2]
+    
     gs = GridSpec(
         3, 5,
-        width_ratios=[1.4, 8.0, 0.35, 1.4, 0.01],  # last tiny column for spacing
-        height_ratios=[1.2, 8.0, 1.2],
+        width_ratios=wr,
+        height_ratios=hr,
         wspace=0,
         hspace=0,
         figure=fig,
     )
     ax_main = fig.add_subplot(gs[1, 1])
-    ax_top = fig.add_subplot(gs[0, 1], sharex=ax_main)
-    ax_bottom = fig.add_subplot(gs[2, 1], sharex=ax_main)
-    ax_left = fig.add_subplot(gs[1, 0], sharey=ax_main)
-    ax_right_sigma = fig.add_subplot(gs[1, 3], sharey=ax_main)
+    # Shared axes only if margins are visible to avoid unwanted coupling when hidden
+    if nomargin:
+        ax_top = fig.add_subplot(gs[0, 1]); ax_top.axis('off')
+        ax_bottom = fig.add_subplot(gs[2, 1]); ax_bottom.axis('off')
+        ax_left = fig.add_subplot(gs[1, 0]); ax_left.axis('off')
+        ax_right_sigma = fig.add_subplot(gs[1, 3]); ax_right_sigma.axis('off')
+    else:
+        ax_top = fig.add_subplot(gs[0, 1], sharex=ax_main)
+        ax_bottom = fig.add_subplot(gs[2, 1], sharex=ax_main)
+        ax_left = fig.add_subplot(gs[1, 0], sharey=ax_main)
+        ax_right_sigma = fig.add_subplot(gs[1, 3], sharey=ax_main)
+
     ax_blank_tl = fig.add_subplot(gs[0, 0]); ax_blank_tl.axis('off')
     ax_blank_bl = fig.add_subplot(gs[2, 0]); ax_blank_bl.axis('off')
     ax_blank_tr = fig.add_subplot(gs[0, 3]); ax_blank_tr.axis('off')
@@ -356,8 +420,11 @@ def test_load_fits_image(input_source, mode='dir', verbose: bool=False, mask_dir
         try:
             import matplotlib.patches as mpatches
             # Place at top left of figure, using figure relative coordinates (avoid obscuring main plot)
-            # Position fine-tuned to be near the left blank area
-            legend_ax = fig.add_axes((0.02, 0.80, 0.17, 0.18), frameon=False)
+            # Adjust legend position and size to avoid overlap with enlarged main plot
+            if nomargin:
+                legend_ax = fig.add_axes((0.005, 0.91, 0.18, 0.08), frameon=False)
+            else:
+                legend_ax = fig.add_axes((0.01, 0.83, 0.17, 0.17), frameon=False)
             legend_ax.axis('off')
             legend_patches = []
             legend_labels = []
@@ -366,14 +433,17 @@ def test_load_fits_image(input_source, mode='dir', verbose: bool=False, mask_dir
                 patch = mpatches.Patch(color=color, label=f"{class_names[cid]} ({cid})")
                 legend_patches.append(patch)
                 legend_labels.append(f"{class_names[cid]} ({cid})")
-            # Draw legend (manually placed in legend_ax)
-            legend_ax.legend(handles=legend_patches, labels=legend_labels, loc='upper left', frameon=False)
+            # Draw legend with smaller font size
+            legend_ax.legend(handles=legend_patches, labels=legend_labels, loc='upper left', frameon=False, fontsize='small')
         except Exception:
             legend_ax = None
 
     # Leave space for a figure-level title (suptitle) above the top panel
     try:
-        fig.subplots_adjust(top=0.90, bottom=0.07, left=0.045, right=0.95)
+        if nomargin:
+            fig.subplots_adjust(top=0.91, bottom=0.06, left=0.04, right=0.96)
+        else:
+            fig.subplots_adjust(top=0.90, bottom=0.07, left=0.045, right=0.95)
     except Exception:
         pass
 
@@ -384,23 +454,23 @@ def test_load_fits_image(input_source, mode='dir', verbose: bool=False, mask_dir
     colorbar.set_label('Intensity')
 
     # Initialize profile lines (use dark colors to be visible on white background)
-    top_line, = ax_top.plot([], [], color='tab:blue', lw=1.5)
-    left_line, = ax_left.plot([], [], color='tab:blue', lw=1.5)
-    right_sigma_line, = ax_right_sigma.plot([], [], color='tab:red', lw=1.5)
-    bottom_sigma_line, = ax_bottom.plot([], [], color='tab:red', lw=1.5)
+    top_line, = ax_top.plot([], [], color='tab:blue', lw=1.5, visible=not nomargin)
+    left_line, = ax_left.plot([], [], color='tab:blue', lw=1.5, visible=not nomargin)
+    right_sigma_line, = ax_right_sigma.plot([], [], color='tab:red', lw=1.5, visible=not nomargin)
+    bottom_sigma_line, = ax_bottom.plot([], [], color='tab:red', lw=1.5, visible=not nomargin)
     # Initialize threshold lines for each panel: median ± 3σ (computed from the respective 1D profile)
     # Top (time mean profile): horizontal lines
-    top_thr_low = ax_top.axhline(0.0, color='0.3', lw=1.0, ls='--', alpha=0.8, zorder=5)
-    top_thr_high = ax_top.axhline(0.0, color='0.3', lw=1.0, ls='--', alpha=0.8, zorder=5)
+    top_thr_low = ax_top.axhline(0.0, color='0.3', lw=1.0, ls='--', alpha=0.8, zorder=5, visible=not nomargin)
+    top_thr_high = ax_top.axhline(0.0, color='0.3', lw=1.0, ls='--', alpha=0.8, zorder=5, visible=not nomargin)
     # Left (frequency mean profile): vertical lines
-    left_thr_low = ax_left.axvline(0.0, color='0.3', lw=1.0, ls='--', alpha=0.8, zorder=5)
-    left_thr_high = ax_left.axvline(0.0, color='0.3', lw=1.0, ls='--', alpha=0.8, zorder=5)
+    left_thr_low = ax_left.axvline(0.0, color='0.3', lw=1.0, ls='--', alpha=0.8, zorder=5, visible=not nomargin)
+    left_thr_high = ax_left.axvline(0.0, color='0.3', lw=1.0, ls='--', alpha=0.8, zorder=5, visible=not nomargin)
     # Right (frequency sigma profile): vertical lines
-    right_thr_low = ax_right_sigma.axvline(0.0, color='0.3', lw=1.0, ls='--', alpha=0.8, zorder=5)
-    right_thr_high = ax_right_sigma.axvline(0.0, color='0.3', lw=1.0, ls='--', alpha=0.8, zorder=5)
+    right_thr_low = ax_right_sigma.axvline(0.0, color='0.3', lw=1.0, ls='--', alpha=0.8, zorder=5, visible=not nomargin)
+    right_thr_high = ax_right_sigma.axvline(0.0, color='0.3', lw=1.0, ls='--', alpha=0.8, zorder=5, visible=not nomargin)
     # Bottom (time sigma profile): horizontal lines
-    bottom_thr_low = ax_bottom.axhline(0.0, color='0.3', lw=1.0, ls='--', alpha=0.8, zorder=5)
-    bottom_thr_high = ax_bottom.axhline(0.0, color='0.3', lw=1.0, ls='--', alpha=0.8, zorder=5)
+    bottom_thr_low = ax_bottom.axhline(0.0, color='0.3', lw=1.0, ls='--', alpha=0.8, zorder=5, visible=not nomargin)
+    bottom_thr_high = ax_bottom.axhline(0.0, color='0.3', lw=1.0, ls='--', alpha=0.8, zorder=5, visible=not nomargin)
     # Configure ticks/labels per panels
     # Top panel: show x ticks/labels on TOP side, outward; hide bottom labels
     ax_top.xaxis.set_ticks_position('top')
@@ -416,9 +486,16 @@ def test_load_fits_image(input_source, mode='dir', verbose: bool=False, mask_dir
     ax_left.xaxis.set_ticks_position('bottom')
     ax_left.xaxis.set_label_position('bottom')
     ax_left.tick_params(axis='x', which='both', direction='out', top=False, labeltop=False, bottom=True, labelbottom=True)
-    # Main panel: remove left (y) and top/bottom (x) ticks/labels (bottom handled by bottom sigma panel)
-    ax_main.tick_params(axis='y', which='both', left=False, labelleft=False, right=False, labelright=False)
-    ax_main.tick_params(axis='x', which='both', top=False, labeltop=False, bottom=False, labelbottom=False)
+    # Main panel: ticks handling
+    if nomargin:
+        ax_main.tick_params(axis='both', which='both', direction='out', 
+                          left=True, labelleft=True, bottom=True, labelbottom=True)
+        ax_main.set_xlabel('Time (s)')
+        ax_main.set_ylabel('Channel')
+    else:
+        # remove left (y) and top/bottom (x) ticks/labels (bottom handled by bottom sigma panel)
+        ax_main.tick_params(axis='y', which='both', left=False, labelleft=False, right=False, labelright=False)
+        ax_main.tick_params(axis='x', which='both', top=False, labeltop=False, bottom=False, labelbottom=False)
     # Bottom sigma panel: show x ticks/labels, y-axis moved to RIGHT side (user request)
     ax_bottom.xaxis.set_ticks_position('bottom')
     ax_bottom.xaxis.set_label_position('bottom')
@@ -438,6 +515,7 @@ def test_load_fits_image(input_source, mode='dir', verbose: bool=False, mask_dir
         'idx': 0,
         'busy': False,
         'pending': 0,
+        'mask_visible': True,  # 新增：控制 Mask 的显示状态
         'thr_mult': {
             'top': 3.0,     # time mean panel (top)
             'left': 3.0,    # freq mean panel (left)
@@ -532,16 +610,7 @@ def test_load_fits_image(input_source, mode='dir', verbose: bool=False, mask_dir
                 # - blocksperread==1: idx == current subint (== index)
                 # - blocksperread>1 : current frame covers rows [start..end]
                 start_row = index * blocksperread
-                candidate_path = mask_map.get(f"{fits_bn}_sub{start_row}")
-                if candidate_path is None:
-                    candidate_path = mask_map.get(f"{fits_bn}_block{start_row}")
-
-                # Fallback to RFISimulator naming: mask_{idx}
-                if candidate_path is None:
-                    for fmt in (f"mask_{start_row}", f"sub{start_row}", f"block{start_row}", str(start_row)):
-                        if fmt in mask_map:
-                            candidate_path = mask_map[fmt]
-                            break
+                candidate_path = _find_mask_path(mask_map, fits_bn, start_row)
 
                 if candidate_path is None and blocksperread > 1:
                     # If user produced merged masks with a range suffix, try it as well
@@ -622,10 +691,10 @@ def test_load_fits_image(input_source, mode='dir', verbose: bool=False, mask_dir
                         end_row = min(start_row + blocksperread - 1, nrows_cap - 1)
                         pieces = []
                         for r in range(start_row, end_row + 1):
-                            p = mask_map.get(f"{fits_bn}_sub{r}")
+                            p = _find_mask_path(mask_map, fits_bn, r)
                             if not p:
                                 if verbose:
-                                    print(f"[Info] Missing mask for subint {r}: expected key {fits_bn}_sub{r}")
+                                    print(f"[Info] Missing mask for subint/block {r}: expected basename like {fits_bn}_sub{r} or {fits_bn}_block{r:04d}")
                                 pieces = []
                                 break
                             mi = _read_mask_png(p)
@@ -653,33 +722,22 @@ def test_load_fits_image(input_source, mode='dir', verbose: bool=False, mask_dir
                             print(f"[Warn] Mask shape {mh}x{mw} mismatches image {ih}x{iw}; skip overlay for {block_idx}")
                             mask_aligned = None
 
+                        if mask_aligned is not None and allowed_classes is not None:
+                            # Filter mask content
+                            mask_aligned = np.where(np.isin(mask_aligned, list(allowed_classes)), mask_aligned, 0)
+
                         if mask_aligned is not None:
                             rgba = np.zeros((ih, iw, 4), dtype=float)
-                            try:
-                                color_map = class_color_map
-                            except Exception:
-                                color_map = {
-                                    1: np.array([1.0, 0.55, 0.0]),
-                                    2: np.array([1.0, 0.0, 1.0]),
-                                    3: np.array([0.0, 0.0, 1.0]),
-                                    4: np.array([0.0, 1.0, 0.0]),
-                                }
-                            palette = np.array([
-                                [0.5, 0.5, 0.5],
-                                [0.0, 1.0, 1.0],
-                                [0.0, 0.85, 0.70],
-                                [0.0, 0.70, 1.00],
-                            ], dtype=float)
-
                             cls_ids = np.unique(mask_aligned)
                             cls_ids = cls_ids[cls_ids != 0]
                             for cid in cls_ids:
                                 sel = (mask_aligned == cid)
                                 cid_int = int(cid)
-                                if cid_int in color_map:
-                                    color = color_map[cid_int]
+                                if cid_int in class_color_map:
+                                    color = class_color_map[cid_int]
                                 else:
-                                    color = palette[(cid_int - 1) % len(palette)]
+                                    # Fallback to some default
+                                    color = (0.5, 0.5, 0.5)
                                 rgba[..., 0][sel] = float(color[0])
                                 rgba[..., 1][sel] = float(color[1])
                                 rgba[..., 2][sel] = float(color[2])
@@ -699,222 +757,217 @@ def test_load_fits_image(input_source, mode='dir', verbose: bool=False, mask_dir
                     mask_display.set_zorder(image_display.get_zorder() + 1)
                 except Exception:
                     pass
-                mask_display.set_visible(True)
+                # 结合全局 state 和是否存在 overlay 来决定可见性
+                mask_display.set_visible(state['mask_visible'])
             else:
                 mask_display.set_visible(False)
         else:
             mask_display.set_visible(False)
 
         # Update marginal profiles on top and left panels
-        # Time profile: mean over frequency (axis=0) -> length nsamp
-        time_profile = image.mean(axis=0)
-        time_x = np.linspace(x_left + 0.5 * tbin, x_right - 0.5 * tbin, nsamp)
-        top_line.set_data(time_x, time_profile)
-        # Set y-limits with small padding
-        if np.isfinite(time_profile).any():
-            tmin_val = float(np.nanmin(time_profile))
-            tmax_val = float(np.nanmax(time_profile))
-            if not np.isfinite(tmin_val) or not np.isfinite(tmax_val):
-                tmin_val, tmax_val = 0.0, 1.0
-            span = (tmax_val - tmin_val)
-            pad = 0.05 * span
-            if span <= 0:
-                pad = max(1.0, abs(tmax_val) * 0.05 + 1e-3)
-            ax_top.set_ylim(tmin_val - pad, tmax_val + pad)
-        ax_top.set_xlim(x_left, x_right)
-        # Compute thresholds for top panel (time mean profile) and ensure visible
-        try:
-            valid = np.isfinite(time_profile)
-            if valid.any():
-                med = float(np.nanmedian(time_profile))
-                sig = float(np.nanstd(time_profile))
-            else:
-                med = 0.0
-                sig = 0.0
-            mult = float(state['thr_mult'].get('top', 3.0))
-            low = med - mult * sig
-            high = med + mult * sig
-            top_thr_low.set_ydata([low, low])
-            top_thr_high.set_ydata([high, high])
-            top_thr_low.set_visible(True); top_thr_high.set_visible(True)
-            # Expand ylim to include thresholds if necessary
-            y0, y1 = ax_top.get_ylim()
-            new_min = min(y0, y1, low, high)
-            new_max = max(y0, y1, low, high)
-            if new_min < min(y0, y1) or new_max > max(y0, y1):
-                span = new_max - new_min
+        if not nomargin:
+            # Time profile: mean over frequency (axis=0) -> length nsamp
+            time_profile = image.mean(axis=0)
+            time_x = np.linspace(x_left + 0.5 * tbin, x_right - 0.5 * tbin, nsamp)
+            top_line.set_data(time_x, time_profile)
+            # Set y-limits with small padding
+            if np.isfinite(time_profile).any():
+                tmin_val = float(np.nanmin(time_profile))
+                tmax_val = float(np.nanmax(time_profile))
+                if not np.isfinite(tmin_val) or not np.isfinite(tmax_val):
+                    tmin_val, tmax_val = 0.0, 1.0
+                span = (tmax_val - tmin_val)
                 pad = 0.05 * span
                 if span <= 0:
-                    pad = max(1.0, abs(new_max) * 0.05 + 1e-3)
-                ax_top.set_ylim(new_min - pad, new_max + pad)
-        except Exception:
-            top_thr_low.set_visible(True); top_thr_high.set_visible(True)
+                    pad = max(1.0, abs(tmax_val) * 0.05 + 1e-3)
+                ax_top.set_ylim(tmin_val - pad, tmax_val + pad)
+            ax_top.set_xlim(x_left, x_right)
+            # Compute thresholds for top panel (time mean profile) and ensure visible
+            try:
+                valid = np.isfinite(time_profile)
+                if valid.any():
+                    med = float(np.nanmedian(time_profile))
+                    sig = float(np.nanstd(time_profile))
+                else:
+                    med = 0.0
+                    sig = 0.0
+                mult = float(state['thr_mult'].get('top', 3.0))
+                low = med - mult * sig
+                high = med + mult * sig
+                top_thr_low.set_ydata([low, low])
+                top_thr_high.set_ydata([high, high])
+                top_thr_low.set_visible(True); top_thr_high.set_visible(True)
+                # Expand ylim to include thresholds if necessary
+                y0, y1 = ax_top.get_ylim()
+                new_min = min(y0, y1, low, high)
+                new_max = max(y0, y1, low, high)
+                if new_min < min(y0, y1) or new_max > max(y0, y1):
+                    span = new_max - new_min
+                    pad = 0.05 * span
+                    if span <= 0:
+                        pad = max(1.0, abs(new_max) * 0.05 + 1e-3)
+                    ax_top.set_ylim(new_min - pad, new_max + pad)
+            except Exception:
+                top_thr_low.set_visible(True); top_thr_high.set_visible(True)
 
-        # Frequency mean profile: mean over time (axis=1) -> length nchan
-        freq_mean_profile = image.mean(axis=1)
-        freq_y = np.linspace(y_top - 0.5, y_bottom + 0.5, nchan)
-        left_line.set_data(freq_mean_profile, freq_y)
-        # Frequency sigma profile: std over time (axis=1)
-        freq_sigma_profile = image.std(axis=1)
-        right_sigma_line.set_data(freq_sigma_profile, freq_y)
-        # Set x-limits with small padding for mean panel
-        if np.isfinite(freq_mean_profile).any():
-            fmin_val = float(np.nanmin(freq_mean_profile))
-            fmax_val = float(np.nanmax(freq_mean_profile))
-            if not np.isfinite(fmin_val) or not np.isfinite(fmax_val):
-                fmin_val, fmax_val = 0.0, 1.0
-            span_mean = (fmax_val - fmin_val)
-            pad_mean = 0.05 * span_mean
-            if span_mean <= 0:
-                pad_mean = max(1.0, abs(fmax_val) * 0.05 + 1e-3)
-            ax_left.set_xlim(fmin_val - pad_mean, fmax_val + pad_mean)
-        # Compute thresholds for left panel (frequency mean profile) and ensure visible
-        try:
-            valid = np.isfinite(freq_mean_profile)
-            if valid.any():
-                med = float(np.nanmedian(freq_mean_profile))
-                sig = float(np.nanstd(freq_mean_profile))
-            else:
-                med = 0.0
-                sig = 0.0
-            mult = float(state['thr_mult'].get('left', 3.0))
-            low = med - mult * sig
-            high = med + mult * sig
-            left_thr_low.set_xdata([low, low])
-            left_thr_high.set_xdata([high, high])
-            left_thr_low.set_visible(True); left_thr_high.set_visible(True)
-            # Expand xlim to include thresholds if necessary
-            x0, x1 = ax_left.get_xlim()
-            new_min = min(x0, x1, low, high)
-            new_max = max(x0, x1, low, high)
-            if new_min < min(x0, x1) or new_max > max(x0, x1):
-                span = new_max - new_min
-                pad = 0.05 * span
-                if span <= 0:
-                    pad = max(1.0, abs(new_max) * 0.05 + 1e-3)
-                ax_left.set_xlim(new_min - pad, new_max + pad)
-        except Exception:
-            left_thr_low.set_visible(True); left_thr_high.set_visible(True)
-        # Set x-limits for sigma panel
-        if np.isfinite(freq_sigma_profile).any():
-            fs_min = float(np.nanmin(freq_sigma_profile))
-            fs_max = float(np.nanmax(freq_sigma_profile))
-            if not np.isfinite(fs_min) or not np.isfinite(fs_max):
-                fs_min, fs_max = 0.0, 1.0
-            span_sig = (fs_max - fs_min)
-            pad_sig = 0.05 * span_sig
-            if span_sig <= 0:
-                pad_sig = max(1.0, abs(fs_max) * 0.05 + 1e-3)
-            ax_right_sigma.set_xlim(fs_min - pad_sig, fs_max + pad_sig)
-        ax_left.set_ylim(y_bottom, y_top)
-        ax_right_sigma.set_ylim(y_bottom, y_top)
-        # Compute thresholds for right sigma panel (frequency sigma profile) and ensure visible
-        try:
-            valid = np.isfinite(freq_sigma_profile)
-            if valid.any():
-                med = float(np.nanmedian(freq_sigma_profile))
-                sig = float(np.nanstd(freq_sigma_profile))
-            else:
-                med = 0.0
-                sig = 0.0
-            mult = float(state['thr_mult'].get('right', 3.0))
-            low = med - mult * sig
-            high = med + mult * sig
-            right_thr_low.set_xdata([low, low])
-            right_thr_high.set_xdata([high, high])
-            right_thr_low.set_visible(True); right_thr_high.set_visible(True)
-            # Expand xlim to include thresholds if necessary
-            x0, x1 = ax_right_sigma.get_xlim()
-            new_min = min(x0, x1, low, high)
-            new_max = max(x0, x1, low, high)
-            if new_min < min(x0, x1) or new_max > max(x0, x1):
-                span = new_max - new_min
-                pad = 0.05 * span
-                if span <= 0:
-                    pad = max(1.0, abs(new_max) * 0.05 + 1e-3)
-                ax_right_sigma.set_xlim(new_min - pad, new_max + pad)
-        except Exception:
-            right_thr_low.set_visible(True); right_thr_high.set_visible(True)
+            # Frequency mean profile: mean over time (axis=1) -> length nchan
+            freq_mean_profile = image.mean(axis=1)
+            freq_y = np.linspace(y_top - 0.5, y_bottom + 0.5, nchan)
+            left_line.set_data(freq_mean_profile, freq_y)
+            # Frequency sigma profile: std over time (axis=1)
+            freq_sigma_profile = image.std(axis=1)
+            right_sigma_line.set_data(freq_sigma_profile, freq_y)
+            # Set x-limits with small padding for mean panel
+            if np.isfinite(freq_mean_profile).any():
+                fmin_val = float(np.nanmin(freq_mean_profile))
+                fmax_val = float(np.nanmax(freq_mean_profile))
+                if not np.isfinite(fmin_val) or not np.isfinite(fmax_val):
+                    fmin_val, fmax_val = 0.0, 1.0
+                span_mean = (fmax_val - fmin_val)
+                pad_mean = 0.05 * span_mean
+                if span_mean <= 0:
+                    pad_mean = max(1.0, abs(fmax_val) * 0.05 + 1e-3)
+                ax_left.set_xlim(fmin_val - pad_mean, fmax_val + pad_mean)
+            # Compute thresholds for left panel (frequency mean profile) and ensure visible
+            try:
+                valid = np.isfinite(freq_mean_profile)
+                if valid.any():
+                    med = float(np.nanmedian(freq_mean_profile))
+                    sig = float(np.nanstd(freq_mean_profile))
+                else:
+                    med = 0.0
+                    sig = 0.0
+                mult = float(state['thr_mult'].get('left', 3.0))
+                low = med - mult * sig
+                high = med + mult * sig
+                left_thr_low.set_xdata([low, low])
+                left_thr_high.set_xdata([high, high])
+                left_thr_low.set_visible(True); left_thr_high.set_visible(True)
+                # Expand xlim to include thresholds if necessary
+                x0, x1 = ax_left.get_xlim()
+                new_min = min(x0, x1, low, high)
+                new_max = max(x0, x1, low, high)
+                if new_min < min(x0, x1) or new_max > max(x0, x1):
+                    span = new_max - new_min
+                    pad = 0.05 * span
+                    if span <= 0:
+                        pad = max(1.0, abs(new_max) * 0.05 + 1e-3)
+                    ax_left.set_xlim(new_min - pad, new_max + pad)
+            except Exception:
+                left_thr_low.set_visible(True); left_thr_high.set_visible(True)
+            # Set x-limits for sigma panel
+            if np.isfinite(freq_sigma_profile).any():
+                fs_min = float(np.nanmin(freq_sigma_profile))
+                fs_max = float(np.nanmax(freq_sigma_profile))
+                if not np.isfinite(fs_min) or not np.isfinite(fs_max):
+                    fs_min, fs_max = 0.0, 1.0
+                span_sig = (fs_max - fs_min)
+                pad_sig = 0.05 * span_sig
+                if span_sig <= 0:
+                    pad_sig = max(1.0, abs(fs_max) * 0.05 + 1e-3)
+                ax_right_sigma.set_xlim(fs_min - pad_sig, fs_max + pad_sig)
+            ax_left.set_ylim(y_bottom, y_top)
+            ax_right_sigma.set_ylim(y_bottom, y_top)
+            # Compute thresholds for right sigma panel (frequency sigma profile) and ensure visible
+            try:
+                valid = np.isfinite(freq_sigma_profile)
+                if valid.any():
+                    med = float(np.nanmedian(freq_sigma_profile))
+                    sig = float(np.nanstd(freq_sigma_profile))
+                else:
+                    med = 0.0
+                    sig = 0.0
+                mult = float(state['thr_mult'].get('right', 3.0))
+                low = med - mult * sig
+                high = med + mult * sig
+                right_thr_low.set_xdata([low, low])
+                right_thr_high.set_xdata([high, high])
+                right_thr_low.set_visible(True); right_thr_high.set_visible(True)
+                # Expand xlim to include thresholds if necessary
+                x0, x1 = ax_right_sigma.get_xlim()
+                new_min = min(x0, x1, low, high)
+                new_max = max(x0, x1, low, high)
+                if new_min < min(x0, x1) or new_max > max(x0, x1):
+                    span = new_max - new_min
+                    pad = 0.05 * span
+                    if span <= 0:
+                        pad = max(1.0, abs(new_max) * 0.05 + 1e-3)
+                    ax_right_sigma.set_xlim(new_min - pad, new_max + pad)
+            except Exception:
+                right_thr_low.set_visible(True); right_thr_high.set_visible(True)
 
-        # Force plain tick labels on x-axis: no scientific, no offset string
-        try:
-            from matplotlib.ticker import ScalarFormatter
-            sf = ScalarFormatter(useOffset=False)
-            sf.set_scientific(False)
-            ax_main.xaxis.set_major_formatter(sf)
-            # Alternatively, ensure style plain
-            ax_main.ticklabel_format(axis='x', style='plain', useOffset=False)
-        except Exception:
-            pass
+            # Update title and labels (use a figure-level title to avoid being covered by the top panel)
+            # Bottom sigma profile: std over frequency (axis=0)
+            time_sigma_profile = image.std(axis=0)
+            bottom_sigma_line.set_data(time_x, time_sigma_profile)
+            if np.isfinite(time_sigma_profile).any():
+                ts_min = float(np.nanmin(time_sigma_profile))
+                ts_max = float(np.nanmax(time_sigma_profile))
+                if not np.isfinite(ts_min) or not np.isfinite(ts_max):
+                    ts_min, ts_max = 0.0, 1.0
+                span_ts = ts_max - ts_min
+                pad_ts = 0.05 * span_ts
+                if span_ts <= 0:
+                    pad_ts = max(1.0, abs(ts_max) * 0.05 + 1e-3)
+                ax_bottom.set_ylim(ts_min - pad_ts, ts_max + pad_ts)
+            ax_bottom.set_xlim(x_left, x_right)
+            # Compute thresholds for bottom sigma panel (time sigma profile) and ensure visible
+            try:
+                valid = np.isfinite(time_sigma_profile)
+                if valid.any():
+                    med = float(np.nanmedian(time_sigma_profile))
+                    sig = float(np.nanstd(time_sigma_profile))
+                else:
+                    med = 0.0
+                    sig = 0.0
+                mult = float(state['thr_mult'].get('bottom', 3.0))
+                low = med - mult * sig
+                high = med + mult * sig
+                bottom_thr_low.set_ydata([low, low])
+                bottom_thr_high.set_ydata([high, high])
+                bottom_thr_low.set_visible(True); bottom_thr_high.set_visible(True)
+                # Expand ylim to include thresholds if necessary
+                y0, y1 = ax_bottom.get_ylim()
+                new_min = min(y0, y1, low, high)
+                new_max = max(y0, y1, low, high)
+                if new_min < min(y0, y1) or new_max > max(y0, y1):
+                    span = new_max - new_min
+                    pad = 0.05 * span
+                    if span <= 0:
+                        pad = max(1.0, abs(new_max) * 0.05 + 1e-3)
+                    ax_bottom.set_ylim(new_min - pad, new_max + pad)
+            except Exception:
+                bottom_thr_low.set_visible(True); bottom_thr_high.set_visible(True)
 
-        # Update title and labels (use a figure-level title to avoid being covered by the top panel)
-        # Bottom sigma profile: std over frequency (axis=0)
-        time_sigma_profile = image.std(axis=0)
-        bottom_sigma_line.set_data(time_x, time_sigma_profile)
-        if np.isfinite(time_sigma_profile).any():
-            ts_min = float(np.nanmin(time_sigma_profile))
-            ts_max = float(np.nanmax(time_sigma_profile))
-            if not np.isfinite(ts_min) or not np.isfinite(ts_max):
-                ts_min, ts_max = 0.0, 1.0
-            span_ts = ts_max - ts_min
-            pad_ts = 0.05 * span_ts
-            if span_ts <= 0:
-                pad_ts = max(1.0, abs(ts_max) * 0.05 + 1e-3)
-            ax_bottom.set_ylim(ts_min - pad_ts, ts_max + pad_ts)
-        ax_bottom.set_xlim(x_left, x_right)
-        # Compute thresholds for bottom sigma panel (time sigma profile) and ensure visible
-        try:
-            valid = np.isfinite(time_sigma_profile)
-            if valid.any():
-                med = float(np.nanmedian(time_sigma_profile))
-                sig = float(np.nanstd(time_sigma_profile))
-            else:
-                med = 0.0
-                sig = 0.0
-            mult = float(state['thr_mult'].get('bottom', 3.0))
-            low = med - mult * sig
-            high = med + mult * sig
-            bottom_thr_low.set_ydata([low, low])
-            bottom_thr_high.set_ydata([high, high])
-            bottom_thr_low.set_visible(True); bottom_thr_high.set_visible(True)
-            # Expand ylim to include thresholds if necessary
-            y0, y1 = ax_bottom.get_ylim()
-            new_min = min(y0, y1, low, high)
-            new_max = max(y0, y1, low, high)
-            if new_min < min(y0, y1) or new_max > max(y0, y1):
-                span = new_max - new_min
-                pad = 0.05 * span
-                if span <= 0:
-                    pad = max(1.0, abs(new_max) * 0.05 + 1e-3)
-                ax_bottom.set_ylim(new_min - pad, new_max + pad)
-        except Exception:
-            bottom_thr_low.set_visible(True); bottom_thr_high.set_visible(True)
+            ax_top.set_ylabel(r'$\bar{x}_{Time}$')
+            # Make top panel y-label horizontal on the right
+            try:
+                ax_top.yaxis.label.set_rotation(0)
+                ax_top.yaxis.label.set_verticalalignment('center')
+                ax_top.yaxis.label.set_horizontalalignment('left')
+                ax_top.yaxis.set_label_coords(1.02, 0.5)
+            except Exception:
+                pass
+            ax_left.set_xlabel(r'$\bar{x}_{Freq}$')
+            ax_right_sigma.set_xlabel(r'$\sigma_{Time}$')
+            ax_right_sigma.set_ylabel('Channel')
+            ax_bottom.set_ylabel(r'$\sigma_{Freq}$')
+            # Make bottom panel y-label horizontal on the right
+            try:
+                ax_bottom.yaxis.label.set_rotation(0)
+                ax_bottom.yaxis.label.set_verticalalignment('center')
+                ax_bottom.yaxis.label.set_horizontalalignment('left')
+                ax_bottom.yaxis.set_label_coords(1.02, 0.5)
+            except Exception:
+                pass
+            ax_bottom.set_xlabel('Time (s)')
+        else:
+            # When nomargin is True, Ensure ax_main has labels and ticks are shown
+            ax_main.tick_params(axis='both', which='both', labelleft=True, labelbottom=True)
+            ax_main.set_xlabel('Time (s)')
+            ax_main.set_ylabel('Channel')
 
-        fig.suptitle(f'[{index+1}/{total}] {name}  (←/→:step, J:jump-to, Esc:quit)')
-        ax_main.set_xlabel('Time since first sample (s)')
-        ax_main.set_ylabel('Channel (index)')
-        ax_top.set_ylabel(r'$\bar{x}_{Time}$')
-        # Make top panel y-label horizontal on the right
-        try:
-            ax_top.yaxis.label.set_rotation(0)
-            ax_top.yaxis.label.set_verticalalignment('center')
-            ax_top.yaxis.label.set_horizontalalignment('left')
-            ax_top.yaxis.set_label_coords(1.02, 0.5)
-        except Exception:
-            pass
-        ax_left.set_xlabel(r'$\bar{x}_{Freq}$')
-        ax_right_sigma.set_xlabel(r'$\sigma_{Time}$')
-        ax_right_sigma.set_ylabel('Channel')
-        ax_bottom.set_ylabel(r'$\sigma_{Freq}$')
-        # Make bottom panel y-label horizontal on the right
-        try:
-            ax_bottom.yaxis.label.set_rotation(0)
-            ax_bottom.yaxis.label.set_verticalalignment('center')
-            ax_bottom.yaxis.label.set_horizontalalignment('left')
-            ax_bottom.yaxis.set_label_coords(1.02, 0.5)
-        except Exception:
-            pass
-        ax_bottom.set_xlabel('Time (s)')
+        fig.suptitle(f"File: {name} (Frame {index+1}/{total})")
 
         # Do not draw here; draw synchronously in navigation to avoid frame skipping
         state['idx'] = index
@@ -1062,6 +1115,13 @@ def test_load_fits_image(input_source, mode='dir', verbose: bool=False, mask_dir
                     state['thr_mult']['bottom'] = max(0.0, float(val))
                     show(state['idx'])
                     fig.canvas.draw(); plt.pause(0.001)
+        elif key in ('m', 'M'):
+            # 切换 Mask 显示状态
+            if not state['busy']:
+                state['mask_visible'] = not state['mask_visible']
+                print(f"[Info] Mask visibility: {'ON' if state['mask_visible'] else 'OFF'}")
+                show(state['idx'])
+                fig.canvas.draw(); plt.pause(0.001)
         elif key in ('escape',):
             plt.close(fig)
 
@@ -1152,6 +1212,10 @@ if __name__ == "__main__":
                         help='Disable mask overlay (overrides --mask).')
     parser.add_argument('--mask-alpha', type=float, default=0.7,
                         help='Alpha (opacity) for mask overlay in [0,1]. Default: 0.7')
+    parser.add_argument('--showclass', type=str, default=None, 
+                        help='Optional string of class IDs to show (e.g. "12678").')
+    parser.add_argument('--nomargin', action='store_true',
+                        help='Do not plot the four marginal integration curves around the main plot.')
     args = parser.parse_args()
 
     mode = 'dir'
@@ -1225,4 +1289,4 @@ if __name__ == "__main__":
             print(f"[Warn] Mask dir not found: {mask_dir}, overlay disabled.")
             mask_dir = None
 
-    test_load_fits_image(target_path, mode=mode, verbose=args.verbose, mask_dir=mask_dir, mask_alpha=args.mask_alpha, blocksperread=args.blocksperread)
+    test_load_fits_image(target_path, mode=mode, verbose=args.verbose, mask_dir=mask_dir, mask_alpha=args.mask_alpha, blocksperread=args.blocksperread, show_class=args.showclass, nomargin=args.nomargin)

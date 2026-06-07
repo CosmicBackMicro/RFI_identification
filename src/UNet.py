@@ -1,3 +1,4 @@
+import torch
 import cv2
 # 优化点: 禁用 OpenCV 的内部多线程，防止在多进程环境下线程数溢出 (同步自 TrainingOnServer)
 cv2.setNumThreads(0)
@@ -16,6 +17,9 @@ from typing import Any, cast, Optional, List
 import albumentations as albu
 
 import sys
+
+# 💡 针对国内网络环境优化：添加 Hugging Face 镜像站地址
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 # 避免 cudagraph 池相关错误
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
@@ -47,9 +51,8 @@ except Exception:
 import torch.nn as nn
 import torch.nn.functional as F
 try:
-    # 禁用 Flash / Mem-Efficient SDPA，避免某些环境下与 CUDA graphs/池的交互问题
+    # 启用 Flash / Mem-Efficient SDPA，显著提升性能
     from torch.backends.cuda import sdp_kernel
-    sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True)
 except Exception:
     pass
 
@@ -155,36 +158,30 @@ class FocalTverskyLoss(nn.Module):
 # MobileMamba 已移除 —— 保持代码库为 SegFormer-only，以简化运行并消除对本地 CUDA 扩展的依赖。
 
 class UNetLightningModule(pl.LightningModule):
-    def __init__(self, encoder_name="segformer-b2", classes=2, learning_rate=0.0001, scheduler_type="cosine_warmup", class_weights=None, focal_gamma: float = 2.0, loss_alpha: float = 0.7, loss_beta: float = 0.3, ce_weight: float = 0.5, ft_weight: float = 0.5, use_compile: bool = False, ft_warmup_epochs: int = 5, class_names: Optional[List[str]] = None):
+    def __init__(self, encoder_name="mit_b2", classes=2, learning_rate=0.0001, scheduler_type="cosine_warmup", class_weights=None, focal_gamma: float = 2.0, loss_alpha: float = 0.7, loss_beta: float = 0.3, ce_weight: float = 0.5, ft_weight: float = 0.5, use_compile: bool = False, ft_warmup_epochs: int = 5, class_names: Optional[List[str]] = None, point_class_index: int = 3, point_aux_weight: float = 0.0):
         super().__init__()
         self.save_hyperparameters()
         self.scheduler_type = scheduler_type
         self.num_classes = classes
         self.use_compile = use_compile
         self.ft_warmup_epochs = ft_warmup_epochs  # 前若干epoch逐步增加FT权重，稳定早期训练
+        self.point_class_index = point_class_index
+        self.point_aux_weight = point_aux_weight
 
-        # 始终使用 SegFormer 作为 backbone（已移除 MobileMamba 支持）
-        self.backbone_type = "segformer"
-        enc = (encoder_name or "").lower()
-        # 当用户选择含 b2 时使用较大配置，否则使用默认小型配置
-        if "b2" in enc:
-            config = SegformerConfig(
-                num_labels=classes,
-                num_channels=1,
-                image_size=512,
-                hidden_sizes=[64, 128, 320, 512],
-                depths=[3, 4, 6, 3],
-                num_attention_heads=[1, 2, 5, 8],
-                intermediate_sizes=[256, 512, 1280, 2048],
-                decoder_hidden_size=768,
-            )
-        else:
-            config = SegformerConfig(
-                num_labels=classes,
-                num_channels=1,
-                image_size=512,
-            )
-        self.model = SegformerForSemanticSegmentation(config)
+        # 用于全局混淆矩阵统计
+        self._epoch_preds = []
+        self._epoch_targets = []
+
+        # 使用 U-Net 架构 + MiT-B2 编码器
+        # 不加载预训练权重，直接从随机初始化开始训练
+        self.backbone_type = "mit_b2"
+        self.model = smp.Unet(
+            encoder_name="mit_b2",        # MiT-B2 编码器 (Mix Transformer)
+            encoder_weights=None,         # 禁用 ImageNet 预训练，完全由射电数据驱动
+            in_channels=1,                # 射电 2D 数据为单通道
+            classes=classes,              # 输出类别数
+            activation=None,              # 后续 joint_loss 需要 raw logits
+        )
 
         # 类别权重（用于缓解类别不平衡）
         if class_weights is not None:
@@ -194,7 +191,7 @@ class UNetLightningModule(pl.LightningModule):
 
         self.learning_rate = learning_rate
 
-        # 交叉熵和FocalTversky
+    # 训练全程使用像素级交叉熵 + FocalTversky 组合损失
         self.ce_weight = ce_weight
         self.ft_weight = ft_weight
 
@@ -218,19 +215,9 @@ class UNetLightningModule(pl.LightningModule):
                 self.class_names = [f"class_{i}" for i in range(self.num_classes)]
             else:
                 self.class_names = class_names
-        # 用于记录每个类别的 FocalTversky Loss（不做 reduction）
-        self.focal_tversky_perclass = FocalTverskyLoss(
-            num_classes=self.num_classes,
-            alpha=loss_alpha,
-            beta=loss_beta,
-            gamma=focal_gamma,
-            smooth=1e-6,
-            label_smoothing=0.01,
-            reduction='none'
-        )
 
         # 可选：使用 torch.compile 编译以减少调度开销
-        if self.backbone_type == "segformer" and use_compile and hasattr(torch, "compile"):
+        if use_compile and hasattr(torch, "compile"):
             try:
                 # 显式在编译选项中关闭 cudagraphs，避免图池生命周期相关错误
                 self.model = torch.compile(
@@ -246,11 +233,11 @@ class UNetLightningModule(pl.LightningModule):
         
     def joint_loss(self, logits: torch.Tensor, probs: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """
-        组合损失：像素级交叉熵（cross-entropy on logits） + FocalTversky（对小目标/细节更敏感）。
+        组合损失：像素级交叉熵 + FocalTversky。
 
         Args:
-            logits: (N, C, H, W) 未归一化网络输出（已上采样到输入分辨率）
-            probs:  (N, C, H, W) softmax 后的概率
+            logits: (N, C, H, W) 未归一化网络输出
+            probs:  (N, C, H, W) softmax 后概率
             y_true: (N, H, W) 真实标签
 
         Returns:
@@ -259,19 +246,13 @@ class UNetLightningModule(pl.LightningModule):
         if y_true.dtype != torch.long:
             y_true = y_true.long()
 
-        device = logits.device
-
-        # 准备类别权重用于交叉熵（如果有的话）
         ce_weight = None
         if hasattr(self, 'class_weights') and self.class_weights is not None:
-            ce_weight = self.class_weights.to(device)
+            ce_weight = self.class_weights.to(logits.device)
 
-        # 直接对 logits 计算 cross_entropy，数值上更稳定并支持 class weights
         nll = F.cross_entropy(logits, y_true, weight=ce_weight)
-
         ft = self.focal_tversky(probs, y_true, class_weights=self.class_weights)
 
-        # 前若干个epoch对 FocalTversky 进行暖启动，减少早期优化不稳定
         try:
             epoch = int(self.current_epoch)
         except Exception:
@@ -281,20 +262,16 @@ class UNetLightningModule(pl.LightningModule):
             scale = min(1.0, max(0.0, epoch / float(self.ft_warmup_epochs)))
 
         loss = self.ce_weight * nll + (self.ft_weight * scale) * ft
-
-        # 不单独记录CE和FocalTversky子项，仅记录总loss（train_loss/val_loss）
-
         return loss
     
     def forward(self, x):
-        # 仅保留 SegFormer 路径
-        outputs = self.model(pixel_values=x)
-        logits = outputs.logits  # (N, C, h, w) 可能与输入分辨率不同
-        # 始终上采样到输入分辨率以与标签对齐
-        logits = F.interpolate(logits, size=x.shape[-2:], mode='bilinear', align_corners=False)
-
+        """
+        前向传播。
+        smp.Unet 输出的分辨率直接与输入相同 (512x512)，无需手动上采样。
+        """
+        logits = self.model(x)
         probs = torch.softmax(logits, dim=1)
-        # 返回 logits 与 probs，方便使用基于 logits 的像素损失（CE）与基于概率的结构损失（FocalTversky）
+    # 返回 logits 与 probs，分别用于基于 logits 的 CE 和基于概率的 FocalTversky
         return logits, probs
     
     def training_step(self, batch, batch_idx):
@@ -308,41 +285,36 @@ class UNetLightningModule(pl.LightningModule):
         tp, fp, fn, tn = smp.metrics.get_stats(
             preds_long, masks_long, mode='multiclass', num_classes=self.num_classes
         )
+        # 💡 重要：将 stats 按 batch 维度求和，得到 (C,)。
+        # 使用 .long() 显式转换以满足 smp 指标对 LongTensor 的类型要求，并确保 per_class_f1[i] 为标量。
+
+        tp, fp, fn, tn = tp.sum(dim=0), fp.sum(dim=0), fn.sum(dim=0), tn.sum(dim=0)
+        tp, fp, fn, tn = tp.long(), fp.long(), fn.long(), tn.long()
+
         # Micro（整体）与 Macro（逐类平均）指标
-        iou = smp.metrics.iou_score(tp, fp, fn, tn, reduction="micro")  # micro IoU
-        f1 = smp.metrics.f1_score(tp, fp, fn, tn, reduction="micro")    # micro F1
-        miou = smp.metrics.iou_score(tp, fp, fn, tn, reduction="macro")  # macro IoU (mIoU)
+        iou = smp.metrics.iou_score(tp, fp, fn, tn, reduction="micro")
+        f1 = smp.metrics.f1_score(tp, fp, fn, tn, reduction="micro")
+        miou = smp.metrics.iou_score(tp, fp, fn, tn, reduction="macro")
         macro_f1 = smp.metrics.f1_score(tp, fp, fn, tn, reduction="macro")
-        accuracy = smp.metrics.accuracy(tp, fp, fn, tn, reduction="micro")
-        
+
         # 前景宏平均：忽略背景类0
-        per_class_iou = smp.metrics.iou_score(tp, fp, fn, tn, reduction="none")
         per_class_f1  = smp.metrics.f1_score(tp, fp, fn, tn, reduction="none")
+        per_class_iou = smp.metrics.iou_score(tp, fp, fn, tn, reduction="none")
+
         if self.num_classes > 1:
             train_fg_macro_f1 = per_class_f1[1:].mean()
-            train_fg_macro_iou = per_class_iou[1:].mean()
+            train_fg_miou = per_class_iou[1:].mean()
             # 在进度条显示无背景（前景宏平均）F1 的 step 值
-            self.log('train_fg_macro_f1', train_fg_macro_f1, on_step=True, on_epoch=True, prog_bar=True)
-            # 其余保持为 epoch 级统计
-            self.log('train_fg_macro_iou', train_fg_macro_iou, on_step=False, on_epoch=True, prog_bar=False)
-
-        # 记录每个类别的 FocalTversky loss（按 epoch 汇总）
-        try:
-            per_class_ft = self.focal_tversky_perclass(probs, masks, class_weights=self.class_weights)
-            for c, v in enumerate(per_class_ft):
-                name = self.class_names[c] if c < len(self.class_names) else f"class_{c}"
-                self.log(f"train_ft_{name}", v, on_step=False, on_epoch=True, prog_bar=False)
-        except Exception:
-            pass
-
-        # 记录整体 TP/TN/FP/FN（
+            self.log('train_fg_f1', train_fg_macro_f1, on_step=True, on_epoch=True, prog_bar=True)
+            self.log('train_fg_miou', train_fg_miou, on_step=False, on_epoch=True, prog_bar=False)
+            # 💡 记录每个类别的 F1 (Epoch 级)
+            for i, name in enumerate(self.class_names):
+                self.log(f'train_f1_cls_{i}_{name}', per_class_f1[i], on_epoch=True, prog_bar=False)
+                self.log(f'train_iou_cls_{i}_{name}', per_class_iou[i], on_epoch=True, prog_bar=False)
+        # 记录整体指标
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
-        self.log('train_iou', iou, on_step=False, on_epoch=True, prog_bar=False)
-        self.log('train_f1', f1, on_step=False, on_epoch=True, prog_bar=False)
-        self.log('train_miou', miou, on_step=False, on_epoch=True, prog_bar=False)
         self.log('train_macro_f1', macro_f1, on_step=False, on_epoch=True, prog_bar=False)
-        self.log('train_accuracy', accuracy, on_step=False, on_epoch=True, prog_bar=False)
-
+        self.log('train_miou', miou, on_step=False, on_epoch=True, prog_bar=False)
         return loss
     
     def validation_step(self, batch, batch_idx):
@@ -360,44 +332,104 @@ class UNetLightningModule(pl.LightningModule):
         tp, fp, fn, tn = smp.metrics.get_stats(
             preds_long, masks_long, mode='multiclass', num_classes=self.num_classes
         )
-        iou = smp.metrics.iou_score(tp, fp, fn, tn, reduction="micro")      # micro IoU
-        f1 = smp.metrics.f1_score(tp, fp, fn, tn, reduction="micro")        # micro F1
-        miou = smp.metrics.iou_score(tp, fp, fn, tn, reduction="macro")      # macro IoU (mIoU)
-        macro_f1 = smp.metrics.f1_score(tp, fp, fn, tn, reduction="macro")   # macro F1
-        accuracy = smp.metrics.accuracy(tp, fp, fn, tn, reduction="micro")
+        # 💡 重要：聚合为 (C,) 确保 per_class_f1[i] 为标量，避免维度不匹配导致的 log 错误。
+        tp, fp, fn, tn = tp.sum(dim=0).long(), fp.sum(dim=0).long(), fn.sum(dim=0).long(), tn.sum(dim=0).long()
+
+        iou = smp.metrics.iou_score(tp, fp, fn, tn, reduction="micro")
+        f1 = smp.metrics.f1_score(tp, fp, fn, tn, reduction="micro")
+        miou = smp.metrics.iou_score(tp, fp, fn, tn, reduction="macro")
+        macro_f1 = smp.metrics.f1_score(tp, fp, fn, tn, reduction="macro")
 
         # 前景宏平均：忽略背景类0，作为主监控指标
-        per_class_iou = smp.metrics.iou_score(tp, fp, fn, tn, reduction="none")
         per_class_f1  = smp.metrics.f1_score(tp, fp, fn, tn, reduction="none")
+        per_class_iou = smp.metrics.iou_score(tp, fp, fn, tn, reduction="none")
+        per_class_acc = smp.metrics.accuracy(cast(torch.LongTensor, tp.long()), cast(torch.LongTensor, fp.long()), cast(torch.LongTensor, fn.long()), cast(torch.LongTensor, tn.long()), reduction="none")
+        per_class_pre = smp.metrics.precision(cast(torch.LongTensor, tp.long()), cast(torch.LongTensor, fp.long()), cast(torch.LongTensor, fn.long()), cast(torch.LongTensor, tn.long()), reduction="none")
+        per_class_rec = smp.metrics.recall(cast(torch.LongTensor, tp.long()), cast(torch.LongTensor, fp.long()), cast(torch.LongTensor, fn.long()), cast(torch.LongTensor, tn.long()), reduction="none")
+
         if self.num_classes > 1:
             val_fg_macro_f1 = per_class_f1[1:].mean()
-            val_fg_macro_iou = per_class_iou[1:].mean()
+            val_fg_miou = per_class_iou[1:].mean()
+            
+            # 💡 记录验证集每个类别的 F1 / IoU / Accuracy / Precision / Recall，便于定位模型在哪些 RFI 类型上较弱
+            for i, name in enumerate(self.class_names):
+                self.log(f'val_f1_cls_{i}_{name}', per_class_f1[i], on_epoch=True, prog_bar=False)
+                self.log(f'val_iou_cls_{i}_{name}', per_class_iou[i], on_epoch=True, prog_bar=False)
+                self.log(f'val_acc_cls_{i}_{name}', per_class_acc[i], on_epoch=True, prog_bar=False)
+                self.log(f'val_pre_cls_{i}_{name}', per_class_pre[i], on_epoch=True, prog_bar=False)
+                self.log(f'val_rec_cls_{i}_{name}', per_class_rec[i], on_epoch=True, prog_bar=False)
         else:
             val_fg_macro_f1 = per_class_f1.mean()
-            val_fg_macro_iou = per_class_iou.mean()
+            val_fg_miou = per_class_iou.mean()
 
-        self.log('val_fg_macro_f1', val_fg_macro_f1, on_step=False, on_epoch=True, prog_bar=True)
-        self.log('val_fg_macro_iou', val_fg_macro_iou, on_step=False, on_epoch=True, prog_bar=False)
-
-        # 记录整体 TP/TN/FP/FN（按 epoch 聚合）
-    # 不再记录 TP/TN/FP/FN，避免日志噪声
-        
         self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
-        # 记录每个类别的 FocalTversky Loss（按 epoch 汇总）
-        try:
-            per_class_ft = self.focal_tversky_perclass(probs, masks, class_weights=self.class_weights)
-            for c, v in enumerate(per_class_ft):
-                name = self.class_names[c] if c < len(self.class_names) else f"class_{c}"
-                self.log(f'val_ft_{name}', v, on_step=False, on_epoch=True, prog_bar=False)
-        except Exception:
-            pass
-        self.log('val_iou', iou, on_step=False, on_epoch=True, prog_bar=True)
-        self.log('val_f1', f1, on_step=False, on_epoch=True, prog_bar=True)
-        self.log('val_miou', miou, on_step=False, on_epoch=True, prog_bar=True)
-        self.log('val_macro_f1', macro_f1, on_step=False, on_epoch=True, prog_bar=True)
-        self.log('val_accuracy', accuracy, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('val_fg_macro_f1', val_fg_macro_f1, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('val_fg_miou', val_fg_miou, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('val_macro_f1', macro_f1, on_step=False, on_epoch=True, prog_bar=False)
+        self.log('val_miou', miou, on_step=False, on_epoch=True, prog_bar=False)
         
+        # ====== 全局混淆矩阵收集 ======
+        # flatten & detach to cpu
+        preds_np = preds.detach().cpu().numpy().flatten()
+        masks_np = masks.detach().cpu().numpy().flatten()
+        # 过滤 ignore_index=255（如有）
+        valid_mask = (masks_np != 255)
+        if np.any(valid_mask):
+            self._epoch_preds.append(preds_np[valid_mask])
+            self._epoch_targets.append(masks_np[valid_mask])
+
         return loss
+    def validation_epoch_end(self, outputs):
+        """
+        在每个epoch结束时，基于全量像素统计混淆矩阵，并计算IoU、F1、Precision、Recall等指标，保证与推理脚本一致。
+        """
+        import numpy as np
+        from sklearn.metrics import confusion_matrix
+
+        if len(self._epoch_preds) == 0 or len(self._epoch_targets) == 0:
+            return
+        y_pred = np.concatenate(self._epoch_preds)
+        y_true = np.concatenate(self._epoch_targets)
+        # 清空缓存，防止内存泄漏
+        self._epoch_preds.clear()
+        self._epoch_targets.clear()
+
+        num_classes = self.num_classes
+        cm = confusion_matrix(y_true, y_pred, labels=range(num_classes))
+
+        # 计算 per-class 指标
+        TP = np.diag(cm)
+        FP = cm.sum(axis=0) - TP
+        FN = cm.sum(axis=1) - TP
+        TN = cm.sum() - (FP + FN + TP)
+
+        # 避免除零
+        eps = 1e-9
+        precision = (TP + eps) / (TP + FP + eps)
+        recall = (TP + eps) / (TP + FN + eps)
+        iou = (TP + eps) / (TP + FP + FN + eps)
+        f1 = 2 * precision * recall / (precision + recall + eps)
+
+        # log per-class指标
+        for i, name in enumerate(self.class_names):
+            self.log(f'val_global_f1_cls_{i}_{name}', f1[i], on_epoch=True, prog_bar=False)
+            self.log(f'val_global_iou_cls_{i}_{name}', iou[i], on_epoch=True, prog_bar=False)
+            self.log(f'val_global_pre_cls_{i}_{name}', precision[i], on_epoch=True, prog_bar=False)
+            self.log(f'val_global_rec_cls_{i}_{name}', recall[i], on_epoch=True, prog_bar=False)
+
+        # log 宏平均（不含背景）
+        if num_classes > 1:
+            fg_slice = slice(1, None)
+            macro_f1 = f1[fg_slice].mean()
+            macro_iou = iou[fg_slice].mean()
+        else:
+            macro_f1 = f1.mean()
+            macro_iou = iou.mean()
+        self.log('val_global_fg_macro_f1', macro_f1, on_epoch=True, prog_bar=True)
+        self.log('val_global_fg_miou', macro_iou, on_epoch=True, prog_bar=True)
+
+        # 可选：保存混淆矩阵到文件
+        # np.save(f'confusion_matrix_epoch{self.current_epoch}.npy', cm)
     
     def configure_optimizers(self) -> Any:
         optimizer = torch.optim.AdamW(
@@ -416,7 +448,7 @@ class UNetLightningModule(pl.LightningModule):
     
     def get_scheduler_config(self, optimizer, scheduler_type="cosine_warmup"):
         """
-        获取学习率调度器配置（精简版，当前仅保留 "cosine_warmup"）。
+    获取学习率调度器配置（warmup + cosine annealing）。
 
         Args:
             optimizer: torch optimizer
@@ -426,22 +458,22 @@ class UNetLightningModule(pl.LightningModule):
             scheduler配置字典，供 Lightning 使用
         """
 
-        # 目前项目中只使用 "cosine_warmup"，其它分支已移除以简化行为
+        # 当前项目中仅保留简单稳定的 warmup + cosine 调度策略
         if scheduler_type != "cosine_warmup":
             raise ValueError(f"Unsupported scheduler type: {scheduler_type} (only 'cosine_warmup' allowed)")
 
-        # 线性warmup若干epoch，然后余弦退火（不重启），更平滑
-        warmup_epochs = 5
-        # 默认回退为 100，但如果 Trainer 已附着到 model，使用 trainer.max_epochs 更精确
-        total_epochs = 100
+        # 使用 1 个 epoch 的线性 warmup，再衔接余弦退火到训练结束。
+        warmup_epochs = 1
+        # 默认回退，但如果 Trainer 已附着到 model，使用 trainer.max_epochs 更精确
+        total_epochs = 25
         if hasattr(self, 'trainer') and getattr(self.trainer, 'max_epochs', None) is not None:
             try:
                 total_epochs = int(cast(int, self.trainer.max_epochs))
             except Exception:
                 pass
         from torch.optim.lr_scheduler import LinearLR, SequentialLR, CosineAnnealingLR
-        warmup = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_epochs)
-        cosine = CosineAnnealingLR(optimizer, T_max=max(1, total_epochs - warmup_epochs), eta_min=1e-6)
+        warmup = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_epochs)
+        cosine = CosineAnnealingLR(optimizer, T_max=max(1, total_epochs - warmup_epochs), eta_min=5e-6)
         scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs])
         return {
             'scheduler': scheduler,
@@ -498,6 +530,10 @@ class FITSDataset(Dataset):
             augmentation = None,
             preprocessing = None,
             normalization_method = "percentile",  # 新增参数
+            crop_size: int = 768,
+            point_class_value: int = 6,
+            point_oversample_factor: float = 3.0,
+            point_crop_prob: float = 0.7,
     ):
         # ============ 新的配对策略：按文件基名匹配 ============
         all_image_files = [f for f in os.listdir(image_dir) if f.lower().endswith('.fits')]
@@ -516,6 +552,10 @@ class FITSDataset(Dataset):
         # =====================================================
 
         self.normalization_method = normalization_method  # 保存归一化方法
+        self.crop_size = int(crop_size)
+        self.point_class_value = int(point_class_value)
+        self.point_oversample_factor = float(max(1.0, point_oversample_factor))
+        self.point_crop_prob = float(np.clip(point_crop_prob, 0.0, 1.0))
         self.classes = classes if classes is not None else self.CLASSES
         self.class_mapping = {
             0: 0,  # bkg
@@ -553,6 +593,45 @@ class FITSDataset(Dataset):
 
         self.augmentation = augmentation
         self.preprocessing = preprocessing
+        self.sample_weights = self._build_sample_weights()
+
+    def _build_sample_weights(self) -> np.ndarray:
+        weights = np.ones(len(self.mask_list), dtype=np.float32)
+        point_hits = 0
+        if len(self.mask_list) == 0:
+            return weights
+        for idx, msk_path in enumerate(self.mask_list):
+            try:
+                mask = cv2.imread(msk_path, cv2.IMREAD_UNCHANGED)
+                if mask is not None and np.any(mask == self.point_class_value):
+                    weights[idx] = self.point_oversample_factor
+                    point_hits += 1
+            except Exception:
+                continue
+        print(f"[PointOversample] 含 point 样本数: {point_hits}/{len(weights)}, oversample_factor={self.point_oversample_factor}")
+        return weights
+
+    def _point_focused_crop(self, image: np.ndarray, mask_labels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        h, w = mask_labels.shape[:2]
+        crop_h = min(self.crop_size, h)
+        crop_w = min(self.crop_size, w)
+
+        if h == crop_h and w == crop_w:
+            return image, mask_labels
+
+        point_index = self.class_mapping.get(self.point_class_value, 3)
+        point_coords = np.argwhere(mask_labels == point_index)
+        focus_on_point = point_coords.size > 0 and np.random.rand() < self.point_crop_prob
+
+        if focus_on_point:
+            center_y, center_x = point_coords[np.random.randint(0, len(point_coords))]
+            top = int(np.clip(center_y - crop_h // 2, 0, max(0, h - crop_h)))
+            left = int(np.clip(center_x - crop_w // 2, 0, max(0, w - crop_w)))
+        else:
+            top = 0 if h == crop_h else np.random.randint(0, h - crop_h + 1)
+            left = 0 if w == crop_w else np.random.randint(0, w - crop_w + 1)
+
+        return image[top:top + crop_h, left:left + crop_w], mask_labels[top:top + crop_h, left:left + crop_w]
 
     @staticmethod
     def normalize_image_mean_std(image: np.ndarray, k: float = 5.0) -> np.ndarray:
@@ -748,6 +827,8 @@ class FITSDataset(Dataset):
             # 均值-标准差归一化
             image = FITSDataset.normalize_image_mean_std(raw_image, k=5.0)
 
+            image, mask_labels = self._point_focused_crop(image, mask_labels)
+
             # 数据增强
             if self.augmentation:
                 sample = self.augmentation(image=image, mask=mask_labels)
@@ -758,6 +839,19 @@ class FITSDataset(Dataset):
                 sample = self.preprocessing(image=image, mask=mask_labels)
                 image, mask_labels = sample['image'], sample['mask']
 
+            # 某些增强会返回带有非标准/不可扩展底层 storage 的数组或张量。
+            # 在 DataLoader worker 中 default_collate 组 batch 时，这类对象可能触发
+            # "Trying to resize storage that is not resizable"。这里统一复制为连续内存。
+            if isinstance(image, torch.Tensor):
+                image = image.contiguous().clone()
+            else:
+                image = np.ascontiguousarray(image.copy())
+
+            if isinstance(mask_labels, torch.Tensor):
+                mask_labels = mask_labels.contiguous().clone()
+            else:
+                mask_labels = np.ascontiguousarray(mask_labels.copy())
+
             return image, mask_labels
             
         except Exception as e:
@@ -767,42 +861,46 @@ class FITSDataset(Dataset):
     def __len__(self):
         return len(self.ids)
     
-def get_stable_training_augmentation():
+def get_stable_training_augmentation(size: int = 640):
     """
-    稳定的射电天文数据增强策略 - 平衡性能和质量的版本
+    点源保护增强策略：禁用 Resize 以防止能量弥散。
+    使用 PadIfNeeded + CenterCrop 确保尺寸对齐。
     """
     train_transform = [
-        albu.RandomScale(scale_limit=(0.8, 1.2), p=0.3),
-        albu.Resize(512, 512),  # 下采样到512x512
-        albu.Affine(
-            scale=(0.9, 1.1),
-            translate_percent=0,
-            rotate=0,
-            p=0.25),
+        # 几何变换（不改变分辨率）
         albu.HorizontalFlip(p=0.5),
-        albu.VerticalFlip(p=0.15),
-        albu.RandomBrightnessContrast(
-            brightness_limit=0.15,
-            contrast_limit=0.2,
-            p=0.5),
-        albu.RandomGamma(gamma_limit=(90, 110), p=0.3),
-        albu.GaussNoise(
-            std_range=(0.005, 0.025),
-            mean_range=(0, 0),
-            per_channel=True,
-            p=0.3),
-        albu.GaussianBlur(blur_limit=(1, 2), p=0.2),
+        albu.VerticalFlip(p=0.5),
+        albu.RandomRotate90(p=0.5),
+        
+        # 强力抗过拟合
+        albu.CoarseDropout(
+            num_holes_range=(1, 6), 
+            hole_height_range=(4, 16), 
+            hole_width_range=(4, 16), 
+            fill=0, 
+            p=0.2
+        ),
+
+        # 图像质量
+        albu.GaussNoise(std_range=(0.01, 0.05), p=0.2),
+        albu.RandomBrightnessContrast(p=0.5),
+        
+        # 核心：使用 Pad + RandomCrop 替代 Resize，提升空间多样性并减轻中心偏置
+        albu.PadIfNeeded(min_height=size, min_width=size, border_mode=cv2.BORDER_CONSTANT),
+        albu.RandomCrop(size, size)
     ]
     return albu.Compose(train_transform)
 
 def to_tensor(x, **kwargs):
     # 检查数据类型来区分图像和掩码
     if x.dtype in [np.uint8, np.int32, np.int64]:  # 标签掩码
-        return torch.from_numpy(x.astype(np.int64))
+        x = np.ascontiguousarray(x.astype(np.int64, copy=True))
+        return torch.from_numpy(x)
     else:  # 图像
         if len(x.shape) == 2:  # (H, W) -> (1, H, W)
             x = np.expand_dims(x, axis=0)
-        return torch.from_numpy(x.astype(np.float32))
+        x = np.ascontiguousarray(x.astype(np.float32, copy=True))
+        return torch.from_numpy(x)
 
 def get_preprocessing(preprocessing_fn):
     """Construct preprocessing transform"""
@@ -812,16 +910,16 @@ def get_preprocessing(preprocessing_fn):
     return albu.Compose(_transform)
 
 
-def get_validation_augmentation(height, width):
-    """Validation resize to target size"""
-    test_transform = [
-        albu.Resize(height, width)
-    ]
+def get_validation_augmentation(height=640, width=640):
+    """Validation augmentation: Pad to target size instead of resizing."""
+    test_transform = []
+    if height is not None and width is not None:
+        test_transform.append(albu.PadIfNeeded(min_height=height, min_width=width, border_mode=cv2.BORDER_CONSTANT))
     return albu.Compose(test_transform)
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("🚀 开始 U-Net 射电干扰分割训练脚本")
+    print("🚀 开始 U-Net (MiT-B2) 射电干扰分割训练脚本")
     print("=" * 60)
     
     dataset_top_dir = "/home/cbm/deRFI/Datasets/SynthesizedDataset"
@@ -835,13 +933,22 @@ if __name__ == "__main__":
     # ============ 超参数配置 ============
     # 将与硬件无关的模型/数据超参数放在顶层共享配置（便于与硬件相关参数分离）
     # 这些参数与训练机器（local/server）无关，便于统一修改和版本控制
-    ENCODER = "segformer-b2"
+    ENCODER = "mit_b2"
     CLASSES = ["bkg", "horizontal", "vertical", "point", "block", "pulsar"]
     SCHEDULER_TYPE = "cosine_warmup"
-    FOCAL_GAMMA = 2.0
-    LOSS_ALPHA = 0.7
-    LOSS_BETA = 0.3
+    FOCAL_GAMMA = 3.0
+    LOSS_ALPHA = 0.4  # 略回调 FN 权重，兼顾 point recall 与 pulsar 完整性
+    LOSS_BETA = 0.6   # 保持对 FP 的抑制，但不要过度压制碎弱前景
     NORMALIZATION_METHOD = "median_sigma"
+    TRAIN_CROP_SIZE = 640
+    POINT_CLASS_NAME = "point"
+    PULSAR_CLASS_NAME = "pulsar"
+    POINT_WEIGHT_MULTIPLIER = 5.0  # 略收一点 point 偏置，给 pulsar 留容量
+    PULSAR_WEIGHT_MULTIPLIER = 1.5  # 适度补偿 pointEnhance 稀释后的 pulsar 暴露
+    POINT_OVERSAMPLE_FACTOR = 3.0
+    POINT_CROP_PROB = 0.6
+    POINT_AUX_LOSS_WEIGHT = 0.25
+    TRAIN_SAMPLES_PER_EPOCH = 16384  # 提升每轮覆盖度，保留更多 pulsar/point 难例
 
     # 使用两套硬编码的配置集（`local` / `server`），通过 CONFIG_MODE 切换
     # local: 轻量级开发机配置；server: 高并发、多核、多GPU 训练服务器配置
@@ -850,11 +957,11 @@ if __name__ == "__main__":
     # 每套配置只包含与硬件/运行相关的参数（不再包含模型结构或损失超参）
     configs = {
         "local": {
-            "LEARNING_RATE": 1e-4,
+            "LEARNING_RATE": 1.8e-4,
             "BATCH_SIZE": 4,
-            "NUM_WORKERS": max(0, min(8, (os.cpu_count() or 4) - 1)),
-            "MAX_EPOCHS": 50,
-            "ACCUMULATE_GRAD_BATCHES": 4,
+            "NUM_WORKERS": 8,
+            "MAX_EPOCHS": 27,
+            "ACCUMULATE_GRAD_BATCHES": 2,
             "USE_COMPILE": False,
             "PRECISION": "16-mixed",
             "DEVICES": 1,
@@ -883,6 +990,7 @@ if __name__ == "__main__":
     USE_COMPILE = cfg.get("USE_COMPILE", False)
     PRECISION = cfg.get("PRECISION", 32)
     DEVICES = cfg.get("DEVICES", 1)
+    RESUME_CKPT_PATH = "/home/cbm/deRFI/checkpoints/train/best_model-epoch=12-fgmIoU_val_fg_miou=0.6668.ckpt"
     # 预训练权重路径 (None表示随机初始化)
     # WEIGHTS_PATH = "/home/cbm/deRFI/pruned_best_model-epoch=21-fgF1_val_fg_macro_f1=0.7905.pt"
     WEIGHTS_PATH = None
@@ -892,9 +1000,12 @@ if __name__ == "__main__":
         train_image_dir,
         train_mask_dir,
         classes=CLASSES,
-        augmentation=get_stable_training_augmentation(),
+        augmentation=get_stable_training_augmentation(TRAIN_CROP_SIZE),
         preprocessing=get_preprocessing(None),
         normalization_method=NORMALIZATION_METHOD,
+        crop_size=TRAIN_CROP_SIZE,
+        point_oversample_factor=POINT_OVERSAMPLE_FACTOR,
+        point_crop_prob=POINT_CROP_PROB,
     )
     print(f"✅ 训练数据集: {len(train_dataset)} 个样本")
 
@@ -905,14 +1016,23 @@ if __name__ == "__main__":
         CLASSES, 
         class_mapping=train_dataset.class_mapping,
         num_samples=200)
+    point_class_index = CLASSES.index(POINT_CLASS_NAME)
+    pulsar_class_index = CLASSES.index(PULSAR_CLASS_NAME)
+    class_weights[point_class_index] *= POINT_WEIGHT_MULTIPLIER
+    class_weights[pulsar_class_index] *= PULSAR_WEIGHT_MULTIPLIER
+    print(f"[ClassWeights] point 类权重额外乘以 {POINT_WEIGHT_MULTIPLIER:.2f}，调整后={class_weights[point_class_index]:.4f}")
+    print(f"[ClassWeights] pulsar 类权重额外乘以 {PULSAR_WEIGHT_MULTIPLIER:.2f}，调整后={class_weights[pulsar_class_index]:.4f}")
 
     val_dataset = FITSDataset(
         val_image_dir,
         val_mask_dir,
         classes=CLASSES,
-        augmentation=get_validation_augmentation(512, 512),
+        augmentation=get_validation_augmentation(TRAIN_CROP_SIZE, TRAIN_CROP_SIZE),
         preprocessing=get_preprocessing(None),
-        normalization_method=NORMALIZATION_METHOD)
+        normalization_method=NORMALIZATION_METHOD,
+        crop_size=TRAIN_CROP_SIZE,
+        point_oversample_factor=1.0,
+        point_crop_prob=0.0)
     
     print(f"✅ 验证数据集: {len(val_dataset)} 个样本")
 
@@ -937,13 +1057,19 @@ if __name__ == "__main__":
         print("验证数据集为空")
 
     print("🔄 创建数据加载器...")
+    use_persistent_workers = NUM_WORKERS > 0
+    train_sampler = torch.utils.data.RandomSampler(
+        train_dataset,
+        replacement=True,
+        num_samples=TRAIN_SAMPLES_PER_EPOCH,
+    )
     train_loader = DataLoader(
         train_dataset, 
         batch_size=BATCH_SIZE, 
-        shuffle=True, 
+        sampler=train_sampler,
         num_workers=NUM_WORKERS,
         pin_memory=True,  # 加速GPU数据传输
-        persistent_workers=False,  # 不保持worker进程，避免小任务/频繁调用下占用过多资源
+        persistent_workers=use_persistent_workers,  # 保持worker进程，提升 epoch 切换速度
         prefetch_factor=2,
         drop_last=True)
     val_loader = DataLoader(
@@ -952,11 +1078,12 @@ if __name__ == "__main__":
         shuffle=False, 
         num_workers=NUM_WORKERS,
         pin_memory=True,
-        persistent_workers=False,
+        persistent_workers=use_persistent_workers,
         prefetch_factor=2)
 
     print(f"✅ 训练数据加载器: {len(train_loader)} 个批次 (batch_size={BATCH_SIZE})")
     print(f"✅ 验证数据加载器: {len(val_loader)} 个批次 (batch_size={BATCH_SIZE})")
+    print(f"✅ 每轮训练采样数: {TRAIN_SAMPLES_PER_EPOCH} (Dataset总数: {len(train_dataset)})")
 
     print("🏗️ 创建 U-Net 模型...")
     model = UNetLightningModule(
@@ -970,29 +1097,33 @@ if __name__ == "__main__":
         loss_alpha=LOSS_ALPHA,
         loss_beta=LOSS_BETA,
         use_compile=USE_COMPILE,
+        ft_warmup_epochs=2,
+        point_class_index=point_class_index,
+        point_aux_weight=POINT_AUX_LOSS_WEIGHT,
     )
     
     print(f"✅ 模型配置: {ENCODER} 编码器, {len(CLASSES)} 个类别 ({CLASSES})")
     # 使用 SegFormer，不需要 MobileMamba 特殊提示
     print(f"✅ 学习率: {LEARNING_RATE}, 批次大小: {BATCH_SIZE}, 梯度累积: {ACCUMULATE_GRAD_BATCHES}步")
     print(f"✅ 有效批次大小: {BATCH_SIZE * ACCUMULATE_GRAD_BATCHES}, 最大轮次: {MAX_EPOCHS}")
+    print(f"✅ 恢复训练检查点: {RESUME_CKPT_PATH if os.path.exists(RESUME_CKPT_PATH) else 'None'}")
     print(f"✅ GPU: RTX 4060 Laptop 8GB - 已优化显存使用")
     
     # 设置示例输入数组以便 TensorBoard 记录计算图
-    model.example_input_array = torch.randn(1, 1, 512, 512)
+    model.example_input_array = torch.randn(1, 1, TRAIN_CROP_SIZE, TRAIN_CROP_SIZE)
     
     callbacks = [
         ModelCheckpoint(
             dirpath='checkpoints/train',
-            filename='best_model-{epoch:02d}-fgF1_{val_fg_macro_f1:.4f}',
-            monitor='val_fg_macro_f1',
+            filename='best_model-{epoch:02d}-fgmIoU_{val_fg_miou:.4f}',
+            monitor='val_fg_miou',
             mode='max',
             save_top_k=3,
             save_last=False,  # 不再保存 last-vX.ckpt 文件
             verbose=True
         ),
         EarlyStopping(
-            monitor='val_fg_macro_f1',
+            monitor='val_fg_miou',
             patience=10,
             mode='max',
             verbose=True
@@ -1017,7 +1148,7 @@ if __name__ == "__main__":
         devices=DEVICES,
         callbacks=callbacks,
         logger=logger,  # 显式指定 TensorBoard 日志记录器
-        log_every_n_steps=10,  # 减少日志频率以提高性能
+    log_every_n_steps=50,  # 进一步减少日志同步频率，提高吞吐
         check_val_every_n_epoch=1,
         enable_progress_bar=True,
         precision=PRECISION,
@@ -1068,7 +1199,7 @@ if __name__ == "__main__":
         model,
         train_dataloaders=train_loader,
         val_dataloaders=val_loader,
-        ckpt_path=None,  # 这里设置None，Scheduler会从头开始，如果是微调，权重已在前面加载
+        ckpt_path=RESUME_CKPT_PATH if os.path.exists(RESUME_CKPT_PATH) else None,
     )
     
     # 保存最终模型

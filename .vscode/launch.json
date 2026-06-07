@@ -12,7 +12,10 @@
                 // "--filename=/mnt/d/FASTData/FITSFiles/B0355+54_20191110_tracking_1-M01-P1-c2048b1.fits",
                 // "--filename=/mnt/d/FASTData/FITSFiles/B1929+10_20210106_tracking-M01-P1-c1024b1.fits",
                 // "--filename=/mnt/d/FASTData/FITSFiles/J195401+292434_20210402_tracking-M02-P1-c2048b1.fits",
-                "--filename=/home/cbm/deRFI/simulation/simulation_psrfits.fits",
+                // "--filename=/home/cbm/deRFI/simulation/simulation_psrfits.fits",
+                // "--filename=/mnt/c/FASTData/FITSFiles/G30.00+6.44_20240120_snapshot-M09-P4-c2048b1.fits",
+                // "--filename=/mnt/c/FASTData/FITSFiles/G31.37+2.20_20201111_snapshot-M07-P1-c2048b1.fits",
+                "--filename=/mnt/d/FASTData/FITSFiles/G200.14+2.80_20250409_snapshot-M05-P1-c1024b1.fits",
                 "--blocksPerRead=1",
                 "--binFactorTime=1", // 生成训练数据时，一般blocksPerRead应与binFactorTime相等，这样可以保持生成图片的尺寸一致
                 "--binFactorFreq=1",

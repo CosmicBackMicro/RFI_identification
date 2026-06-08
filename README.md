@@ -1,6 +1,6 @@
 # 射电干扰 (RFI) 深度学习消除项目帮助文档
 
-Disclaimer：这个交接文档由项目上一任负责人CBM编写，部分内容为AI生成，但经过CBM的逐段审核。如果对未提及的内容有疑问，可以联系CBM或查看他的毕业论文，另外Cao et al. 2026, RAA, "RFI Identification and Classification for FAST-GPPS Survey via Transformer Architectures"也可以让你对项目有一个更好的理解，建议先读一下。组内的其他成员知道CBM的联系方式。
+Disclaimer：这个交接文档由项目上一任负责人CBM编写，部分内容为AI生成，但经过CBM的逐段审核。如果对未提及的内容有疑问，可以联系CBM或查看他的毕业论文，另外Cao et al. 2026, RAA, "RFI Identification and Classification for FAST-GPPS Survey via Transformer Architectures"也可以让你对项目有一个更好的理解。
 
 本项目利用深度学习语义分割手段，对射电天文数据中的射电频率干扰（RFI）进行识别、掩码与消除。为了你能快速上手，本文档整理了项目的核心概念、环境配置，以及从数据标记到推理的完整工作流。
 
@@ -23,7 +23,7 @@ pip install -r requirements.txt
 - `results/`：验证和评测脚本（如混淆矩阵作图）的输出文件。
 
 **本地环境注意事项**：  
-`cbm@LAPTOP7-24E98GG` 这台电脑有时会出现 IDE 没法连接 WSL 子系统的问题！这个问题大概率是 WSL 的虚拟磁盘文件（vhdx）需要手动压缩一下，这个可以用 Windows 系统 cmd 命令行中的 diskpart 工具进行，但是一定要仔细谨慎操作，否则有可能把 WSL 系统搞崩！不过也不用太担心，网上找教程一步步做就行，不算难，压缩需要 20min 左右，千万不要中断这个过程！
+`cbm@LAPTOP7-24E98GG` 这台电脑有时会出现 IDE 没法连接 WSL 子系统的问题！这个问题大概率是 WSL 的虚拟磁盘文件（vhdx）需要手动压缩一下，这个可以用 Windows 系统 cmd 命令行中的 diskpart 工具进行，但是一定要仔细谨慎操作，否则有可能把 WSL 系统搞崩。我之前做过这个操作，没有问题。
 
 **磁盘空间管理**：  
 这台电脑的硬盘空间比较少了，原因是我把制作数据集的原始 FITS 文件拷到了本地（emm我承认自己比较懒哈哈哈，数据集制作初期需要反复读取，后面为了保险就留着了）。如果你接手之后主要做新数据，可以删掉这些 FITS 文件，它们在 `C:\FASTData\FITSFiles` 和 `D:\FASTData\FITSFiles` 两个目录下。
@@ -34,7 +34,7 @@ pip install -r requirements.txt
 位于 `bmcao@g02:/home/bmcao/deRFI/` 的这个文件夹，本质上是笔记本电脑上这个项目的一个 fork，但是修改了一些环境适配、数据集路径、训练时配置（batch_size 等），以利用 g02 服务器的两张 V100S 进行多卡训练，总之来说是 deRFI 项目的生产环境！目前这里面的训练和推理代码都是可以运行的，所以强烈建议把这个现成的环境和 g02 服务器的两张卡用起来，会大大加速项目进度。
 
 **远程数据集资源**：  
-如果是从 GitHub 拉取的项目代码，可能只有 src 等少数目录，但是不用担心！我有一系列数据集存储在 g02 服务器上的 `/home/bmcao/deRFI/Datasets/` 目录下：`SynthesizedDataset` 是我制作好的大规模数据集，有 40000 多个样本；`SynthesizedDataset_Shuffled` 是将训练集和测试集的样本打乱后的版本，可以用于交叉验证；还有其他几个不同采样因子、不同观测的数据集，可以根据需要选择使用。**但是这个项目往下做是需要以添加新数据为主的，而不是依赖已有的数据集**！
+如果是从 GitHub 拉取的项目代码，可能只有 src 等少数目录。但是不用担心，我有一系列数据集存储在 g02 服务器上的 `/home/bmcao/deRFI/Datasets/` 目录下：`SynthesizedDataset` 是我制作好的大规模数据集，有 40000 多个样本；`SynthesizedDataset_Shuffled` 是将训练集和测试集的样本打乱后的版本，可以用于交叉验证；还有其他几个不同采样因子、不同观测的数据集，可以根据需要选择使用。如果有时间，也可以把现有数据集进一步清洗精制，个别样本难免有标得不好的。**但是这个项目往下做是需要以添加新数据为主的，而不是依赖已有的数据集**！
 
 **登录方式**：  
 如果你直接继承了我的笔记本电脑 `cbm@LAPTOP7-24E98GG`，那你可以用我的账号免密登录 g02：终端敲 `ssh g02` 即可！但如果不是这台电脑也没问题，问组里老师在 g02 上创建自己的账号，然后去 `bmcao` 用户文件夹下找就行，没有权限的限制。
@@ -58,7 +58,7 @@ python src/visualize_fits.py
   ```bash
   make release  # 或 make turbo 获取最大优化，调试时用 make debug
   ```
-- **参数与下采样**：程序的命令行参数我记录在 `.vscode/launch.json` 中，你可以直接在 VSCode 中按 F5 调试。
+- **参数与下采样**：ReadFASTData数据标记程序的命令行参数，我记录在 `.vscode/launch.json` 中，你可以直接在 VSCode 中按 F5 调试。当然，后续也可以将这些参数写到一个bash脚本中，这样更方便一次处理多个FITS文件。
 重要参数： `--binFactorTime` 和 `--blocksPerRead` 可以控制数据的下采样倍数。通常这俩参数要保持相等，这样不同下采样的图像尺寸才能保持一致。
 
 ---
@@ -68,7 +68,7 @@ python src/visualize_fits.py
 `ReadFASTData` 生成的图像为 `.fits` 格式，掩码为 `.png` 格式（目前也支持通过 `visualize_fits` 察看 `.fits` 掩码），它们存放在 `output/`。在交给深度学习模型前，需要结构化。
 
 - **目录结构要求**：
-  模型 DataLoader 依赖如下组织形式：
+  我们采用的数据集组织形式如下：
   ```text
   Dataset_Name/
       ├── image/
@@ -82,7 +82,7 @@ python src/visualize_fits.py
   - `src/split_dataset.py`：自动将 `output/` 里的样本按比例划分并移入上述结构的文件夹（可通过 `--help` 查看用法）。
   - `src/merge_datasets.py`：我一般是把每个原始FITS文件处理成一个单独的数据集结构，用此脚本合并成一个大的数据集结构。
   - **数据可视化**：`src/visualize_fits.py` 是我专门定制的针对本项目FITS数据集的可视化工具，运行它会弹出窗口，根据提示指定数据集目录即可查看。支持开关 mask 叠加、图例、预览不同sigma阈值截断的通道（各有对应的快捷键，详见--help），强烈建议用它进行数据可视化。
-  - **数据仿真**：`src/RFISimulator.py` 可用于在训练集中加入仿真 RFI 数据以增强数据多样性，这可以辅助模型学习通用的特征表示。通过--psrfits参数，可以控制输出的仿真数据是分成单个subint存储还是合成一个大的PSRFITS文件。详见--help。
+  - **数据仿真**：`src/RFISimulator.py` 可用于在训练集中加入仿真 RFI 数据，以增强数据多样性，这可以辅助模型学习通用的特征表示。通过--psrfits参数，可以控制输出的仿真数据是分成单个subint存储还是合成一个大的PSRFITS文件。详见--help。
 
 ---
 
@@ -105,18 +105,18 @@ python src/visualize_fits.py
     python src/export_metrics.py /path/to/log_dir
     ```
   - `src/validate_unet.py` & `src/plot_custom_cm.py`：用于加载已训练好的 `.ckpt` 权重，手动跑一次验证集并生成极高精度的混淆矩阵图与 `.npy` 原始频数，非常适合论文作图准备。
-  - 传统对比：`src/aoflagger_mask.py`（基于 `parkes-default.lua`）用于生成经典的 AOFlagger 掩码，可用于对比 AI 的准确率。
+  - 传统对比：`src/aoflagger_mask.py`（依赖`parkes-default.lua`）用于生成经典的 AOFlagger 掩码，可用于对比 AI 的准确率。
 
 ---
 
 ## 4. 模型导出与优化 (Export & Optimization)
 
-为了将庞大的 PyTorch 模型应用于实际的高吞吐量流线，我们需要加速。
+分割模型作为“密集预测”任务，会为数据生成高分辨率的 mask。为了提高模型的吞吐量，我们需要加速模型的推理速度。
 
 - **核心脚本**：`src/exportModel.py`
 - **功能**：将训练得到的 `.ckpt` 权重转换为 ONNX 及 TensorRT 引擎。这通常会带来 **2 到 4 倍的推理速度提升**，代价是需要固定推理时的图像尺寸（丢弃动态分辨率）。
-- **下一步优化方向（留给你的挑战）**：
-  脚本内可以进一步添加对 **INT8 量化** 的支持，这能再提升 2 倍速度并缩减一半显存占用。提醒：INT8 量化需要精选 Calibration 数据集，否则准确率会崩盘。
+- **下一步优化方向**：
+  可以进一步添加对 **INT8 量化** 的支持，这能进一步提升速度并缩减显存占用。提醒：INT8 量化需要精选 Calibration 数据集，否则准确率容易大幅下降，比较tricky。
 
 ---
 
@@ -126,7 +126,7 @@ python src/visualize_fits.py
 
 - **核心脚本**：`src/AI_RFI.py`
 - **功能**：加载优化后的模型（或 ckpt），对新来的 FITS 数据生成消噪后的 mask。
-- **高阶操作**：该脚本带有直接在源文件像素上执行重置替换的逻辑选项（默认关闭，属高风险操作）。具体替换的物理意义与阈值逻辑，请参考我的毕业论文。
+- **高阶操作**：该脚本带有直接在源文件像素上执行像素替换的逻辑选项（默认关闭，属高风险操作），建议运行推理脚本之前先备份目标数据。具体像素替换逻辑在我的毕业论文中有描述。
 
 ---
 
@@ -135,6 +135,6 @@ python src/visualize_fits.py
 - **超大数据集**：`/home/cbm/deRFI/Datasets/SynthesizedDataset`（g02 上有备份，大约 4 万张图，100GB）。由于是半自动批量标记，个别复杂样本难免有瑕疵，后续可以考虑数据清洗与精制。
 - **改进方向建议**：
   1. **数据多样性**：继续完善生成式 RFI 模拟。
-  2. **自监督预训练**：这是非常有希望走向巡天级别泛化能力的方向。我已在 g02 上存放了基于 DINO v2 的实验性预训练脚本，目标是通过 Masked AutoEncoder 等技术减少对完美标记掩码的依赖，这个脚本仍有一些 bugs 待修复，留待你继续探索。
+  2. **自监督预训练**：这是有希望走向巡天级别泛化能力的方向，不过需要进一步开发。我在 g02 上实验过一个预训练脚本，但受限于时间问题，加上我自己对预训练-微调技术还不太熟悉，没能完全实现。但我认为这个方向是有潜力的，可以考虑继续探索。
 
-祝你在射电数据抗干扰领域取得更出色的进展！
+最后，我的代码写得比较乱，如果对你理解项目造成不便，提前向你致歉，敬请谅解。qwq
